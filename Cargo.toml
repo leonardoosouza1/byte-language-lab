@@ -1,0 +1,52 @@
+[package]
+name = "byte-language-lab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+description = "Empirical lab for byte-as-language hypothesis: structured byte streams as the unit of intelligence, replacing tokens and floats with positional-coded discrete units."
+
+[lib]
+name = "blab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exp01_format"
+path = "bin/exp01_format.rs"
+
+[[bin]]
+name = "exp02_arithmetic"
+path = "bin/exp02_arithmetic.rs"
+
+[[bin]]
+name = "exp03_learn"
+path = "bin/exp03_learn.rs"
+
+[[bin]]
+name = "exp04_compose"
+path = "bin/exp04_compose.rs"
+
+[[bin]]
+name = "run_all"
+path = "bin/run_all.rs"
+
+[dependencies]
+# Mantém dependências mínimas — todo código é nosso, validável byte a byte.
+# Apenas RNG (reprodutível, sem cripto).
+
+[dev-dependencies]
+# Property tests: validar invariantes em milhões de inputs gerados
+# (sem dependência: implementamos com rand simples + loops)
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.test]
+opt-level = 1  # tests rodam rápido sem compilar 2x
