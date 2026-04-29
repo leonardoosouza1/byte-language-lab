@@ -34,6 +34,38 @@ name = "exp06_bpe_compare"
 path = "bin/exp06_bpe_compare.rs"
 
 [[bin]]
+name = "exp07_neural"
+path = "bin/exp07_neural.rs"
+
+[[bin]]
+name = "exp08_tropical"
+path = "bin/exp08_tropical.rs"
+
+[[bin]]
+name = "exp09_hopfield"
+path = "bin/exp09_hopfield.rs"
+
+[[bin]]
+name = "exp10_predictive"
+path = "bin/exp10_predictive.rs"
+
+[[bin]]
+name = "exp11_stdp"
+path = "bin/exp11_stdp.rs"
+
+[[bin]]
+name = "exp12_cellular"
+path = "bin/exp12_cellular.rs"
+
+[[bin]]
+name = "exp13_compression"
+path = "bin/exp13_compression.rs"
+
+[[bin]]
+name = "exp14_robustness"
+path = "bin/exp14_robustness.rs"
+
+[[bin]]
 name = "run_all"
 path = "bin/run_all.rs"
 

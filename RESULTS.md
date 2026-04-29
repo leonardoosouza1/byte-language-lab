@@ -2,7 +2,7 @@
 
 Hipótese central: **inteligência fala bytes estruturados, não tokens nem floats**.
 
-**Lab executado em 451 ms total.** Detalhes por experimento:
+**Lab executado em 18160 ms total.** Detalhes por experimento:
 
 ## Sumário executivo
 
@@ -14,6 +14,14 @@ Hipótese central: **inteligência fala bytes estruturados, não tokens nem floa
 | exp04 — composition | Bytes podem unificar multi-domain? | **Sim**: 39% do espaço de JSON para mesmo conteúdo (número+texto+comando+estado+bool) |
 | exp05 — FSM unified | Mesmo byte serve para estado FSM e número? | **Sim**: 100% round-trip em 1000 frames mistos. `Block::State(byte)` ≡ `Microcoluna.neurons[i]` |
 | exp06 — Qwen BPE | Byte-positional vence Qwen tokenizer real? | **Sim**: Path C perplexity **3.64 vs Qwen 9.31** (2.5× mais previsível) |
+| exp07 — Neural MLP | MLP treinada aprende mais rápido sob byte-positional? | **Sim**: Path B accuracy **63% vs Qwen 25%**, converge em 750 vs nunca |
+| exp08 — Tropical | NN sem multiplicação (max-plus) é viável? | **Sim**: classificador binário roda em apenas i16 add+max |
+| exp09 — Hopfield | Memória associativa funciona com bytes discretos? | **Sim**: 100% recall até 256 patterns × 50% noise (Hamming similarity) |
+| exp10 — Predictive | Friston FEP em pesos i16 converge? | **Parcial**: erro decresce 18.7→18.0, lento mas direcional. Ajuste de hyperparams necessário |
+| exp11 — STDP | Aprendizado local sem gradiente diferencia patterns? | **Parcial**: STDP simplista mistura patterns; precisa competitive STDP ou curriculum |
+| exp12 — Cellular Automata | Rule 110 (Turing-complete) emerge? | **Sim**: 8 regras testadas, classes Wolfram I/II/III observadas. Rule 110 chaotic confirmada |
+| exp13 — Compression | Streams estruturados são mais redundantes? | **Sim**: Qwen u16 LZ77 0.525, Path C 0.603, Path B 0.699 — todos superam ASCII 0.855 |
+| exp14 — Robustness | Byte degrada melhor que f64 sob bit flips? | **Sim em rel-err**: Path B mean log rel err **-5.99 vs f64 -1.85** (erro relativo ~10^4× menor) |
 
 ## Findings concretos
 
@@ -63,13 +71,21 @@ Esta lab valida que a hipótese é **viável e mensuravelmente promissora**. Par
 
 ## Tempos de execução
 
-- exp01_format — 0.12s
-- exp02_arithmetic — 0.06s
-- exp03_learn — 0.06s
-- exp04_compose — 0.06s
-- exp05_fsm_unified — 0.05s
-- exp06_bpe_compare — 0.10s
-- **Total** — 0.45s
+- exp01_format — 2.75s
+- exp02_arithmetic — 2.71s
+- exp03_learn — 2.71s
+- exp04_compose — 2.58s
+- exp05_fsm_unified — 2.92s
+- exp06_bpe_compare — 3.47s
+- exp07_neural — 0.31s
+- exp08_tropical — 0.05s
+- exp09_hopfield — 0.08s
+- exp10_predictive — 0.06s
+- exp11_stdp — 0.05s
+- exp12_cellular — 0.06s
+- exp13_compression — 0.36s
+- exp14_robustness — 0.05s
+- **Total** — 18.16s
 
 ## Como reproduzir
 
@@ -88,3 +104,11 @@ cargo run --release --bin run_all  # gera todos os results/*.md e RESULTS.md
 - [`results/exp04_compose.md`](results/exp04_compose.md) — multi-domain stream
 - [`results/exp05_fsm_unified.md`](results/exp05_fsm_unified.md) — substrato bytewise unificado FSM ↔ número
 - [`results/exp06_bpe_compare.md`](results/exp06_bpe_compare.md) — vs Qwen 2.5 BPE real
+- [`results/exp07_neural.md`](results/exp07_neural.md) — tiny MLP gradient-trained, 4 encodings
+- [`results/exp08_tropical.md`](results/exp08_tropical.md) — álgebra tropical (max-plus)
+- [`results/exp09_hopfield.md`](results/exp09_hopfield.md) — Modern Hopfield com bytes
+- [`results/exp10_predictive.md`](results/exp10_predictive.md) — predictive coding i16
+- [`results/exp11_stdp.md`](results/exp11_stdp.md) — STDP aprendizado local
+- [`results/exp12_cellular.md`](results/exp12_cellular.md) — cellular automata + Rule 110
+- [`results/exp13_compression.md`](results/exp13_compression.md) — LZ77 ratio per encoding
+- [`results/exp14_robustness.md`](results/exp14_robustness.md) — bit-flip robustness vs f64

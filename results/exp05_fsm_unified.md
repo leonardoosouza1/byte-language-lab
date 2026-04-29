@@ -35,14 +35,14 @@ Gerados 1000 frames mistos (estado FSM + sensores numéricos + comando) totaliza
 
 | Família | Contagem |
 |---------|---------:|
-| DIFERENCIADOR | 2000 |
-| AMPLIFICADOR | 2000 |
-| MEMORIZADOR | 2000 |
+| INTEGRADOR | 2000 |
 | ALEATORIZADOR | 2000 |
 | COMPARADOR | 2000 |
-| INIBIDOR | 2000 |
 | RESSONADOR | 2000 |
-| INTEGRADOR | 2000 |
+| MEMORIZADOR | 2000 |
+| DIFERENCIADOR | 2000 |
+| INIBIDOR | 2000 |
+| AMPLIFICADOR | 2000 |
 
 ## Exemplo de frame (hex dump)
 

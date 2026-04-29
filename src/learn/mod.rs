@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+pub mod mlp;
+
 /// N-gram counter com Laplace smoothing.
 pub struct NGramModel {
     n: usize,
