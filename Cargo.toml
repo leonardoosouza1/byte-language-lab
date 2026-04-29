@@ -26,6 +26,14 @@ name = "exp04_compose"
 path = "bin/exp04_compose.rs"
 
 [[bin]]
+name = "exp05_fsm_unified"
+path = "bin/exp05_fsm_unified.rs"
+
+[[bin]]
+name = "exp06_bpe_compare"
+path = "bin/exp06_bpe_compare.rs"
+
+[[bin]]
 name = "run_all"
 path = "bin/run_all.rs"
 

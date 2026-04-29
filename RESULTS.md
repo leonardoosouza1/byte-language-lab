@@ -2,7 +2,7 @@
 
 Hipótese central: **inteligência fala bytes estruturados, não tokens nem floats**.
 
-**Lab executado em 2662 ms total.** Detalhes por experimento:
+**Lab executado em 451 ms total.** Detalhes por experimento:
 
 ## Sumário executivo
 
@@ -12,6 +12,8 @@ Hipótese central: **inteligência fala bytes estruturados, não tokens nem floa
 | exp02 — aritmética | Aritmética sem FP-ALU é viável? | **Sim**: add/sub 100% correctness, mul 99.4%. ~50× slower que f64 (esperado, sem SIMD) |
 | exp03 — learnability | Byte-positional é mais aprendível que ASCII? | **Sim**: perplexity 47-55% MENOR em todos n-gram orders |
 | exp04 — composition | Bytes podem unificar multi-domain? | **Sim**: 39% do espaço de JSON para mesmo conteúdo (número+texto+comando+estado+bool) |
+| exp05 — FSM unified | Mesmo byte serve para estado FSM e número? | **Sim**: 100% round-trip em 1000 frames mistos. `Block::State(byte)` ≡ `Microcoluna.neurons[i]` |
+| exp06 — Qwen BPE | Byte-positional vence Qwen tokenizer real? | **Sim**: Path C perplexity **3.64 vs Qwen 9.31** (2.5× mais previsível) |
 
 ## Findings concretos
 
@@ -61,11 +63,13 @@ Esta lab valida que a hipótese é **viável e mensuravelmente promissora**. Par
 
 ## Tempos de execução
 
-- exp01_format — 2.50s
+- exp01_format — 0.12s
 - exp02_arithmetic — 0.06s
 - exp03_learn — 0.06s
-- exp04_compose — 0.04s
-- **Total** — 2.66s
+- exp04_compose — 0.06s
+- exp05_fsm_unified — 0.05s
+- exp06_bpe_compare — 0.10s
+- **Total** — 0.45s
 
 ## Como reproduzir
 
@@ -80,5 +84,7 @@ cargo run --release --bin run_all  # gera todos os results/*.md e RESULTS.md
 - [`DESIGN.md`](DESIGN.md) — formalismo dos 3 paths
 - [`results/exp01_format.md`](results/exp01_format.md) — round-trip & compactness
 - [`results/exp02_arithmetic.md`](results/exp02_arithmetic.md) — aritmética bytewise vs f64
-- [`results/exp03_learn.md`](results/exp03_learn.md) — learnability comparison
+- [`results/exp03_learn.md`](results/exp03_learn.md) — learnability vs ASCII (n-gram)
 - [`results/exp04_compose.md`](results/exp04_compose.md) — multi-domain stream
+- [`results/exp05_fsm_unified.md`](results/exp05_fsm_unified.md) — substrato bytewise unificado FSM ↔ número
+- [`results/exp06_bpe_compare.md`](results/exp06_bpe_compare.md) — vs Qwen 2.5 BPE real

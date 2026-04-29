@@ -21,6 +21,7 @@ pub mod format;
 pub mod arithmetic;
 pub mod learn;
 pub mod compose;
+pub mod fsm_byte;
 
 /// RNG determinístico minimalista (xorshift64) para reprodutibilidade total.
 ///

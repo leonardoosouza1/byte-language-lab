@@ -22,7 +22,14 @@ fn main() -> std::io::Result<()> {
     let global_start = Instant::now();
 
     let mut timings = Vec::new();
-    for name in ["exp01_format", "exp02_arithmetic", "exp03_learn", "exp04_compose"] {
+    for name in [
+        "exp01_format",
+        "exp02_arithmetic",
+        "exp03_learn",
+        "exp04_compose",
+        "exp05_fsm_unified",
+        "exp06_bpe_compare",
+    ] {
         let ms = run_exp(name)?;
         timings.push((name, ms));
     }
@@ -41,6 +48,8 @@ fn main() -> std::io::Result<()> {
     writeln!(out, "| exp02 — aritmética | Aritmética sem FP-ALU é viável? | **Sim**: add/sub 100% correctness, mul 99.4%. ~50× slower que f64 (esperado, sem SIMD) |")?;
     writeln!(out, "| exp03 — learnability | Byte-positional é mais aprendível que ASCII? | **Sim**: perplexity 47-55% MENOR em todos n-gram orders |")?;
     writeln!(out, "| exp04 — composition | Bytes podem unificar multi-domain? | **Sim**: 39% do espaço de JSON para mesmo conteúdo (número+texto+comando+estado+bool) |")?;
+    writeln!(out, "| exp05 — FSM unified | Mesmo byte serve para estado FSM e número? | **Sim**: 100% round-trip em 1000 frames mistos. `Block::State(byte)` ≡ `Microcoluna.neurons[i]` |")?;
+    writeln!(out, "| exp06 — Qwen BPE | Byte-positional vence Qwen tokenizer real? | **Sim**: Path C perplexity **3.64 vs Qwen 9.31** (2.5× mais previsível) |")?;
 
     writeln!(out, "\n## Findings concretos\n")?;
 
@@ -98,8 +107,10 @@ fn main() -> std::io::Result<()> {
     writeln!(out, "- [`DESIGN.md`](DESIGN.md) — formalismo dos 3 paths")?;
     writeln!(out, "- [`results/exp01_format.md`](results/exp01_format.md) — round-trip & compactness")?;
     writeln!(out, "- [`results/exp02_arithmetic.md`](results/exp02_arithmetic.md) — aritmética bytewise vs f64")?;
-    writeln!(out, "- [`results/exp03_learn.md`](results/exp03_learn.md) — learnability comparison")?;
+    writeln!(out, "- [`results/exp03_learn.md`](results/exp03_learn.md) — learnability vs ASCII (n-gram)")?;
     writeln!(out, "- [`results/exp04_compose.md`](results/exp04_compose.md) — multi-domain stream")?;
+    writeln!(out, "- [`results/exp05_fsm_unified.md`](results/exp05_fsm_unified.md) — substrato bytewise unificado FSM ↔ número")?;
+    writeln!(out, "- [`results/exp06_bpe_compare.md`](results/exp06_bpe_compare.md) — vs Qwen 2.5 BPE real")?;
 
     println!("\n=== run_all complete in {:.2}s ===", total_ms as f64 / 1000.0);
     println!("Wrote RESULTS.md with consolidated findings.");

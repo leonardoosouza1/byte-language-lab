@@ -8,9 +8,9 @@
 
 | Path | Encode OK | Decode OK | Round-trip Match | Avg bytes | Encode (ns/op) | Decode (ns/op) |
 |------|----------:|----------:|-----------------:|----------:|---------------:|---------------:|
-| Path A (positional) | 99999 | 99999 | 99999 | 9.86 | 121 | 35 |
-| Path B (BCD ordered) | 100000 | 100000 | 100000 | 19.90 | 308 | 82 |
-| Path C (domain-tagged) | 99999 | 99999 | 99999 | 10.86 | 111 | 50 |
+| Path A (positional) | 99999 | 99999 | 99999 | 9.86 | 123 | 35 |
+| Path B (BCD ordered) | 100000 | 100000 | 100000 | 19.90 | 310 | 82 |
+| Path C (domain-tagged) | 99999 | 99999 | 99999 | 10.86 | 115 | 52 |
 | f64 raw (baseline) | 100000 | 100000 | 100000 | 8.00 | ~0 | ~0 |
 
 ## Análise
