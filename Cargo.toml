@@ -66,12 +66,100 @@ name = "exp14_robustness"
 path = "bin/exp14_robustness.rs"
 
 [[bin]]
+name = "exp15_text"
+path = "bin/exp15_text.rs"
+
+[[bin]]
+name = "exp16_smg_distill"
+path = "bin/exp16_smg_distill.rs"
+
+[[bin]]
+name = "exp17_smg_grid"
+path = "bin/exp17_smg_grid.rs"
+
+[[bin]]
+name = "exp17b_smg_grid_v2"
+path = "bin/exp17b_smg_grid_v2.rs"
+
+[[bin]]
+name = "exp18_smg_lateral"
+path = "bin/exp18_smg_lateral.rs"
+
+[[bin]]
+name = "probe_hsa"
+path = "bin/probe_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "test_parity_fwd"
+path = "bin/test_parity_fwd.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "test_parity_bwd"
+path = "bin/test_parity_bwd.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "bench_hsa"
+path = "bin/bench_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "test_parity_step"
+path = "bin/test_parity_step.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "profile_hsa"
+path = "bin/profile_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "train_smg_hsa"
+path = "bin/train_smg_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "analyze_geometry"
+path = "bin/analyze_geometry.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "train_nibble_hsa"
+path = "bin/train_nibble_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "inspect_traces"
+path = "bin/inspect_traces.rs"
+
+[[bin]]
 name = "run_all"
 path = "bin/run_all.rs"
 
 [dependencies]
 # Mantém dependências mínimas — todo código é nosso, validável byte a byte.
 # Apenas RNG (reprodutível, sem cripto).
+#
+# Exceção justificada: GPU runtime (wgpu) é acesso a hardware, não algoritmia.
+# A lógica numérica continua nossa (WGSL shaders em src/gpu/shaders/), apenas
+# delegamos device init/queue/dispatch ao wgpu. RDNA2 alvo: wave32, 40 CUs,
+# 64KB LDS/CU. Sem wgpu seríamos forçados a Vulkan/HIP raw — fora de escopo.
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+
+# Path-dep para HSA AQL backend. Optional: build sem ROCm continua funcionando
+# (a feature gpu-aql não está em default).
+hip-ffi = { path = "../llm-lab/hip-ffi", optional = true }
+
+[features]
+default = []
+# HSA AQL backend (RDNA2/ROCm). Bypass wgpu/Vulkan, usa kernel HIP nativo
+# dispatched via packets HSA. Requer ROCm 7.x instalado e kernel ABI v5.
+# Ver docs/migration-hsa-aql.md.
+gpu-aql = ["dep:hip-ffi"]
 
 [dev-dependencies]
 # Property tests: validar invariantes em milhões de inputs gerados

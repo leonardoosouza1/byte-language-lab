@@ -217,6 +217,180 @@ impl Mlp {
         }
         correct as f32 / samples.len() as f32
     }
+
+    /// Aloca um buffer de gradientes zerado, dimensionado para esta config.
+    pub fn alloc_grads(&self) -> Grads {
+        let v = self.cfg.vocab_size;
+        let h = self.cfg.hidden;
+        let k = self.cfg.window;
+        Grads {
+            g_w1: vec![0.0f32; k * v * h],
+            g_b1: vec![0.0f32; h],
+            g_w2: vec![0.0f32; h * v],
+            g_b2: vec![0.0f32; v],
+            sum_loss: 0.0,
+        }
+    }
+
+    /// Acumula gradientes do batch DENTRO de um buffer pré-alocado, **zerando-o**
+    /// no início. Read-only sobre `self`. Permite reuso de buffer entre batches.
+    pub fn compute_grads_into(&self, batch: &[(Vec<u32>, u32)], grads: &mut Grads) {
+        let v = self.cfg.vocab_size;
+        let h = self.cfg.hidden;
+
+        // zera buffer reusado
+        grads.g_w1.fill(0.0);
+        grads.g_b1.fill(0.0);
+        grads.g_w2.fill(0.0);
+        grads.g_b2.fill(0.0);
+        grads.sum_loss = 0.0;
+
+        for (window, target) in batch {
+            let target = (*target as usize).min(v - 1);
+            let cache = self.forward(window);
+
+            // softmax + cross-entropy
+            let max_logit = cache.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs: Vec<f32> = cache.logits.iter().map(|&x| (x - max_logit).exp()).collect();
+            let sum_p: f32 = probs.iter().sum();
+            for p in &mut probs { *p /= sum_p; }
+            grads.sum_loss -= probs[target].max(1e-20).ln();
+
+            // dL/d_logits = probs - one_hot(target)
+            let mut d_logits = probs;
+            d_logits[target] -= 1.0;
+
+            // d_h_post = W2 @ d_logits  (calcular ANTES de modificar g_w2)
+            let mut d_h_pre = vec![0.0f32; h];
+            for i in 0..h {
+                if cache.h_pre[i] <= 0.0 { continue; } // ReLU: apenas i com h_pre>0 contribuem
+                let mut acc = 0.0f32;
+                for j in 0..v {
+                    acc += self.w2[i * v + j] * d_logits[j];
+                }
+                d_h_pre[i] = acc;
+            }
+
+            // grads para W2, b2
+            for i in 0..h {
+                let hp = cache.h_post[i];
+                if hp == 0.0 { continue; }
+                for j in 0..v {
+                    grads.g_w2[i * v + j] += hp * d_logits[j];
+                }
+            }
+            for j in 0..v {
+                grads.g_b2[j] += d_logits[j];
+            }
+
+            // grads para W1, b1 (input é one-hot esparso → só K posições firingam)
+            for (pos, &tok) in window.iter().enumerate() {
+                let idx = (tok as usize).min(v - 1);
+                let row_off = (pos * v + idx) * h;
+                for j in 0..h {
+                    grads.g_w1[row_off + j] += d_h_pre[j];
+                }
+            }
+            for j in 0..h {
+                grads.g_b1[j] += d_h_pre[j];
+            }
+        }
+    }
+
+    /// Versão owning para conveniência. Aloca novo buffer cada chamada (não use no hot loop).
+    #[must_use]
+    pub fn compute_grads(&self, batch: &[(Vec<u32>, u32)]) -> Grads {
+        let mut g = self.alloc_grads();
+        self.compute_grads_into(batch, &mut g);
+        g
+    }
+
+    /// Aplica gradientes acumulados ao MLP. `scale` permite normalizar pelo batch
+    /// (ex.: `lr / batch_size` para mini-batch médio).
+    pub fn apply_grads(&mut self, grads: &Grads, scale: f32) {
+        for i in 0..self.w1.len() { self.w1[i] -= scale * grads.g_w1[i]; }
+        for i in 0..self.b1.len() { self.b1[i] -= scale * grads.g_b1[i]; }
+        for i in 0..self.w2.len() { self.w2[i] -= scale * grads.g_w2[i]; }
+        for i in 0..self.b2.len() { self.b2[i] -= scale * grads.g_b2[i]; }
+    }
+
+    /// Treina 1 época em mini-batch SGD paralelo usando `n_threads`.
+    ///
+    /// Estratégia:
+    /// - itera em batches de `batch_size`
+    /// - cada batch é dividido em `n_threads` chunks paralelos
+    /// - cada thread computa gradientes locais sobre seu chunk
+    /// - main soma e aplica 1 update (LR escalado por 1/batch_size)
+    ///
+    /// Mantém dinâmica de SGD real (muitos updates por época) com paralelismo
+    /// dentro de cada update. `pairs` é assumido já shuffled pelo caller.
+    /// Retorna loss médio do epoch.
+    pub fn train_epoch_parallel(
+        &mut self,
+        pairs: &[(Vec<u32>, u32)],
+        n_threads: usize,
+        batch_size: usize,
+    ) -> f32 {
+        if pairs.is_empty() { return 0.0; }
+        let n_threads = n_threads.max(1);
+        let batch_size = batch_size.max(1).min(pairs.len());
+
+        // **Pré-aloca** buffers de gradiente — 1 por thread + 1 acumulador.
+        // Reusa entre batches; evita malloc/free no hot loop.
+        let mut bufs: Vec<Grads> = (0..n_threads).map(|_| self.alloc_grads()).collect();
+
+        let mut total_loss = 0.0f32;
+        let total_count = pairs.len();
+
+        for batch_start in (0..total_count).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(total_count);
+            let batch = &pairs[batch_start..batch_end];
+            let actual_threads = n_threads.min(batch.len());
+            let chunk_size = batch.len().div_ceil(actual_threads);
+            let chunks: Vec<&[(Vec<u32>, u32)]> = batch.chunks(chunk_size).collect();
+            let actual_n = chunks.len();
+            let mlp_ref = &*self;
+
+            // Cada thread recebe (chunk, &mut buf único). Split exclusivo via iter_mut.
+            std::thread::scope(|s| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .zip(bufs.iter_mut().take(actual_n))
+                    .map(|(chunk, buf)| {
+                        s.spawn(move || mlp_ref.compute_grads_into(chunk, buf))
+                    })
+                    .collect();
+                for h in handles { h.join().expect("thread panicked"); }
+            });
+
+            // Soma deltas no primeiro buffer (em vez de alocar novo) usando split_first_mut
+            // para borrow checker aceitar &mut[0] + & dos resto.
+            let scale = self.cfg.learning_rate / batch.len() as f32;
+            let (head, tail) = bufs.split_first_mut().expect("bufs empty");
+            for r in tail.iter().take(actual_n.saturating_sub(1)) {
+                for i in 0..head.g_w1.len() { head.g_w1[i] += r.g_w1[i]; }
+                for i in 0..head.g_b1.len() { head.g_b1[i] += r.g_b1[i]; }
+                for i in 0..head.g_w2.len() { head.g_w2[i] += r.g_w2[i]; }
+                for i in 0..head.g_b2.len() { head.g_b2[i] += r.g_b2[i]; }
+                head.sum_loss += r.sum_loss;
+            }
+            total_loss += head.sum_loss;
+            self.apply_grads(head, scale);
+            // (buffers serão zerados na próxima compute_grads_into; sum_loss reset implícito)
+        }
+
+        total_loss / total_count as f32
+    }
+}
+
+/// Gradientes acumulados (resultado de `compute_grads`).
+#[derive(Debug, Clone)]
+pub struct Grads {
+    pub g_w1: Vec<f32>,
+    pub g_b1: Vec<f32>,
+    pub g_w2: Vec<f32>,
+    pub g_b2: Vec<f32>,
+    pub sum_loss: f32,
 }
 
 #[derive(Debug)]

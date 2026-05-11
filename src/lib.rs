@@ -22,6 +22,10 @@ pub mod arithmetic;
 pub mod learn;
 pub mod compose;
 pub mod fsm_byte;
+pub mod gpu;
+
+#[cfg(feature = "gpu-aql")]
+pub mod gpu_aql;
 
 /// RNG determinístico minimalista (xorshift64) para reprodutibilidade total.
 ///

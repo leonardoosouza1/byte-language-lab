@@ -10,6 +10,10 @@
 use std::collections::HashMap;
 
 pub mod mlp;
+pub mod microcolumn;
+pub mod microcolumn_v2;
+pub mod microcolumn_v3;
+pub mod microcolumn_gpu;
 
 /// N-gram counter com Laplace smoothing.
 pub struct NGramModel {
