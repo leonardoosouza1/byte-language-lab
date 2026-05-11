@@ -1,8 +1,9 @@
 // smg_forward.hip — Forward pass do SMG v3 (Stacked Microcolumn Grid).
 //
 // Port de `src/gpu/shaders/microcolumn_v3_forward.wgsl` para HIP C++.
-// Alvo: RDNA2 gfx1031 (RX 6750 XT). Compilar com:
-//   hipcc --genco --offload-arch=gfx1031 -mwavefrontsize32 -mno-cumode -O3 -ffast-math
+// Alvo: RDNA2 gfx1030 (compatível com RX 6750 XT via HSA_OVERRIDE_GFX_VERSION=10.3.0).
+// Compilar com:
+//   hipcc --genco --offload-arch=gfx1030 -O3 -ffast-math
 //
 // Layout da grade:
 //   Grid  : (batch_size, 1, 1) — 1 workgroup por sample.
@@ -53,7 +54,11 @@ struct ParamsFwd {
 };
 
 extern "C" __global__ void
-__launch_bounds__(128, 2)   // maxThreadsPerBlock=128, minBlocksPerSM=2
+__launch_bounds__(128, 1)   // maxThreadsPerBlock=128, minBlocksPerSM=1
+// NOTE: nibble embedding aumentou VGPRs para 128/wave. Com wave32 e 256 VGPRs/SIMD32,
+// só cabe 1 workgroup/CU (2 waves/SIMD32 × 2 SIMD32 = 4 waves = 128 threads).
+// minBlocksPerSM=2 exigiria 8 waves mas só há 4 → código inválido.
+// Para batch=64 e 40 CUs, 1 block/CU é suficiente (64 WGs enchem os 40 CUs).
 forward_main(
     ParamsFwd        params,
     const float* __restrict__    t_f,       // [N_FAMILIES, K, K]

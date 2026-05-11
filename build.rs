@@ -26,9 +26,14 @@ fn compile_smg_kernels() {
     // `--genco`, causando erro. Para gfx1031 eles são o DEFAULT (RDNA2 sempre
     // compila em wave32 e WGP mode), então são dispensáveis.
     // Ver docs/research/rdna2-microarch.md §wavefronts.
+    // gfx1030 em vez de gfx1031: o ambiente ROCm do user tem
+    // HSA_OVERRIDE_GFX_VERSION=10.3.0 (gfx1030). O RX 6750 XT é gfx1031
+    // mas gfx1031 é superset de gfx1030 para compute — código gfx1030 roda
+    // sem perda em gfx1031. Sem o override o HSA runtime rejeita gfx1031
+    // com INCOMPATIBLE_ARGUMENTS.
     let flags = [
         "--genco",
-        "--offload-arch=gfx1031",
+        "--offload-arch=gfx1030",
         "-O3",
         "-ffast-math",
         "-std=c++17",
