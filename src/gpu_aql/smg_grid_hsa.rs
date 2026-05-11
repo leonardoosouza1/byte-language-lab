@@ -239,6 +239,35 @@ impl SmgGridHsa {
         }
     }
 
+    /// Carrega pesos do host para a GPU (para continuar treino ou inferência
+    /// a partir de pesos salvos em disco via `save_weights` / `load_weights`).
+    ///
+    /// # Panics
+    /// Pânica se os tamanhos de `wh` não condizerem com os buffers alocados.
+    pub fn upload_weights(&mut self, wh: &WeightsHost) -> Result<(), GridInitError> {
+        assert_eq!(wh.t_f.len(),      self.buf_t_f.len(),      "t_f size mismatch");
+        assert_eq!(wh.i_f.len(),      self.buf_i_f.len(),      "i_f size mismatch");
+        assert_eq!(wh.nibble_h.len(), self.buf_nibble_h.len(), "nibble_h size mismatch");
+        assert_eq!(wh.nibble_l.len(), self.buf_nibble_l.len(), "nibble_l size mismatch");
+        assert_eq!(wh.b_f.len(),      self.buf_b_f.len(),      "b_f size mismatch");
+        assert_eq!(wh.pos_bias.len(), self.buf_pos.len(),      "pos_bias size mismatch");
+        assert_eq!(wh.lat_w.len(),    self.buf_lat.len(),      "lat_w size mismatch");
+        assert_eq!(wh.w_out.len(),    self.buf_w_out.len(),    "w_out size mismatch");
+        assert_eq!(wh.b_out.len(),    self.buf_b_out.len(),    "b_out size mismatch");
+        unsafe {
+            hip_h2d(self.buf_t_f.as_mut_ptr(),      &wh.t_f)?;
+            hip_h2d(self.buf_i_f.as_mut_ptr(),      &wh.i_f)?;
+            hip_h2d(self.buf_nibble_h.as_mut_ptr(), &wh.nibble_h)?;
+            hip_h2d(self.buf_nibble_l.as_mut_ptr(), &wh.nibble_l)?;
+            hip_h2d(self.buf_b_f.as_mut_ptr(),      &wh.b_f)?;
+            hip_h2d(self.buf_pos.as_mut_ptr(),      &wh.pos_bias)?;
+            hip_h2d(self.buf_lat.as_mut_ptr(),      &wh.lat_w)?;
+            hip_h2d(self.buf_w_out.as_mut_ptr(),    &wh.w_out)?;
+            hip_h2d(self.buf_b_out.as_mut_ptr(),    &wh.b_out)?;
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Inferência — alloc por chamada (fora do hot path de treino)
     // -----------------------------------------------------------------------
@@ -422,8 +451,14 @@ impl SmgGridHsa {
                 self.pst_dlog.as_mut_ptr()          as u64,   // write d_logits_out
             ).expect("dispatch_backward_bptt");
 
-            // Barrier GPU-side: todos os grad_acc só começam após backward_bptt completar.
-            self.rt.barrier().expect("barrier bptt→grad_acc");
+            // NOTA: NÃO inserir barrier() explícito aqui.
+            // O bit BARRIER em cada dispatch packet (QUEUE_TYPE_SINGLE) garante que
+            // grad_acc só começa após backward_bptt completar, SEM partilhar o
+            // completion_signal com drain(). Um barrier_and extra causaria uma corrida:
+            //   barrier_and A dispara após bptt → decrementa signal → drain2 retorna
+            //   antes de grad_acc terminar → drain3 retorna antes de SGD → buf_log
+            //   freed enquanto forward kernel ainda escreve → page fault @ 0x100000000.
+            // BARRIER bit + fila in-order é suficiente e correcto.
 
             // ==== Fase 3b: Grad accumulation (sem atomics) ====
             // Todos os 4 kernels são independentes entre si — GPU pipelina-os.

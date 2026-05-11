@@ -521,9 +521,20 @@ impl SmgRuntime {
         }
     }
 
-    /// Insere um barrier packet na queue (sem stall de CPU).
-    /// Garante que kernels posteriores só começam após os anteriores completarem.
-    /// Útil para sequenciar backward_bptt → grad_acc sem parar o CPU.
+    /// Insere um barrier_and packet na queue (sem stall de CPU).
+    ///
+    /// ⚠️  **NÃO USAR em sequência com drain()** — ambos partilham o mesmo
+    /// `completion_signal`. Se `barrier()` for chamado ANTES de `drain()`,
+    /// o barrier_and de `barrier()` decrementa o signal quando bptt termina;
+    /// `drain()` armazena 1 no signal e submete outro barrier_and, mas o wait
+    /// vê 0 (decrementado pelo barrier anterior) e retorna ANTES dos kernels
+    /// grad_acc terminarem → drain prematuro → use-after-free no buf_log da
+    /// validação → page fault @ 0x100000000.
+    ///
+    /// **Alternativa correcta**: Os dispatch packets já têm o bit BARRIER setado,
+    /// garantindo ordering automático numa fila QUEUE_TYPE_SINGLE. Não é necessário
+    /// nenhum barrier explícito — basta chamar `drain()` no fim de cada grupo.
+    #[allow(dead_code)]
     pub fn barrier(&self) -> Result<(), HsaError> {
         self.disp.submit_barrier()
     }
