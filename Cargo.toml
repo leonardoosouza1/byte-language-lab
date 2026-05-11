@@ -131,6 +131,26 @@ path = "bin/train_nibble_hsa.rs"
 required-features = ["gpu-aql"]
 
 [[bin]]
+name = "diag_kernels"
+path = "bin/diag_kernels.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "generate_hsa"
+path = "bin/generate_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "train_dialogue_hsa"
+path = "bin/train_dialogue_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "chat_hsa"
+path = "bin/chat_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
 name = "inspect_traces"
 path = "bin/inspect_traces.rs"
 
