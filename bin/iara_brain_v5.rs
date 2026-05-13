@@ -3954,69 +3954,153 @@ fn handle_client(
             g.forest.n_trees(), blab::gravity_forest::GRID,
             total_branches, g.forest.mycelium.len(), trees.join(","))
     } else if method == "GET" && path == "/dashboard" {
-        // HTML dashboard — single page snapshot of brain state.
+        // Mobile-optimized HTML dashboard — responsive, card-based, dark theme.
         let g = brain.lock().unwrap();
         let a = auto_state.lock().unwrap();
         let cs = curiosity_state;
         let ds = detector_state.lock().unwrap();
         let ck = ckpt_state.lock().unwrap();
-        let stats_html = format!(
-            "bytes: <b>{}</b> | words: <b>{}</b> | phrases: <b>{}</b> | dialogs: <b>{}</b> | triples: <b>{}</b> | bigram_edges: <b>{}</b>",
-            g.unigram.iter().sum::<u32>(),
-            g.word_count.len(), g.phrase_count.len(),
-            g.dialog_pairs.len(), g.triples.len(),
-            g.bigram.iter().filter(|&&c| c > 0).count());
-        let moe_rows: String = g.experts.iter().map(|e| {
-            format!("<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+
+        let unigram_sum: u32 = g.unigram.iter().sum();
+        let n_words = g.word_count.len();
+        let n_phrases = g.phrase_count.len();
+        let n_dialogs = g.dialog_pairs.len();
+        let n_triples = g.triples.len();
+        let n_bigram = g.bigram.iter().filter(|&&c| c > 0).count();
+
+        let moe_cards: String = g.experts.iter().map(|e| {
+            format!("<div class=\"row\"><span class=\"name\">{}</span><span class=\"val\">{}d / {}h</span></div>",
                 e.name, e.dialog_indices.len(), e.n_hits)
         }).collect();
-        let tree_rows: String = g.forest.trees.iter().map(|t| {
-            format!("<tr><td>{}</td><td>({:.2},{:.2},{:.2})</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
-                t.name, t.position.x, t.position.y, t.position.z, t.mass, t.n_dialogs, t.branches.len())
+
+        let tree_cards: String = g.forest.trees.iter().map(|t| {
+            format!("<div class=\"row\"><span class=\"name\">{}</span><span class=\"val\">m={:.1} d={} b={}</span></div>",
+                t.name, t.mass, t.n_dialogs, t.branches.len())
         }).collect();
+
         use std::sync::atomic::Ordering;
+        let cur_running = cs.running.load(Ordering::Relaxed);
+        let cur_workers = cs.workers_active.load(Ordering::Relaxed);
+        let cur_asked = cs.questions_asked.load(Ordering::Relaxed);
+        let cur_answered = cs.questions_answered.load(Ordering::Relaxed);
+        let cur_topics = cs.topics_explored.lock().unwrap().len();
+
+        let n_branches: usize = g.forest.trees.iter().map(|t| t.branches.len()).sum();
+        let n_myc = g.forest.mycelium.len();
+        let n_trees = g.forest.n_trees();
+        let n_exp = g.experts.len();
+
         let html = format!(
-            "<!DOCTYPE html><html><head><title>IARA Brain Dashboard</title>\
-             <meta http-equiv=\"refresh\" content=\"10\">\
+            "<!DOCTYPE html><html lang=\"pt-BR\"><head>\
+             <meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
+             <meta name=\"theme-color\" content=\"#0f1419\">\
+             <title>🧠 IARA Brain</title>\
+             <meta http-equiv=\"refresh\" content=\"15\">\
              <style>\
-               body{{font-family:monospace;background:#0f1419;color:#bfbdb6;padding:20px;}}\
-               h1{{color:#ffb454;}} h2{{color:#73d0ff;border-bottom:1px solid #1f2430;padding-bottom:4px;}}\
-               table{{border-collapse:collapse;margin:8px 0;}} \
-               td,th{{padding:4px 12px;border:1px solid #1f2430;}} th{{background:#1f2430;color:#73d0ff;}}\
-               .ok{{color:#7fd962;}} .stat{{font-size:14px;}}\
+               *{{box-sizing:border-box;margin:0;padding:0}}\
+               body{{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,sans-serif;\
+                     background:#0f1419;color:#bfbdb6;padding:env(safe-area-inset-top,12px) 14px env(safe-area-inset-bottom,14px) 14px;\
+                     font-size:15px;line-height:1.4;-webkit-tap-highlight-color:transparent}}\
+               h1{{color:#ffb454;font-size:20px;font-weight:600;margin-bottom:4px}}\
+               .ver{{color:#5c6773;font-size:12px;margin-bottom:14px}}\
+               .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}}\
+               .kpi{{background:#1f2430;border-radius:10px;padding:10px;border:1px solid #273347}}\
+               .kpi .lbl{{color:#5c6773;font-size:11px;text-transform:uppercase;letter-spacing:.5px}}\
+               .kpi .num{{color:#73d0ff;font-size:18px;font-weight:600;margin-top:2px}}\
+               .card{{background:#1f2430;border-radius:10px;padding:12px;margin-bottom:10px;border:1px solid #273347}}\
+               .card h2{{color:#ffb454;font-size:13px;font-weight:600;text-transform:uppercase;\
+                          letter-spacing:.5px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}}\
+               .card h2 .badge{{background:#273347;color:#73d0ff;font-size:10px;padding:2px 8px;border-radius:10px;letter-spacing:0;text-transform:none}}\
+               .row{{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1a1f2b;font-size:14px}}\
+               .row:last-child{{border-bottom:none}}\
+               .row .name{{color:#bfbdb6}}\
+               .row .val{{color:#73d0ff;font-family:monospace;font-size:13px}}\
+               .pill{{display:inline-block;background:#273347;color:#73d0ff;padding:2px 8px;border-radius:8px;font-size:12px;margin:2px 4px 2px 0}}\
+               .pill.ok{{background:#1f3a1f;color:#7fd962}}\
+               .pill.warn{{background:#3a2f1f;color:#ffb454}}\
+               .stats-row{{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}}\
+               .footer{{text-align:center;color:#5c6773;font-size:11px;margin:20px 0 0}}\
+               a{{color:#73d0ff;text-decoration:none}}\
+               @media(min-width:600px){{.grid{{grid-template-columns:repeat(3,1fr)}}}}\
+               @media(min-width:900px){{body{{max-width:900px;margin:0 auto}}}}\
              </style></head><body>\
-             <h1>🧠 IARA-Byte Brain v0.6.1 — Dashboard</h1>\
-             <p class=\"stat\">{stats}</p>\
-             <h2>Auto-learn</h2>\
-             <p>cycles: <b>{cyc}</b> | dialogs learned: <b>{dl}</b> | triples learned: <b>{tl}</b> | last cycle: <b>{lcms}ms</b></p>\
-             <h2>Curiosity</h2>\
-             <p>running: <b class=\"ok\">{cur_run}</b> | workers: <b>{cur_w}</b> | asked: <b>{cur_a}</b> | answered: <b>{cur_ans}</b> | topics: <b>{cur_t}</b></p>\
-             <h2>Domain Detector</h2>\
-             <p>scans: <b>{det_s}</b> | emerging: <b>{det_e}</b> | auto-spawned: <b>{det_sp}</b></p>\
-             <h2>Checkpoint</h2>\
-             <p>count: <b>{ck_c}</b> | last ms: <b>{ck_ms}</b></p>\
-             <h2>MoE Experts ({n_exp})</h2>\
-             <table><tr><th>Name</th><th>Dialogs</th><th>Hits</th></tr>{moe}</table>\
-             <h2>Gravity Forest ({n_trees} trees, {n_branches} branches, {n_myc} mycelium edges)</h2>\
-             <table><tr><th>Name</th><th>Position</th><th>Mass</th><th>Dialogs</th><th>Branches</th></tr>{trees}</table>\
-             <p><small>Auto-refresh 10s</small></p>\
+             <h1>🧠 IARA-Byte Brain</h1>\
+             <div class=\"ver\">v0.6.1 · auto-refresh 15s</div>\
+             \
+             <div class=\"grid\">\
+               <div class=\"kpi\"><div class=\"lbl\">Dialogs</div><div class=\"num\">{n_dialogs}</div></div>\
+               <div class=\"kpi\"><div class=\"lbl\">Triples</div><div class=\"num\">{n_triples}</div></div>\
+               <div class=\"kpi\"><div class=\"lbl\">Words</div><div class=\"num\">{n_words}</div></div>\
+               <div class=\"kpi\"><div class=\"lbl\">Phrases</div><div class=\"num\">{n_phrases}</div></div>\
+               <div class=\"kpi\"><div class=\"lbl\">Bytes</div><div class=\"num\">{ub}</div></div>\
+               <div class=\"kpi\"><div class=\"lbl\">Bigram</div><div class=\"num\">{nb}</div></div>\
+             </div>\
+             \
+             <div class=\"card\">\
+               <h2>♻️ Auto-Learn <span class=\"badge\">{cyc} cycles</span></h2>\
+               <div class=\"stats-row\">\
+                 <span class=\"pill\">+{dl} dialogs</span>\
+                 <span class=\"pill\">+{tl} triples</span>\
+                 <span class=\"pill\">{lcms}ms last</span>\
+               </div>\
+             </div>\
+             \
+             <div class=\"card\">\
+               <h2>🔍 Curiosity <span class=\"badge\">{cur_w}/4 workers</span></h2>\
+               <div class=\"stats-row\">\
+                 <span class=\"pill {cur_cls}\">{cur_status}</span>\
+                 <span class=\"pill\">asked {cur_a}</span>\
+                 <span class=\"pill ok\">answered {cur_ans}</span>\
+                 <span class=\"pill\">{cur_t} topics</span>\
+               </div>\
+             </div>\
+             \
+             <div class=\"card\">\
+               <h2>🌱 Domain Detector <span class=\"badge\">{det_s} scans</span></h2>\
+               <div class=\"stats-row\">\
+                 <span class=\"pill\">{det_e} emerging</span>\
+                 <span class=\"pill ok\">{det_sp} auto-spawned</span>\
+               </div>\
+             </div>\
+             \
+             <div class=\"card\">\
+               <h2>💾 Checkpoint <span class=\"badge\">{ck_c} saves</span></h2>\
+               <div class=\"stats-row\">\
+                 <span class=\"pill\">{ck_ms}ms last</span>\
+               </div>\
+             </div>\
+             \
+             <div class=\"card\">\
+               <h2>🎯 MoE Experts <span class=\"badge\">{n_exp}</span></h2>\
+               {moe}\
+             </div>\
+             \
+             <div class=\"card\">\
+               <h2>🌳 Gravity Forest <span class=\"badge\">{n_trees}t · {n_branches}br · {n_myc}myc</span></h2>\
+               {trees}\
+             </div>\
+             \
+             <div class=\"footer\">\
+               <a href=\"/stats\">/stats</a> · <a href=\"/moe\">/moe</a> · \
+               <a href=\"/forest\">/forest</a> · <a href=\"/mycelium\">/mycelium</a> · \
+               <a href=\"/autolearn\">/autolearn</a> · <a href=\"/curiosity\">/curiosity</a><br>\
+               byte-language-lab · github.com/leonardoosouza1\
+             </div>\
              </body></html>",
-            stats = stats_html,
-            cyc = a.cycles, dl = a.total_dialogs_learned, tl = a.total_triples_learned, lcms = a.last_cycle_ms,
-            cur_run = cs.running.load(Ordering::Relaxed),
-            cur_w = cs.workers_active.load(Ordering::Relaxed),
-            cur_a = cs.questions_asked.load(Ordering::Relaxed),
-            cur_ans = cs.questions_answered.load(Ordering::Relaxed),
-            cur_t = cs.topics_explored.lock().unwrap().len(),
+            n_dialogs = n_dialogs, n_triples = n_triples, n_words = n_words,
+            n_phrases = n_phrases, ub = unigram_sum, nb = n_bigram,
+            cyc = a.cycles, dl = a.total_dialogs_learned, tl = a.total_triples_learned,
+            lcms = a.last_cycle_ms,
+            cur_w = cur_workers, cur_a = cur_asked, cur_ans = cur_answered, cur_t = cur_topics,
+            cur_status = if cur_running { "RUNNING" } else { "STOPPED" },
+            cur_cls = if cur_running { "ok" } else { "warn" },
             det_s = ds.scans, det_e = ds.emerging.len(), det_sp = ds.auto_spawned,
             ck_c = ck.count, ck_ms = ck.last_ms,
-            n_exp = g.experts.len(), moe = moe_rows,
-            n_trees = g.forest.n_trees(),
-            n_branches = g.forest.trees.iter().map(|t| t.branches.len()).sum::<usize>(),
-            n_myc = g.forest.mycelium.len(),
-            trees = tree_rows,
+            n_exp = n_exp, moe = moe_cards,
+            n_trees = n_trees, n_branches = n_branches, n_myc = n_myc,
+            trees = tree_cards,
         );
-        // Return raw HTML — special-case the response wrapper
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             html.len(), html
