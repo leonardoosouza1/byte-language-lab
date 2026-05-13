@@ -4208,46 +4208,83 @@ fn handle_client(
         let (title_emoji, page_id, content) = match path.as_str() {
             "/chat-ui" => ("💬", "chat", r#"
 <div class="card">
-  <h2>💬 Chat com brain <span class="badge">live</span></h2>
-  <div id="msgs" style="max-height:50vh;overflow-y:auto;padding:8px 0">
+  <h2>💬 Chat com brain <span class="badge" id="status">ready</span></h2>
+  <div id="msgs" style="max-height:55vh;overflow-y:auto;padding:8px 0">
     <div style="color:#5c6773;font-size:13px;text-align:center;padding:14px">Faça uma pergunta abaixo...</div>
   </div>
   <div style="display:flex;gap:6px;margin-top:8px">
     <input id="q" type="text" placeholder="Pergunte algo..." style="flex:1;padding:12px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:10px;font-size:15px;font-family:inherit">
-    <button onclick="ask()" style="padding:12px 18px;background:#73d0ff;color:#0f1419;border:none;border-radius:10px;font-weight:600;font-size:14px">Enviar</button>
+    <button id="askBtn" onclick="ask()" style="padding:12px 18px;background:#73d0ff;color:#0f1419;border:none;border-radius:10px;font-weight:600;font-size:14px;min-width:80px">Enviar</button>
   </div>
 </div>
+<style>
+.spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.badge.live{background:#7fd962;color:#0f1419}
+.badge.thinking{background:#ffb454;color:#0f1419}
+.badge.err{background:#ff6b6b;color:#fff}
+</style>
 <script>
-function ask(){
+function setStatus(text, cls){
+  var s=document.getElementById('status');
+  s.textContent=text;
+  s.className='badge '+(cls||'');
+}
+function setBtn(loading){
+  var b=document.getElementById('askBtn');
+  if(loading){b.disabled=true;b.innerHTML='<span class="spin"></span>';}
+  else{b.disabled=false;b.innerHTML='Enviar';}
+}
+async function ask(){
   var q=document.getElementById('q');var t=q.value.trim();if(!t)return;
   var m=document.getElementById('msgs');
+  // Remove placeholder if first
+  if(m.children.length===1 && m.children[0].textContent.indexOf('Faça uma')===0) m.innerHTML='';
   var u=document.createElement('div');u.style.cssText='background:#273347;padding:8px 12px;border-radius:10px;margin:6px 0;color:#73d0ff';u.textContent='› '+t;m.appendChild(u);
-  var loader=document.createElement('div');loader.style.cssText='color:#5c6773;font-size:12px;padding:4px 12px';loader.textContent='pensando...';m.appendChild(loader);
+  var loader=document.createElement('div');loader.style.cssText='color:#5c6773;font-size:12px;padding:4px 12px;display:flex;align-items:center;gap:6px';loader.innerHTML='<span class="spin"></span>pensando...';m.appendChild(loader);
   m.scrollTop=m.scrollHeight;q.value='';
-  fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify({prompt:t,max:160,temp:0.5})})
-    .then(r=>r.json()).then(d=>{
-      loader.remove();
-      var r=document.createElement('div');r.style.cssText='background:#1f2430;padding:10px 12px;border-radius:10px;margin:6px 0;border-left:3px solid '+(d.source.startsWith('brain')?'#7fd962':'#ffb454');
-      var src=document.createElement('span');src.style.cssText='font-size:10px;color:#5c6773;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px';src.textContent=d.source;
-      var ans=document.createElement('div');ans.style.cssText='color:#bfbdb6;white-space:pre-wrap';ans.textContent=d.response;
-      r.appendChild(src);r.appendChild(ans);m.appendChild(r);m.scrollTop=m.scrollHeight;
-    }).catch(e=>{loader.textContent='erro: '+e});
+  setBtn(true); setStatus('thinking', 'thinking');
+  var t0=Date.now();
+  try {
+    var resp=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify({prompt:t,max:160,temp:0.5})});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    var d=await resp.json();
+    var dt=Date.now()-t0;
+    loader.remove();
+    var r=document.createElement('div');
+    var srcType=d.source.indexOf('brain')===0?'brain':(d.source.indexOf('qwen')===0?'qwen':'other');
+    var color={brain:'#7fd962',qwen:'#ffb454',other:'#5c6773'}[srcType];
+    r.style.cssText='background:#1f2430;padding:10px 12px;border-radius:10px;margin:6px 0;border-left:3px solid '+color;
+    var meta=document.createElement('div');meta.style.cssText='display:flex;justify-content:space-between;font-size:10px;color:#5c6773;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px';
+    meta.innerHTML='<span style="color:'+color+'">'+d.source+'</span><span>'+dt+'ms</span>';
+    var ans=document.createElement('div');ans.style.cssText='color:#bfbdb6;white-space:pre-wrap';ans.textContent=d.response;
+    r.appendChild(meta);r.appendChild(ans);m.appendChild(r);m.scrollTop=m.scrollHeight;
+    setStatus('ready', 'live');
+  } catch(e) {
+    loader.remove();
+    var er=document.createElement('div');er.style.cssText='background:#3a1f1f;color:#ff6b6b;padding:8px 12px;border-radius:10px;margin:6px 0';er.textContent='✗ '+(e.message||e);
+    m.appendChild(er);
+    setStatus('error', 'err');
+  }
+  setBtn(false);
 }
 document.getElementById('q').addEventListener('keydown',function(e){if(e.key==='Enter')ask()});
 </script>"#),
             "/control-ui" => ("🎛", "control", r#"
+<div id="toast" style="position:fixed;top:env(safe-area-inset-top,12px);left:14px;right:14px;z-index:1000;display:none;padding:12px;border-radius:10px;font-weight:600;font-size:14px;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,.4)"></div>
+
 <div class="card">
   <h2>🔍 Curiosity Loop</h2>
   <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Brain pesquisa próprios gaps. Workers = paralelo.</p>
-  <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+  <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
     <label style="font-size:13px;color:#bfbdb6">Workers:</label>
     <input id="curW" type="number" value="4" min="1" max="8" style="width:60px;padding:6px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px">
     <label style="font-size:13px;color:#bfbdb6">Throttle ms:</label>
     <input id="curT" type="number" value="600" min="100" max="5000" step="100" style="width:80px;padding:6px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px">
   </div>
   <div style="display:flex;gap:6px">
-    <button onclick="startCur()" style="flex:1;padding:10px;background:#7fd962;color:#0f1419;border:none;border-radius:8px;font-weight:600">▶ Start</button>
-    <button onclick="post('/curiosity/stop')" style="flex:1;padding:10px;background:#ffb454;color:#0f1419;border:none;border-radius:8px;font-weight:600">⏸ Stop</button>
+    <button id="b-curStart" class="btn ok" onclick="act('startCur',this,'Iniciando curiosity...')">▶ Start</button>
+    <button id="b-curStop" class="btn warn" onclick="act('stopCur',this,'Parando workers...')">⏸ Stop</button>
   </div>
 </div>
 
@@ -4271,16 +4308,16 @@ document.getElementById('q').addEventListener('keydown',function(e){if(e.key==='
     <option value="qwen2.5-0.5b">Qwen 0.5b (tiny)</option>
   </select>
   <div style="display:flex;gap:6px">
-    <button onclick="loadModel()" style="flex:1;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600">🔄 Load teacher</button>
-    <button onclick="runDistill()" style="flex:1;padding:10px;background:#7fd962;color:#0f1419;border:none;border-radius:8px;font-weight:600">📚 Distill</button>
+    <button class="btn info" onclick="act('loadModel',this,'Carregando teacher (até 10s)...')">🔄 Load teacher</button>
+    <button class="btn ok" onclick="act('runDistill',this,'Distillation started')">📚 Distill</button>
   </div>
 </div>
 
 <div class="card">
   <h2>♻️ Auto-learn / Checkpoint</h2>
   <div style="display:flex;gap:6px;flex-wrap:wrap">
-    <button onclick="post('/learn')" style="flex:1;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600;min-width:120px">Ingest WAL</button>
-    <button onclick="post('/checkpoint')" style="flex:1;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600;min-width:120px">💾 Save</button>
+    <button class="btn info" onclick="act('ingestWAL',this,'Ingestindo WAL...')">📥 Ingest WAL</button>
+    <button class="btn info" onclick="act('checkpoint',this,'Salvando brain.bin...')">💾 Save</button>
   </div>
 </div>
 
@@ -4289,50 +4326,132 @@ document.getElementById('q').addEventListener('keydown',function(e){if(e.key==='
   <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Ensina brain sobre tópico específico.</p>
   <input id="topic" type="text" placeholder="ex: fotossíntese, Sócrates, Rust..." style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
   <input id="nQ" type="number" value="10" min="1" max="50" placeholder="N questions" style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
-  <button onclick="targetedLearn()" style="width:100%;padding:10px;background:#7fd962;color:#0f1419;border:none;border-radius:8px;font-weight:600">📖 Aprender sobre tópico</button>
+  <button class="btn ok" onclick="act('targetedLearn',this,'Ensinando brain...')" style="width:100%">📖 Aprender sobre tópico</button>
 </div>
 
 <div class="card">
-  <h2>📤 Saída última ação</h2>
-  <pre id="out" style="background:#1a1f2b;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;overflow-x:auto;color:#bfbdb6;white-space:pre-wrap;border:1px solid #273347;min-height:40px;max-height:300px">(nenhuma)</pre>
+  <h2>📤 Log de ações <button onclick="document.getElementById('out').textContent='(limpo)'" style="float:right;padding:2px 8px;font-size:11px;background:#273347;color:#5c6773;border:none;border-radius:4px;cursor:pointer">limpar</button></h2>
+  <pre id="out" style="background:#1a1f2b;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;overflow-x:auto;color:#bfbdb6;white-space:pre-wrap;border:1px solid #273347;min-height:40px;max-height:400px;overflow-y:auto">(nenhuma)</pre>
 </div>
 
+<style>
+.btn{flex:1;padding:12px;border:none;border-radius:8px;font-weight:600;font-size:14px;cursor:pointer;transition:all .15s;position:relative;min-height:44px}
+.btn.ok{background:#7fd962;color:#0f1419}
+.btn.warn{background:#ffb454;color:#0f1419}
+.btn.info{background:#73d0ff;color:#0f1419}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.6;cursor:wait}
+.btn .spinner{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+#toast.show{display:block;animation:slideIn .2s ease}
+#toast.ok{background:#7fd962;color:#0f1419}
+#toast.err{background:#ff6b6b;color:#fff}
+#toast.info{background:#73d0ff;color:#0f1419}
+#toast.warn{background:#ffb454;color:#0f1419}
+@keyframes slideIn{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
+</style>
+
 <script>
-function show(r){document.getElementById('out').textContent=typeof r==='string'?r:JSON.stringify(r,null,2)}
-function post(url){fetch(url,{method:'POST'}).then(r=>r.json()).then(show).catch(e=>show({error:String(e)}))}
-function postBody(url,body){fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(show).catch(e=>show({error:String(e)}))}
-function startCur(){
-  var w=parseInt(document.getElementById('curW').value)||4;
-  var t=parseInt(document.getElementById('curT').value)||600;
-  postBody('/curiosity/start',{workers:w,throttle_ms:t});
+function log(s){var o=document.getElementById('out');var ts=new Date().toTimeString().slice(0,8);var prev=o.textContent;o.textContent='['+ts+'] '+s+'\n'+(prev==='(nenhuma)'?'':prev);}
+function toast(msg, kind){
+  var t=document.getElementById('toast');
+  t.textContent=msg; t.className='show '+kind;
+  t.style.display='block';
+  clearTimeout(window._toastT);
+  window._toastT=setTimeout(function(){t.style.display='none'},3500);
 }
-function loadModel(){
-  var m=document.getElementById('teacher').value;
-  show('Loading '+m+'...');
-  fetch('http://'+location.hostname+':3000/api/load-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:m})})
-    .then(r=>r.json()).then(show).catch(e=>show({error:String(e)+' (engine porta 3000 acessível?)'}));
-}
-function runDistill(){
-  var c=document.getElementById('corpus').value;
-  var n=parseInt(document.getElementById('nPrompts').value)||20;
-  show('Distill iniciado: '+c+' x '+n+' prompts.\nAguarde, isso roda no terminal do server.\nTriggering /distill backend endpoint...');
-  postBody('/distill',{corpus:c,n:n});
-}
-function targetedLearn(){
-  var t=document.getElementById('topic').value.trim();if(!t)return;
-  var n=parseInt(document.getElementById('nQ').value)||10;
-  var templates=['o que é '+t,'quem foi '+t,'explique '+t,'fale sobre '+t,'qual a importância de '+t,
-    'quais os exemplos de '+t,'qual a história de '+t,'compare '+t+' e seus similares',
-    'consequências de '+t,'tipos de '+t];
-  show('Targeted learn: '+t+' ('+n+' questions)...');
-  var done=0;
-  for(var i=0;i<Math.min(n,templates.length);i++){
-    (function(q){
-      fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q,max:120,temp:0.5})})
-        .then(r=>r.json()).then(d=>{done++;show('['+done+'/'+n+'] '+q+' → '+d.source);});
-    })(templates[i]);
+function setLoading(btn, loading, labelOrig){
+  if(loading){
+    if(!btn.dataset.orig)btn.dataset.orig=btn.innerHTML;
+    btn.disabled=true;
+    btn.innerHTML='<span class="spinner"></span>'+(labelOrig||'...');
+  } else {
+    btn.disabled=false;
+    btn.innerHTML=btn.dataset.orig||btn.innerHTML;
+    delete btn.dataset.orig;
   }
 }
+function callJSON(url, opts){
+  return fetch(url, opts||{}).then(function(r){
+    return r.text().then(function(text){
+      try{return {ok:r.ok, status:r.status, data:JSON.parse(text)}}
+      catch(e){return {ok:r.ok, status:r.status, data:text}}
+    });
+  });
+}
+async function act(action, btn, loadingMsg){
+  setLoading(btn, true, loadingMsg);
+  toast(loadingMsg, 'info');
+  try {
+    var result = await ACTIONS[action]();
+    var ok = result && (result.ok!==false) && !result.error;
+    toast(result.message || (ok?'✓ OK':'✗ Erro'), ok?'ok':'err');
+    log(action+': '+JSON.stringify(result));
+  } catch(e) {
+    toast('✗ '+(e.message||e), 'err');
+    log(action+' ERR: '+(e.message||e));
+  }
+  setLoading(btn, false);
+}
+
+var ACTIONS = {
+  startCur: async function(){
+    var w=parseInt(document.getElementById('curW').value)||4;
+    var t=parseInt(document.getElementById('curT').value)||600;
+    var r=await callJSON('/curiosity/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workers:w,throttle_ms:t})});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return {ok:true, message:'Curiosity started ('+w+' workers)', data:r.data};
+  },
+  stopCur: async function(){
+    var r=await callJSON('/curiosity/stop',{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return {ok:true, message:'✓ Workers stopped', data:r.data};
+  },
+  loadModel: async function(){
+    var m=document.getElementById('teacher').value;
+    var r=await callJSON('http://'+location.hostname+':3000/api/load-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:m})});
+    if(!r.ok)throw new Error('Engine porta 3000 inacessível? HTTP '+r.status);
+    return {ok:true, message:'✓ '+m+' loading', data:r.data};
+  },
+  runDistill: async function(){
+    var c=document.getElementById('corpus').value;
+    var n=parseInt(document.getElementById('nPrompts').value)||20;
+    var r=await callJSON('/distill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({corpus:c,n:n})});
+    if(!r.ok || !r.data.started)throw new Error(r.data.error||'fail spawn');
+    return {ok:true, message:'✓ Distill spawned pid='+r.data.pid, data:r.data};
+  },
+  ingestWAL: async function(){
+    var r=await callJSON('/learn',{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var msg = r.data.learned ? ('✓ +'+r.data.new_dialogs+' dialogs') : '⚠ WAL vazio';
+    return {ok:r.data.learned, message:msg, data:r.data};
+  },
+  checkpoint: async function(){
+    var r=await callJSON('/checkpoint',{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var mb=(r.data.size_bytes/1024/1024).toFixed(1);
+    return {ok:true, message:'✓ Saved '+mb+'MB ('+r.data.ms+'ms)', data:r.data};
+  },
+  targetedLearn: async function(){
+    var t=document.getElementById('topic').value.trim();
+    if(!t)throw new Error('Digite um tópico');
+    var n=parseInt(document.getElementById('nQ').value)||10;
+    var templates=['o que é '+t,'quem foi '+t,'explique '+t,'fale sobre '+t,'qual a importância de '+t,
+      'quais os exemplos de '+t,'qual a história de '+t,'compare '+t+' e seus similares',
+      'consequências de '+t,'tipos de '+t];
+    var done=0, brain=0, qwen=0;
+    for(var i=0;i<Math.min(n,templates.length);i++){
+      var q=templates[i];
+      try {
+        var r=await callJSON('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q,max:120,temp:0.5})});
+        if(r.data.source && r.data.source.indexOf('brain')===0) brain++; else qwen++;
+        done++;
+        log('  ['+done+'/'+n+'] '+q+' → '+r.data.source);
+      } catch(e) { log('  ['+done+'/'+n+'] '+q+' ERR'); }
+    }
+    return {ok:true, message:'✓ '+done+'/'+n+' (brain='+brain+' qwen='+qwen+')', data:{done:done,brain:brain,qwen:qwen}};
+  }
+};
 </script>"#),
             "/forest-ui" => ("🌳", "forest", r#"
 <div class="card">
