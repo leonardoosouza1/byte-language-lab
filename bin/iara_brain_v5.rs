@@ -1494,6 +1494,27 @@ impl Brain {
         }
         println!("  Gravity forest: {} trees planted in 3D terrain ({}³ grid)",
             self.forest.n_trees(), blab::gravity_forest::GRID);
+
+        // Grow branches per tree — split dialogs into 4 chunks per expert
+        for (tree_idx, expert) in self.experts.iter().enumerate() {
+            if expert.dialog_indices.len() < 8 { continue; }
+            let chunk_size = (expert.dialog_indices.len() / 4).max(2);
+            for branch_i in 0..4 {
+                let start = branch_i * chunk_size;
+                let end = ((branch_i + 1) * chunk_size).min(expert.dialog_indices.len());
+                if start >= end { break; }
+                let sub: Vec<usize> = expert.dialog_indices[start..end].to_vec();
+                let label = format!("{}.{}", expert.name, branch_i);
+                let seed = (tree_idx as u64) * 1000 + branch_i as u64 + 7;
+                self.forest.grow_branch(tree_idx, label, sub, seed);
+            }
+        }
+        let total_branches: usize = self.forest.trees.iter().map(|t| t.branches.len()).sum();
+        println!("  Branches grown: {} total B-spline curves", total_branches);
+
+        // Build mycelium from tree proximity
+        self.forest.auto_build_mycelium(0.35);
+        println!("  Mycelium edges: {} (threshold 0.35)", self.forest.mycelium.len());
     }
 
     /// Route query via forest: project HV → nearest tree by Euclidean distance.
@@ -3902,12 +3923,23 @@ fn handle_client(
     } else if method == "GET" && path == "/forest" {
         let g = brain.lock().unwrap();
         let trees: Vec<String> = g.forest.trees.iter().map(|t| {
-            format!("{{\"name\":{},\"pos\":[{:.3},{:.3},{:.3}],\"mass\":{:.3},\"n_dialogs\":{}}}",
+            format!("{{\"name\":{},\"pos\":[{:.3},{:.3},{:.3}],\"mass\":{:.3},\"n_dialogs\":{},\"branches\":{}}}",
                 json_escape(&t.name), t.position.x, t.position.y, t.position.z,
-                t.mass, t.n_dialogs)
+                t.mass, t.n_dialogs, t.branches.len())
         }).collect();
-        format!("{{\"n_trees\":{},\"grid\":{},\"trees\":[{}]}}",
-            g.forest.n_trees(), blab::gravity_forest::GRID, trees.join(","))
+        let total_branches: usize = g.forest.trees.iter().map(|t| t.branches.len()).sum();
+        format!("{{\"n_trees\":{},\"grid\":{},\"total_branches\":{},\"mycelium_edges\":{},\"trees\":[{}]}}",
+            g.forest.n_trees(), blab::gravity_forest::GRID,
+            total_branches, g.forest.mycelium.len(), trees.join(","))
+    } else if method == "GET" && path == "/mycelium" {
+        let g = brain.lock().unwrap();
+        let edges: Vec<String> = g.forest.mycelium.iter().map(|e| {
+            let name_a = g.forest.trees.get(e.tree_a).map(|t| t.name.clone()).unwrap_or_default();
+            let name_b = g.forest.trees.get(e.tree_b).map(|t| t.name.clone()).unwrap_or_default();
+            format!("{{\"a\":{},\"b\":{},\"weight\":{:.3}}}",
+                json_escape(&name_a), json_escape(&name_b), e.weight)
+        }).collect();
+        format!("{{\"n_edges\":{},\"edges\":[{}]}}", g.forest.mycelium.len(), edges.join(","))
     } else if method == "POST" && path == "/forest_route" {
         // Test gravity routing for a prompt
         let body_s = String::from_utf8_lossy(&body).to_string();
