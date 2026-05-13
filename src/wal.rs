@@ -122,9 +122,8 @@ mod tests {
 
     #[test]
     fn roundtrip_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.wal");
-        let path_s = path.to_str().unwrap();
+        let path_s = "/tmp/wal_test_roundtrip.wal";
+        let _ = std::fs::remove_file(path_s);
 
         let mut f = open_for_append(path_s).unwrap();
         append(&mut f, &Record {
@@ -142,5 +141,6 @@ mod tests {
         assert_eq!(recs[0].rtype, TYPE_DIALOG);
         assert_eq!(recs[0].user, b"hello");
         assert_eq!(recs[0].model, b"world");
+        let _ = std::fs::remove_file(path_s);
     }
 }

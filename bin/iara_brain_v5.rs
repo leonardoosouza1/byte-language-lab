@@ -759,6 +759,10 @@ struct Brain {
     // Router: query HV → cosine to centroids → top-2 → search only those dialog subsets.
     // Não serializado em brain.bin — rebuilt on load via build_static_experts().
     experts: Vec<ExpertHead>,
+    // ─── GRAVITY FOREST (PLAN-01 Fase T1) ───
+    // 3D potential field + tree forest pra particle-based routing.
+    // Cada expert vira uma tree no terreno. Query → particle → gravity descent.
+    forest: blab::gravity_forest::Forest,
 
     // Knowledge graph: entity → relation → value (string-keyed for now)
     // Ex: ("Brasil", "capital") → "Brasília"
@@ -896,6 +900,7 @@ impl Brain {
             dialog_pairs: Vec::new(),
             dialog_hvs: Vec::new(),
             experts: Vec::new(),
+            forest: blab::gravity_forest::Forest::new(),
             triples: HashMap::new(),
             reverse_triples: HashMap::new(),
             phrase_count: HashMap::new(),
@@ -1463,6 +1468,42 @@ impl Brain {
             .map(|e| format!("{}={}", e.name, e.dialog_indices.len()))
             .collect();
         println!("  MoE static experts built ({}): {}", self.experts.len(), totals.join(", "));
+
+        // ── Plant trees in gravity forest (PLAN-01 Fase T1) ──
+        // Strategy: spread trees evenly em "Fibonacci sphere" anchors (deterministic
+        // pseudo-random sobre cube). HV centroid já vira jitter pequeno em torno do anchor.
+        // Isso evita colapso ao centro quando todos centroids têm ~50% bits.
+        self.forest = blab::gravity_forest::Forest::new();
+        let n = self.experts.len() as f32;
+        for (i, expert) in self.experts.iter().enumerate() {
+            // Fibonacci-like spiral pra cobrir cube uniformly
+            let phi = (1.0_f32 + 5.0_f32.sqrt()) / 2.0;
+            let t = i as f32 / n.max(1.0);
+            let anchor_x = ((i as f32 * phi).fract()).clamp(0.05, 0.95);
+            let anchor_y = (((i as f32 * phi * 2.5).fract())).clamp(0.05, 0.95);
+            let anchor_z = (t * 0.9 + 0.05).clamp(0.05, 0.95);
+            // HV centroid contributes small jitter (~10%)
+            let hv_pos = blab::gravity_forest::Forest::hv_to_position(&expert.centroid_hv);
+            let pos = blab::gravity_forest::Vec3::new(
+                anchor_x * 0.85 + hv_pos.x * 0.15,
+                anchor_y * 0.85 + hv_pos.y * 0.15,
+                anchor_z * 0.85 + hv_pos.z * 0.15,
+            );
+            let mass = ((expert.dialog_indices.len() as f32 + 1.0).ln()).max(0.5);
+            self.forest.plant_tree(expert.name.clone(), pos, mass, expert.dialog_indices.len());
+        }
+        println!("  Gravity forest: {} trees planted in 3D terrain ({}³ grid)",
+            self.forest.n_trees(), blab::gravity_forest::GRID);
+    }
+
+    /// Route query via forest: project HV → nearest tree by Euclidean distance.
+    /// Faster + predictable que descent. Descent ainda existe pra visualização.
+    fn route_via_gravity(&self, prompt: &[u8]) -> Option<(usize, blab::gravity_forest::Vec3, usize)> {
+        if self.forest.n_trees() == 0 { return None; }
+        let query_hv = encode_prompt_hv(prompt);
+        let initial = blab::gravity_forest::Forest::hv_to_position(&query_hv);
+        let tree_idx = self.forest.nearest_tree(initial);
+        tree_idx.map(|i| (i, initial, 0))
     }
 
     /// Route query via MoE: keyword fast-path + HV centroid fallback.
@@ -3855,8 +3896,31 @@ fn handle_client(
                 i, e.density, e.mean_dist_to_existing, e.dialog_indices.len(),
                 json_escape(&e.top_words.join(",")), e.detected_at, e.pending)
         }).collect();
-        format!("{{\"scans\":{},\"last_scan_ts\":{},\"emerging\":[{}],\"count\":{}}}",
-                s.scans, s.last_scan_ts, entries.join(","), s.emerging.len())
+        format!("{{\"scans\":{},\"last_scan_ts\":{},\"emerging\":[{}],\"count\":{},\"auto_spawned\":{},\"last_spawn_ts\":{}}}",
+                s.scans, s.last_scan_ts, entries.join(","), s.emerging.len(),
+                s.auto_spawned, s.last_spawn_ts)
+    } else if method == "GET" && path == "/forest" {
+        let g = brain.lock().unwrap();
+        let trees: Vec<String> = g.forest.trees.iter().map(|t| {
+            format!("{{\"name\":{},\"pos\":[{:.3},{:.3},{:.3}],\"mass\":{:.3},\"n_dialogs\":{}}}",
+                json_escape(&t.name), t.position.x, t.position.y, t.position.z,
+                t.mass, t.n_dialogs)
+        }).collect();
+        format!("{{\"n_trees\":{},\"grid\":{},\"trees\":[{}]}}",
+            g.forest.n_trees(), blab::gravity_forest::GRID, trees.join(","))
+    } else if method == "POST" && path == "/forest_route" {
+        // Test gravity routing for a prompt
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
+        let g = brain.lock().unwrap();
+        match g.route_via_gravity(prompt.as_bytes()) {
+            Some((idx, final_pos, steps)) => {
+                let name = g.forest.trees.get(idx).map(|t| t.name.clone()).unwrap_or_default();
+                format!("{{\"expert_idx\":{},\"expert_name\":{},\"final_pos\":[{:.3},{:.3},{:.3}],\"steps\":{}}}",
+                    idx, json_escape(&name), final_pos.x, final_pos.y, final_pos.z, steps)
+            }
+            None => "{\"error\":\"no trees\"}".to_string()
+        }
     } else if method == "GET" && path == "/moe" {
         let g = brain.lock().unwrap();
         let entries: Vec<String> = g.experts.iter().map(|e| {
@@ -4367,10 +4431,50 @@ fn serve(brain: Brain) -> std::io::Result<()> {
             // Replace detected list with latest scan
             det_state.emerging = emerging.clone();
             let count = emerging.len();
+
+            // ── AUTO-SPAWN (Fase 3) ──
+            // Criteria: density + dist + min_dialogs + cooldown + max_cap
+            let now_ts = wal::now_ts();
+            let cooldown_ok = det_state.last_spawn_ts == 0
+                || now_ts.saturating_sub(det_state.last_spawn_ts) >= SPAWN_COOLDOWN_SECS;
+            let cap_ok = det_state.auto_spawned < SPAWN_MAX_AUTO;
+
+            let mut spawn_candidates: Vec<&EmergingDomain> = emerging.iter()
+                .filter(|e| e.density >= SPAWN_MIN_DENSITY
+                         && e.mean_dist_to_existing >= SPAWN_MIN_DIST
+                         && e.dialog_indices.len() >= SPAWN_MIN_DIALOGS)
+                .collect();
+            // Sort by density desc — spawn strongest first
+            spawn_candidates.sort_by(|a, b| b.density.partial_cmp(&a.density).unwrap());
+
+            if cooldown_ok && cap_ok && !spawn_candidates.is_empty() {
+                // Spawn 1 expert por cycle (conservador)
+                let candidate = spawn_candidates[0];
+                // Generate name from top words
+                let name = format!("auto-{}", candidate.top_words.iter().take(2)
+                    .cloned().collect::<Vec<_>>().join("-"));
+                // Append expert to brain
+                let mut g2 = det_brain.lock().unwrap();
+                g2.experts.push(ExpertHead {
+                    name: name.clone(),
+                    centroid_hv: candidate.centroid_hv,
+                    dialog_indices: candidate.dialog_indices.clone(),
+                    keywords: Vec::new(),  // auto-generated, no static keywords
+                    n_hits: 0,
+                });
+                let total_experts = g2.experts.len();
+                drop(g2);
+                det_state.auto_spawned += 1;
+                det_state.last_spawn_ts = now_ts;
+                println!("🌱 AUTO-SPAWN expert '{}' (density={:.3} dist={:.3} dialogs={}) → total {}",
+                    name, candidate.density, candidate.mean_dist_to_existing,
+                    candidate.dialog_indices.len(), total_experts);
+            }
+
             drop(det_state);
             if count > 0 {
-                println!("🔍 Domain detector scan: {} emerging clusters in {} orphans ({}ms)",
-                         count, orphan_indices.len(), t0.elapsed().as_millis());
+                println!("🔍 Domain detector scan: {} emerging clusters in {} orphans ({}ms, cooldown_ok={}, cap_ok={})",
+                         count, orphan_indices.len(), t0.elapsed().as_millis(), cooldown_ok, cap_ok);
             }
         }
     });
@@ -4444,7 +4548,21 @@ struct DomainDetectorState {
     scans: u64,
     last_scan_ts: u64,
     emerging: Vec<EmergingDomain>,
+    auto_spawned: u64,           // total experts auto-criados
+    last_spawn_ts: u64,
 }
+
+/// Criteria pra auto-spawn (PLAN-03 Fase 3):
+/// - density > MIN_DENSITY
+/// - mean_dist_to_existing > MIN_DIST
+/// - n_dialogs >= MIN_DIALOGS
+/// - 24h cooldown desde último spawn (ou primeira execução)
+/// - max total auto-spawned experts (cap pra não explodir VRAM)
+const SPAWN_MIN_DENSITY: f32 = 0.10;
+const SPAWN_MIN_DIST: f32 = 0.40;
+const SPAWN_MIN_DIALOGS: usize = 15;
+const SPAWN_COOLDOWN_SECS: u64 = 600;  // 10min entre spawns
+const SPAWN_MAX_AUTO: u64 = 20;        // cap 20 auto-experts (10 static + 20 = 30 max)
 
 #[derive(Default, Clone)]
 struct AutoLearnState {

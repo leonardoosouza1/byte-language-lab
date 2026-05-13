@@ -2,6 +2,38 @@
 
 Seguindo [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) e [SemVer](https://semver.org/).
 
+## [0.6.0] — 2026-05-13 — Roadmap Phase 1 Implementation
+
+### Added
+- **PLAN-03 Fase 3 auto-spawn**: Domain detector daemon agora cria experts automaticamente quando cluster orfão atinge criteria (density ≥0.10, dist ≥0.40, ≥15 dialogs, cooldown 600s, max 20 auto-spawned).
+- **PLAN-01 Fase T1 Gravity Forest** (`src/gravity_forest.rs`):
+  - 3D potential field 32³ grid em VRAM
+  - Tree forest com Newton-like potencial U(r) = -Σ G·m_i / (|r-r_i| + ε)
+  - Verlet integration com damping pra descent
+  - Convergence proven via Lyapunov (V = ½||v||² + U)
+  - Force clamp 5.0 anti-overshoot
+  - Nearest-tree routing por Euclidean distance
+  - HV→3D projection via bit-bucket popcount
+  - 4 unit tests passing
+  - Endpoints: `GET /forest`, `POST /forest_route`
+- **PLAN-02 Sprint 1 Distillation** (`scripts/distill_qwen.py`):
+  - Multi-temperature ensemble (T=0.5 + T=0.9)
+  - WAL injection com FLAG_HIGH_QUALITY
+  - Throughput ~1.5 prompts/s
+  - Auto-ingested via daemon cycle 20s
+  - Math: soft target ensemble = média implícita sobre temperaturas
+
+### Architecture
+- Gravity forest planted from MoE experts: 10 trees no Fibonacci-spread cube
+- Auto-spawn aumenta dinamicamente o cap de experts (10 static + até 20 auto = 30 max)
+- Distillation pipeline aproveita Qwen como teacher sem treinar weights diretos (brain absorve via WAL)
+
+### Notes
+- Gravity descent funciona em 2-tree case (unit tests). Com 10 trees, potencial combinado puxa pro centroide global — usamos `nearest_tree` direto pra routing.
+- HV→3D projection ainda colapsa centroids — futura melhoria com semantic anchors (bit 5/6/7).
+
+---
+
 ## [0.5.0] — 2026-05-13 — Mixture-of-Experts + Domain Detection
 
 ### Added
