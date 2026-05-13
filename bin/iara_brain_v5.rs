@@ -1360,11 +1360,20 @@ impl Brain {
     }
 
     /// Retrieve top-K best matching model responses for a prompt.
+    /// Aplica RECENCY BOOST: dialogs mais recentes (índices altos) ganham +5% no score.
+    /// Resolve issue de stale dialogs vencendo ingests novos (ex: "Leonardo da Vinci"
+    /// vs identity ingest "Leonardo Souza criador IARA").
     fn retrieve_dialog(&self, prompt: &[u8], k: usize) -> Vec<(Vec<u8>, f32)> {
         let p_words = Self::normalize_to_bow(prompt);
         if p_words.is_empty() { return Vec::new(); }
+        let n = self.dialog_pairs.len() as f32;
         let mut scored: Vec<(usize, f32)> = self.dialog_pairs.iter().enumerate()
-            .map(|(i, (u, _))| (i, self.dialog_similarity(&p_words, u)))
+            .map(|(i, (u, _))| {
+                let base = self.dialog_similarity(&p_words, u);
+                // Recency bonus: linear de 0..0.06 baseado em idx/n
+                let recency = (i as f32 / n.max(1.0)) * 0.06;
+                (i, base + recency)
+            })
             .filter(|(_, s)| *s > 0.45)
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -1378,8 +1387,13 @@ impl Brain {
     fn retrieve_dialog_hdc(&self, prompt: &[u8], k: usize, min_sim: f32) -> Vec<(Vec<u8>, f32)> {
         if self.dialog_hvs.is_empty() { return Vec::new(); }
         let query = encode_prompt_hv(prompt);
+        let n = self.dialog_hvs.len() as f32;
         let mut scored: Vec<(usize, f32)> = self.dialog_hvs.iter().enumerate()
-            .map(|(i, hv)| (i, hv_similarity(&query, hv)))
+            .map(|(i, hv)| {
+                let base = hv_similarity(&query, hv);
+                let recency = (i as f32 / n.max(1.0)) * 0.04;  // smaller boost for HDC
+                (i, base + recency)
+            })
             .filter(|(_, s)| *s >= min_sim)
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -2379,9 +2393,17 @@ impl Brain {
         for (w, c) in scored { *agg.entry(w).or_insert(0) += c; }
         let mut sorted: Vec<(Vec<u8>, u32)> = agg.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        sorted.into_iter().take(n * 2)
+        // Filter stop/dialog-marker tokens
+        const STOPS: &[&str] = &["model", "user", "modelo", "usuario", "assistente",
+                                   "para", "como", "qual", "quais", "mais", "menos",
+                                   "sobre", "entre", "também", "isso", "este", "esta",
+                                   "esse", "essa", "muito", "pouco", "geralmente",
+                                   "principalmente", "exemplo"];
+        sorted.into_iter().take(n * 4)
             .filter_map(|(w, _)| {
                 let s = String::from_utf8_lossy(&w).to_string();
+                let s_lc = s.to_lowercase();
+                if STOPS.contains(&s_lc.as_str()) { return None; }
                 if s.len() >= 4 && s.len() <= 14 { Some(s) } else { None }
             })
             .take(n).collect()
@@ -3931,6 +3953,22 @@ fn handle_client(
         format!("{{\"n_trees\":{},\"grid\":{},\"total_branches\":{},\"mycelium_edges\":{},\"trees\":[{}]}}",
             g.forest.n_trees(), blab::gravity_forest::GRID,
             total_branches, g.forest.mycelium.len(), trees.join(","))
+    } else if method == "GET" && path == "/graph_dot" {
+        // DOT graph: forest trees as nodes + mycelium edges
+        let g = brain.lock().unwrap();
+        let mut dot = String::from("graph IARA_brain {\n  rankdir=LR;\n  node [shape=ellipse,style=filled,fillcolor=lightblue,fontname=\"sans\"];\n");
+        for (i, t) in g.forest.trees.iter().enumerate() {
+            dot.push_str(&format!("  T{} [label=\"{}\\nn={} m={:.1}\"];\n",
+                i, t.name.replace('"', "_"), t.n_dialogs, t.mass));
+        }
+        for e in &g.forest.mycelium {
+            let pen = (e.weight * 8.0).max(1.0) as u32;
+            dot.push_str(&format!("  T{} -- T{} [penwidth={},label=\"{:.2}\"];\n",
+                e.tree_a, e.tree_b, pen, e.weight));
+        }
+        dot.push_str("}\n");
+        // Return as text/plain via JSON wrap
+        format!("{{\"dot\":{}}}", json_escape(&dot))
     } else if method == "GET" && path == "/mycelium" {
         let g = brain.lock().unwrap();
         let edges: Vec<String> = g.forest.mycelium.iter().map(|e| {
