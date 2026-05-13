@@ -158,6 +158,129 @@ path = "bin/inspect_traces.rs"
 name = "run_all"
 path = "bin/run_all.rs"
 
+[[bin]]
+name = "bitlevel_v1"
+path = "bin/bitlevel_v1.rs"
+
+[[bin]]
+name = "bitlevel_v2"
+path = "bin/bitlevel_v2.rs"
+
+[[bin]]
+name = "train_distill_hsa"
+path = "bin/train_distill_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "train_bitstream_hsa"
+path = "bin/train_bitstream_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "quantize_ternary_hsa"
+path = "bin/quantize_ternary_hsa.rs"
+required-features = ["gpu-aql"]
+
+[[bin]]
+name = "iara_byte_chat"
+path = "bin/iara_byte_chat.rs"
+
+[[bin]]
+name = "iara_hdc_chat"
+path = "bin/iara_hdc_chat.rs"
+
+[[bin]]
+name = "iara_hdc_chat_v2"
+path = "bin/iara_hdc_chat_v2.rs"
+
+[[bin]]
+name = "iara_hdc_analogy"
+path = "bin/iara_hdc_analogy.rs"
+
+[[bin]]
+name = "byte_harmony"
+path = "bin/byte_harmony.rs"
+
+[[bin]]
+name = "iara_intelligent_chat"
+path = "bin/iara_intelligent_chat.rs"
+
+[[bin]]
+name = "iara_chat_eval"
+path = "bin/iara_chat_eval.rs"
+
+[[bin]]
+name = "build_phonetic_hvs"
+path = "bin/build_phonetic_hvs.rs"
+
+[[bin]]
+name = "iara_typo_eval"
+path = "bin/iara_typo_eval.rs"
+
+[[bin]]
+name = "iara_chat_rerank"
+path = "bin/iara_chat_rerank.rs"
+
+[[bin]]
+name = "iara_chat_server"
+path = "bin/iara_chat_server.rs"
+
+[[bin]]
+name = "adversarial_test"
+path = "bin/adversarial_test.rs"
+
+[[bin]]
+name = "stress_test"
+path = "bin/stress_test.rs"
+
+[[bin]]
+name = "byte_graph_communities"
+path = "bin/byte_graph_communities.rs"
+
+[[bin]]
+name = "byte_walker"
+path = "bin/byte_walker.rs"
+
+[[bin]]
+name = "build_corpus_index"
+path = "bin/build_corpus_index.rs"
+
+[[bin]]
+name = "iara_chat_server_indexed"
+path = "bin/iara_chat_server_indexed.rs"
+
+[[bin]]
+name = "byte_projection_2d"
+path = "bin/byte_projection_2d.rs"
+
+[[bin]]
+name = "iara_hdc_compose"
+path = "bin/iara_hdc_compose.rs"
+
+[[bin]]
+name = "corpus_stats"
+path = "bin/corpus_stats.rs"
+
+[[bin]]
+name = "iara_self_learn"
+path = "bin/iara_self_learn.rs"
+
+[[bin]]
+name = "iara_self_learn_loop"
+path = "bin/iara_self_learn_loop.rs"
+
+[[bin]]
+name = "iara_liquid"
+path = "bin/iara_liquid.rs"
+
+[[bin]]
+name = "iara_brain"
+path = "bin/iara_brain.rs"
+
+[[bin]]
+name = "iara_brain_full"
+path = "bin/iara_brain_v5.rs"
+
 [dependencies]
 # Mantém dependências mínimas — todo código é nosso, validável byte a byte.
 # Apenas RNG (reprodutível, sem cripto).
@@ -169,6 +292,9 @@ path = "bin/run_all.rs"
 wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
+serde_json = "1"
+rayon = "1.10"
+num_cpus = "1.16"
 
 # Path-dep para HSA AQL backend. Optional: build sem ROCm continua funcionando
 # (a feature gpu-aql não está em default).

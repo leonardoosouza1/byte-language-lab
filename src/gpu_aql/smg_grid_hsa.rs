@@ -117,6 +117,9 @@ pub struct SmgGridHsa {
     n_lat_w:  u32,
     n_w_out:  u32,
     n_b_out:  u32,
+
+    /// Flag para escolher kernel BPTT bit-level (BCE marginal) vs softmax CE.
+    pub bit_loss: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +200,7 @@ impl SmgGridHsa {
             buf_g_lat_w, buf_g_w_out, buf_g_b_out,
             pst_win, pst_tgt, pst_log, pst_st, pst_dpre, pst_dlog,
             n_t_f, n_i_f, n_nibble, n_b_f, n_pos, n_lat_w, n_w_out, n_b_out,
+            bit_loss: false,  // default: cross-entropy 256-way (compat)
         })
     }
 
@@ -434,22 +438,42 @@ impl SmgGridHsa {
         // Mantém atomics apenas para g_i_f, g_nibble_h, g_nibble_l, g_b_out.
         // SAFETY: todos os ponteiros são buffers GPU válidos.
         unsafe {
-            self.rt.dispatch_backward_bptt(
-                params_bwd,
-                self.buf_t_f.as_ptr()              as u64,   // read T_f
-                self.buf_lat.as_ptr()               as u64,   // read lat_w
-                self.buf_w_out.as_ptr()             as u64,   // read W_out
-                self.pst_st.as_ptr()                as u64,   // read states_all [B, T+1, FLAT_DIM]
-                self.pst_log.as_ptr()               as u64,   // read logits_in  [B, V]
-                self.pst_win.as_ptr()               as u64,   // read windows    [B, T]
-                self.pst_tgt.as_ptr()               as u64,   // read targets    [B]
-                self.buf_g_i_f.as_mut_ptr()         as u64,   // g_i_f (atomic, baixo conflito)
-                self.buf_g_nibble_h.as_mut_ptr()    as u64,   // g_nibble_h (atomic)
-                self.buf_g_nibble_l.as_mut_ptr()    as u64,   // g_nibble_l (atomic)
-                self.buf_g_b_out.as_mut_ptr()       as u64,   // g_b_out (atomic, muito baixo)
-                self.pst_dpre.as_mut_ptr()          as u64,   // write d_pre_out
-                self.pst_dlog.as_mut_ptr()          as u64,   // write d_logits_out
-            ).expect("dispatch_backward_bptt");
+            let res = if self.bit_loss {
+                self.rt.dispatch_backward_bptt_bit(
+                    params_bwd,
+                    self.buf_t_f.as_ptr()              as u64,
+                    self.buf_lat.as_ptr()              as u64,
+                    self.buf_w_out.as_ptr()            as u64,
+                    self.pst_st.as_ptr()               as u64,
+                    self.pst_log.as_ptr()              as u64,
+                    self.pst_win.as_ptr()              as u64,
+                    self.pst_tgt.as_ptr()              as u64,
+                    self.buf_g_i_f.as_mut_ptr()        as u64,
+                    self.buf_g_nibble_h.as_mut_ptr()   as u64,
+                    self.buf_g_nibble_l.as_mut_ptr()   as u64,
+                    self.buf_g_b_out.as_mut_ptr()      as u64,
+                    self.pst_dpre.as_mut_ptr()         as u64,
+                    self.pst_dlog.as_mut_ptr()         as u64,
+                )
+            } else {
+                self.rt.dispatch_backward_bptt(
+                    params_bwd,
+                    self.buf_t_f.as_ptr()              as u64,
+                    self.buf_lat.as_ptr()              as u64,
+                    self.buf_w_out.as_ptr()            as u64,
+                    self.pst_st.as_ptr()               as u64,
+                    self.pst_log.as_ptr()              as u64,
+                    self.pst_win.as_ptr()              as u64,
+                    self.pst_tgt.as_ptr()              as u64,
+                    self.buf_g_i_f.as_mut_ptr()        as u64,
+                    self.buf_g_nibble_h.as_mut_ptr()   as u64,
+                    self.buf_g_nibble_l.as_mut_ptr()   as u64,
+                    self.buf_g_b_out.as_mut_ptr()      as u64,
+                    self.pst_dpre.as_mut_ptr()         as u64,
+                    self.pst_dlog.as_mut_ptr()         as u64,
+                )
+            };
+            res.expect("dispatch_backward_bptt(_bit)");
 
             // NOTA: NÃO inserir barrier() explícito aqui.
             // O bit BARRIER em cada dispatch packet (QUEUE_TYPE_SINGLE) garante que
@@ -518,6 +542,165 @@ impl SmgGridHsa {
             self.rt.drain().expect("drain sgd");
         }
 
+        total_loss / batch_size as f32
+    }
+
+    /// train_step_distill — passo de treino com SOFT TARGETS (distillation).
+    ///
+    /// Recebe `windows` e `target_dists` (distribuição f32[V] por amostra).
+    /// Roda forward (idêntico), computa KL divergence (loss reportada), e backward
+    /// via `dispatch_backward_bptt_kl` (gradiente = softmax(logits) - target_dist).
+    ///
+    /// Aloca `pst_tgt_dist` por chamada (não é o hot path do treino normal).
+    pub fn train_step_distill(
+        &mut self,
+        windows:      &[Vec<u32>],
+        target_dists: &[Vec<f32>],
+    ) -> f32 {
+        assert_eq!(windows.len(), target_dists.len());
+        assert!(!windows.is_empty());
+        let batch_size = windows.len();
+        assert!(batch_size <= self.max_batch);
+        let t_steps = windows[0].len();
+        let v       = self.cfg.vocab_size;
+
+        // ==== Upload windows + target_dist ====
+        let win_flat: Vec<u32> = windows.iter().flat_map(|w| w.iter().copied()).collect();
+        let dist_flat: Vec<f32> = target_dists.iter().flat_map(|d| {
+            assert_eq!(d.len(), v, "target_dist size mismatch");
+            d.iter().copied()
+        }).collect();
+
+        // Aloca target_dist GPU buffer (per-call — não otimizado, distill é raro).
+        let buf_tgt_dist = DeviceBuffer::<f32>::from_slice(&dist_flat)
+            .expect("alloc pst_tgt_dist");
+
+        // SAFETY: buffers válidos.
+        unsafe {
+            hip_h2d(self.pst_win.as_mut_ptr(), &win_flat).expect("hip_h2d windows");
+        }
+
+        let params_fwd = ParamsFwd {
+            vocab_size: v as u32,
+            t_steps:    t_steps as u32,
+            batch_size: batch_size as u32,
+            cache_states: 1,
+        };
+
+        // Forward (idêntico ao train_step)
+        unsafe {
+            self.rt.dispatch_forward(
+                params_fwd,
+                self.buf_t_f.as_ptr()        as u64,
+                self.buf_i_f.as_ptr()        as u64,
+                self.buf_nibble_h.as_ptr()   as u64,
+                self.buf_nibble_l.as_ptr()   as u64,
+                self.buf_b_f.as_ptr()        as u64,
+                self.buf_pos.as_ptr()        as u64,
+                self.buf_lat.as_ptr()        as u64,
+                self.buf_w_out.as_ptr()      as u64,
+                self.buf_b_out.as_ptr()      as u64,
+                self.pst_win.as_ptr()        as u64,
+                self.pst_log.as_mut_ptr()    as u64,
+                self.pst_st.as_mut_ptr()     as u64,
+            ).expect("dispatch_forward");
+            self.rt.drain().expect("drain forward");
+        }
+
+        // Loss KL = sum_j t_j * log(t_j / softmax(z)_j) (CPU readback)
+        let mut logits_host = vec![0.0f32; batch_size * v];
+        unsafe {
+            hip_d2h(&mut logits_host, self.pst_log.as_ptr()).expect("hip_d2h logits");
+        }
+        let mut total_loss = 0.0_f32;
+        for b in 0..batch_size {
+            let logits = &logits_host[b * v..(b + 1) * v];
+            let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|&x| (x - mx).exp()).collect();
+            let s: f32 = exps.iter().sum();
+            let inv_s = 1.0 / s;
+            let tdist = &target_dists[b];
+            for j in 0..v {
+                let p = exps[j] * inv_s;
+                let t = tdist[j];
+                if t > 1e-9 {
+                    total_loss += t * (t.max(1e-20).ln() - p.max(1e-20).ln());
+                }
+            }
+        }
+
+        let params_bwd = ParamsBwd {
+            vocab_size: v as u32,
+            t_steps:    t_steps as u32,
+            batch_size: batch_size as u32,
+            _pad:       0,
+        };
+        let params_grad = ParamsGradAcc {
+            vocab_size: v as u32,
+            t_steps:    t_steps as u32,
+            batch_size: batch_size as u32,
+            _pad:       0,
+        };
+        let scale = self.cfg.learning_rate / batch_size as f32;
+
+        // Backward com KL kernel + grad_acc + sgd
+        unsafe {
+            self.rt.dispatch_backward_bptt_kl(
+                params_bwd,
+                self.buf_t_f.as_ptr()              as u64,
+                self.buf_lat.as_ptr()              as u64,
+                self.buf_w_out.as_ptr()            as u64,
+                self.pst_st.as_ptr()               as u64,
+                self.pst_log.as_ptr()              as u64,
+                self.pst_win.as_ptr()              as u64,
+                buf_tgt_dist.as_ptr()              as u64,
+                self.buf_g_i_f.as_mut_ptr()        as u64,
+                self.buf_g_nibble_h.as_mut_ptr()   as u64,
+                self.buf_g_nibble_l.as_mut_ptr()   as u64,
+                self.buf_g_b_out.as_mut_ptr()      as u64,
+                self.pst_dpre.as_mut_ptr()         as u64,
+                self.pst_dlog.as_mut_ptr()         as u64,
+            ).expect("dispatch_backward_bptt_kl");
+
+            self.rt.dispatch_grad_acc_tf_latw(
+                params_grad,
+                self.pst_dpre.as_ptr() as u64, self.pst_st.as_ptr() as u64,
+                self.buf_g_t_f.as_mut_ptr() as u64, self.buf_g_lat_w.as_mut_ptr() as u64,
+            ).expect("grad_acc_tf_latw");
+            self.rt.dispatch_grad_acc_wout(
+                params_grad,
+                self.pst_st.as_ptr() as u64, self.pst_dlog.as_ptr() as u64,
+                self.buf_g_w_out.as_mut_ptr() as u64,
+            ).expect("grad_acc_wout");
+            self.rt.dispatch_grad_acc_b_f(
+                params_grad,
+                self.pst_dpre.as_ptr() as u64, self.buf_g_b_f.as_mut_ptr() as u64,
+            ).expect("grad_acc_b_f");
+            self.rt.dispatch_grad_acc_pos(
+                params_grad,
+                self.pst_dpre.as_ptr() as u64, self.buf_g_pos.as_mut_ptr() as u64,
+            ).expect("grad_acc_pos");
+            self.rt.drain().expect("drain grad_acc");
+
+            macro_rules! sgd {
+                ($n:expr, $w:expr, $g:expr) => {
+                    self.rt.dispatch_sgd($n, scale, $w.as_mut_ptr() as u64, $g.as_mut_ptr() as u64)
+                        .expect("dispatch_sgd");
+                };
+            }
+            sgd!(self.n_t_f,    self.buf_t_f,      self.buf_g_t_f);
+            sgd!(self.n_i_f,    self.buf_i_f,      self.buf_g_i_f);
+            sgd!(self.n_nibble, self.buf_nibble_h, self.buf_g_nibble_h);
+            sgd!(self.n_nibble, self.buf_nibble_l, self.buf_g_nibble_l);
+            sgd!(self.n_b_f,    self.buf_b_f,      self.buf_g_b_f);
+            sgd!(self.n_pos,    self.buf_pos,      self.buf_g_pos);
+            sgd!(self.n_lat_w,  self.buf_lat,      self.buf_g_lat_w);
+            sgd!(self.n_w_out,  self.buf_w_out,    self.buf_g_w_out);
+            sgd!(self.n_b_out,  self.buf_b_out,    self.buf_g_b_out);
+            self.rt.drain().expect("drain sgd");
+        }
+
+        drop(buf_tgt_dist);
         total_loss / batch_size as f32
     }
 

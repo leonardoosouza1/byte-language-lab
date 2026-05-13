@@ -34,7 +34,7 @@ use blab::{
 };
 
 // ---- Hiperparâmetros ----
-const WINDOW:          usize = 48;
+const WINDOW:          usize = 96;   // 48→96 contexto
 const VOCAB:           usize = 256;
 const LR:              f32   = 0.003;
 const BATCH:           usize = 64;
@@ -42,7 +42,7 @@ const N_EPOCHS:        usize = 60;
 const STEPS_PER_EPOCH: usize = 200;
 const VAL_STEPS:       usize = 40;
 const SEED:            u64   = 7;
-const GEN_LEN:         usize = 96;   // bytes para demo de geração
+const GEN_LEN:         usize = 96;
 
 // ---- Corpus PT-BR embutido ----
 const EMBEDDED_CORPUS: &str = "\
@@ -465,7 +465,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let cpu_init = SmgGrid::new(cfg.clone());
     let mut hsa  = SmgGridHsa::from_cpu(&cpu_init, BATCH)?;
-    println!("Modelo: {} parâmetros\n", hsa.n_params());
+    // BIT-LEVEL BCE LOSS: usa marginal sobre softmax 256-way
+    hsa.bit_loss = false;
+    println!("Modelo: {} parâmetros  [bit_loss=true]\n", hsa.n_params());
 
     // ---- Treino ----
     println!("{:>5}  {:>10}  {:>10}  {:>8}", "época", "train_loss", "val_loss", "tempo");

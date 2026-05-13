@@ -42,6 +42,8 @@ use hip_ffi::hsa_dispatch::{HsaDispatcher, HsaError, KernelInfo};
 static FORWARD_HSACO:   &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_forward.hsaco"));
 static BACKWARD_HSACO:  &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_backward.hsaco"));
 static BPTT_HSACO:      &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_backward_bptt.hsaco"));
+static BPTT_BIT_HSACO:  &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_backward_bptt_bit.hsaco"));
+static BPTT_KL_HSACO:   &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_backward_bptt_kl.hsaco"));
 static GRAD_ACC_HSACO:  &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_grad_acc.hsaco"));
 static NORM_HSACO:      &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_norm.hsaco"));
 static SGD_HSACO:       &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smg_sgd.hsaco"));
@@ -118,11 +120,13 @@ pub struct SmgRuntime {
     pub disp:        HsaDispatcher,
     forward:         KernelInfo,
     backward:        KernelInfo,
-    backward_bptt:   KernelInfo,   // Fase 1: BPTT sem atomics para g_t_f/g_lat_w/g_w_out
-    grad_tf_latw:    KernelInfo,   // Fase 2: accumula g_t_f + g_lat_w (GEMM-like)
-    grad_wout:       KernelInfo,   // Fase 2: accumula g_w_out (GEMM-like)
-    grad_b_f:        KernelInfo,   // Fase 2: accumula g_b_f (redução simples)
-    grad_pos:        KernelInfo,   // Fase 2: accumula g_pos (redução simples)
+    backward_bptt:   KernelInfo,   // BPTT softmax+CE
+    backward_bptt_bit: KernelInfo, // BPTT bit-level BCE (marginal)
+    backward_bptt_kl:  KernelInfo, // BPTT KL soft-target (distill)
+    grad_tf_latw:    KernelInfo,
+    grad_wout:       KernelInfo,
+    grad_b_f:        KernelInfo,
+    grad_pos:        KernelInfo,
     sumsq:           KernelInfo,
     zero_acc:        KernelInfo,
     sgd:             KernelInfo,
@@ -140,39 +144,45 @@ impl SmgRuntime {
             FORWARD_HSACO,
             BACKWARD_HSACO,
             BPTT_HSACO,
+            BPTT_BIT_HSACO,
+            BPTT_KL_HSACO,
             GRAD_ACC_HSACO,
             NORM_HSACO,
             SGD_HSACO,
         ];
         let mut disp = HsaDispatcher::new(modules, KARG_SLOT_SIZE, KARG_SLOTS)?;
 
-        let forward       = disp.register("forward_main")?;
-        let backward      = disp.register("backward_main")?;
-        let backward_bptt = disp.register("backward_bptt")?;
-        let grad_tf_latw  = disp.register("grad_acc_tf_latw")?;
-        let grad_wout     = disp.register("grad_acc_wout")?;
-        let grad_b_f      = disp.register("grad_acc_b_f")?;
-        let grad_pos      = disp.register("grad_acc_pos")?;
-        let sumsq         = disp.register("sumsq_main")?;
-        let zero_acc      = disp.register("zero_acc")?;
-        let sgd           = disp.register("sgd_main")?;
-        let zero_g        = disp.register("zero_grads")?;
+        let forward            = disp.register("forward_main")?;
+        let backward           = disp.register("backward_main")?;
+        let backward_bptt      = disp.register("backward_bptt")?;
+        let backward_bptt_bit  = disp.register("backward_bptt_bit")?;
+        let backward_bptt_kl   = disp.register("backward_bptt_kl")?;
+        let grad_tf_latw       = disp.register("grad_acc_tf_latw")?;
+        let grad_wout          = disp.register("grad_acc_wout")?;
+        let grad_b_f           = disp.register("grad_acc_b_f")?;
+        let grad_pos           = disp.register("grad_acc_pos")?;
+        let sumsq              = disp.register("sumsq_main")?;
+        let zero_acc           = disp.register("zero_acc")?;
+        let sgd                = disp.register("sgd_main")?;
+        let zero_g             = disp.register("zero_grads")?;
 
         // Validação: aborta cedo se hipcc mudou o layout.
         // Para os novos kernels (bptt/grad_acc), os tamanhos esperados são estimativas
         // — se falhar, rodar `extract_layouts.py` e actualizar as constantes KARG_*.
         for (name, actual, expected) in [
-            ("forward_main",     forward.kernarg_size,       KARG_FORWARD),
-            ("backward_main",    backward.kernarg_size,      KARG_BACKWARD),
-            ("backward_bptt",    backward_bptt.kernarg_size, KARG_BPTT),
-            ("grad_acc_tf_latw", grad_tf_latw.kernarg_size,  KARG_GRAD_TF_LATW),
-            ("grad_acc_wout",    grad_wout.kernarg_size,     KARG_GRAD_WOUT),
-            ("grad_acc_b_f",     grad_b_f.kernarg_size,      KARG_GRAD_BF),
-            ("grad_acc_pos",     grad_pos.kernarg_size,      KARG_GRAD_POS),
-            ("sumsq_main",       sumsq.kernarg_size,         KARG_SUMSQ),
-            ("zero_acc",         zero_acc.kernarg_size,      KARG_ZERO_ACC),
-            ("sgd_main",         sgd.kernarg_size,           KARG_SGD),
-            ("zero_grads",       zero_g.kernarg_size,        KARG_ZERO_G),
+            ("forward_main",      forward.kernarg_size,           KARG_FORWARD),
+            ("backward_main",     backward.kernarg_size,          KARG_BACKWARD),
+            ("backward_bptt",     backward_bptt.kernarg_size,     KARG_BPTT),
+            ("backward_bptt_bit", backward_bptt_bit.kernarg_size, KARG_BPTT),
+            ("backward_bptt_kl",  backward_bptt_kl.kernarg_size,  KARG_BPTT),
+            ("grad_acc_tf_latw",  grad_tf_latw.kernarg_size,      KARG_GRAD_TF_LATW),
+            ("grad_acc_wout",     grad_wout.kernarg_size,         KARG_GRAD_WOUT),
+            ("grad_acc_b_f",      grad_b_f.kernarg_size,          KARG_GRAD_BF),
+            ("grad_acc_pos",      grad_pos.kernarg_size,          KARG_GRAD_POS),
+            ("sumsq_main",        sumsq.kernarg_size,             KARG_SUMSQ),
+            ("zero_acc",          zero_acc.kernarg_size,          KARG_ZERO_ACC),
+            ("sgd_main",          sgd.kernarg_size,               KARG_SGD),
+            ("zero_grads",        zero_g.kernarg_size,            KARG_ZERO_G),
         ] {
             assert_eq!(
                 actual, expected,
@@ -181,8 +191,9 @@ impl SmgRuntime {
             );
         }
 
-        Ok(Self { disp, forward, backward, backward_bptt, grad_tf_latw, grad_wout,
-                  grad_b_f, grad_pos, sumsq, zero_acc, sgd, zero_g })
+        Ok(Self { disp, forward, backward, backward_bptt, backward_bptt_bit, backward_bptt_kl,
+                  grad_tf_latw, grad_wout, grad_b_f, grad_pos,
+                  sumsq, zero_acc, sgd, zero_g })
     }
 
     // -----------------------------------------------------------------------
@@ -347,6 +358,76 @@ impl SmgRuntime {
             // Sem hidden args (usa apenas blockIdx.x e threadIdx.x).
             let grid = (params.batch_size * 128, 1, 1);
             self.disp.ctx.dispatch_async(&self.backward_bptt, karg, grid, (128, 1, 1), 0)
+        }
+    }
+
+    /// dispatch_backward_bptt_bit — variante com BCE bit-level (marginal sobre softmax).
+    /// Mesma assinatura/layout que `dispatch_backward_bptt`. Só muda o kernel chamado.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dispatch_backward_bptt_bit(
+        &self,
+        params:        ParamsBwd,
+        t_f:           u64, lat_w:        u64, w_out:         u64,
+        states_all:    u64, logits_in:    u64,
+        windows:       u64, targets:      u64,
+        g_i_f:         u64,
+        g_nibble_h:    u64, g_nibble_l:   u64,
+        g_b_out:       u64,
+        d_pre_out:     u64, d_logits_out: u64,
+    ) -> Result<(), HsaError> {
+        unsafe {
+            let karg = self.disp.next_kernarg(KARG_BPTT as usize);
+            Self::write_at::<ParamsBwd>(karg,   0, params);
+            Self::write_at::<u64>(karg,  16, t_f);
+            Self::write_at::<u64>(karg,  24, lat_w);
+            Self::write_at::<u64>(karg,  32, w_out);
+            Self::write_at::<u64>(karg,  40, states_all);
+            Self::write_at::<u64>(karg,  48, logits_in);
+            Self::write_at::<u64>(karg,  56, windows);
+            Self::write_at::<u64>(karg,  64, targets);
+            Self::write_at::<u64>(karg,  72, g_i_f);
+            Self::write_at::<u64>(karg,  80, g_nibble_h);
+            Self::write_at::<u64>(karg,  88, g_nibble_l);
+            Self::write_at::<u64>(karg,  96, g_b_out);
+            Self::write_at::<u64>(karg, 104, d_pre_out);
+            Self::write_at::<u64>(karg, 112, d_logits_out);
+            let grid = (params.batch_size * 128, 1, 1);
+            self.disp.ctx.dispatch_async(&self.backward_bptt_bit, karg, grid, (128, 1, 1), 0)
+        }
+    }
+
+    /// dispatch_backward_bptt_kl — variante KL soft-target (distillation).
+    /// `target_dist`: ponteiro pra [B, V] f32 (soft target distribution).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dispatch_backward_bptt_kl(
+        &self,
+        params:        ParamsBwd,
+        t_f:           u64, lat_w:        u64, w_out:         u64,
+        states_all:    u64, logits_in:    u64,
+        windows:       u64, target_dist:  u64,   // f32* [B, V]
+        g_i_f:         u64,
+        g_nibble_h:    u64, g_nibble_l:   u64,
+        g_b_out:       u64,
+        d_pre_out:     u64, d_logits_out: u64,
+    ) -> Result<(), HsaError> {
+        unsafe {
+            let karg = self.disp.next_kernarg(KARG_BPTT as usize);
+            Self::write_at::<ParamsBwd>(karg,   0, params);
+            Self::write_at::<u64>(karg,  16, t_f);
+            Self::write_at::<u64>(karg,  24, lat_w);
+            Self::write_at::<u64>(karg,  32, w_out);
+            Self::write_at::<u64>(karg,  40, states_all);
+            Self::write_at::<u64>(karg,  48, logits_in);
+            Self::write_at::<u64>(karg,  56, windows);
+            Self::write_at::<u64>(karg,  64, target_dist);
+            Self::write_at::<u64>(karg,  72, g_i_f);
+            Self::write_at::<u64>(karg,  80, g_nibble_h);
+            Self::write_at::<u64>(karg,  88, g_nibble_l);
+            Self::write_at::<u64>(karg,  96, g_b_out);
+            Self::write_at::<u64>(karg, 104, d_pre_out);
+            Self::write_at::<u64>(karg, 112, d_logits_out);
+            let grid = (params.batch_size * 128, 1, 1);
+            self.disp.ctx.dispatch_async(&self.backward_bptt_kl, karg, grid, (128, 1, 1), 0)
         }
     }
 

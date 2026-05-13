@@ -48,6 +48,8 @@ fn compile_smg_kernels() {
         "smg_forward",
         "smg_backward",
         "smg_backward_bptt",
+        "smg_backward_bptt_bit",  // BPTT com BCE bit-level (marginal sobre softmax 256)
+        "smg_backward_bptt_kl",   // BPTT com KL soft-target (distill Qwen→SMG)
         "smg_grad_acc",
         "smg_norm",
         "smg_sgd",

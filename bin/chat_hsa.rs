@@ -37,7 +37,7 @@ use blab::{
 };
 
 // ---- Configuração ----
-const WINDOW:    usize = 48;
+const WINDOW:    usize = 96;
 const VOCAB:     usize = 256;
 const SEED:      u64   = 7;
 const MAX_RESP:  usize = 200;   // comprimento máximo da resposta em bytes
