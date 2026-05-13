@@ -3953,6 +3953,76 @@ fn handle_client(
         format!("{{\"n_trees\":{},\"grid\":{},\"total_branches\":{},\"mycelium_edges\":{},\"trees\":[{}]}}",
             g.forest.n_trees(), blab::gravity_forest::GRID,
             total_branches, g.forest.mycelium.len(), trees.join(","))
+    } else if method == "GET" && path == "/dashboard" {
+        // HTML dashboard — single page snapshot of brain state.
+        let g = brain.lock().unwrap();
+        let a = auto_state.lock().unwrap();
+        let cs = curiosity_state;
+        let ds = detector_state.lock().unwrap();
+        let ck = ckpt_state.lock().unwrap();
+        let stats_html = format!(
+            "bytes: <b>{}</b> | words: <b>{}</b> | phrases: <b>{}</b> | dialogs: <b>{}</b> | triples: <b>{}</b> | bigram_edges: <b>{}</b>",
+            g.unigram.iter().sum::<u32>(),
+            g.word_count.len(), g.phrase_count.len(),
+            g.dialog_pairs.len(), g.triples.len(),
+            g.bigram.iter().filter(|&&c| c > 0).count());
+        let moe_rows: String = g.experts.iter().map(|e| {
+            format!("<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                e.name, e.dialog_indices.len(), e.n_hits)
+        }).collect();
+        let tree_rows: String = g.forest.trees.iter().map(|t| {
+            format!("<tr><td>{}</td><td>({:.2},{:.2},{:.2})</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
+                t.name, t.position.x, t.position.y, t.position.z, t.mass, t.n_dialogs, t.branches.len())
+        }).collect();
+        use std::sync::atomic::Ordering;
+        let html = format!(
+            "<!DOCTYPE html><html><head><title>IARA Brain Dashboard</title>\
+             <meta http-equiv=\"refresh\" content=\"10\">\
+             <style>\
+               body{{font-family:monospace;background:#0f1419;color:#bfbdb6;padding:20px;}}\
+               h1{{color:#ffb454;}} h2{{color:#73d0ff;border-bottom:1px solid #1f2430;padding-bottom:4px;}}\
+               table{{border-collapse:collapse;margin:8px 0;}} \
+               td,th{{padding:4px 12px;border:1px solid #1f2430;}} th{{background:#1f2430;color:#73d0ff;}}\
+               .ok{{color:#7fd962;}} .stat{{font-size:14px;}}\
+             </style></head><body>\
+             <h1>🧠 IARA-Byte Brain v0.6.1 — Dashboard</h1>\
+             <p class=\"stat\">{stats}</p>\
+             <h2>Auto-learn</h2>\
+             <p>cycles: <b>{cyc}</b> | dialogs learned: <b>{dl}</b> | triples learned: <b>{tl}</b> | last cycle: <b>{lcms}ms</b></p>\
+             <h2>Curiosity</h2>\
+             <p>running: <b class=\"ok\">{cur_run}</b> | workers: <b>{cur_w}</b> | asked: <b>{cur_a}</b> | answered: <b>{cur_ans}</b> | topics: <b>{cur_t}</b></p>\
+             <h2>Domain Detector</h2>\
+             <p>scans: <b>{det_s}</b> | emerging: <b>{det_e}</b> | auto-spawned: <b>{det_sp}</b></p>\
+             <h2>Checkpoint</h2>\
+             <p>count: <b>{ck_c}</b> | last ms: <b>{ck_ms}</b></p>\
+             <h2>MoE Experts ({n_exp})</h2>\
+             <table><tr><th>Name</th><th>Dialogs</th><th>Hits</th></tr>{moe}</table>\
+             <h2>Gravity Forest ({n_trees} trees, {n_branches} branches, {n_myc} mycelium edges)</h2>\
+             <table><tr><th>Name</th><th>Position</th><th>Mass</th><th>Dialogs</th><th>Branches</th></tr>{trees}</table>\
+             <p><small>Auto-refresh 10s</small></p>\
+             </body></html>",
+            stats = stats_html,
+            cyc = a.cycles, dl = a.total_dialogs_learned, tl = a.total_triples_learned, lcms = a.last_cycle_ms,
+            cur_run = cs.running.load(Ordering::Relaxed),
+            cur_w = cs.workers_active.load(Ordering::Relaxed),
+            cur_a = cs.questions_asked.load(Ordering::Relaxed),
+            cur_ans = cs.questions_answered.load(Ordering::Relaxed),
+            cur_t = cs.topics_explored.lock().unwrap().len(),
+            det_s = ds.scans, det_e = ds.emerging.len(), det_sp = ds.auto_spawned,
+            ck_c = ck.count, ck_ms = ck.last_ms,
+            n_exp = g.experts.len(), moe = moe_rows,
+            n_trees = g.forest.n_trees(),
+            n_branches = g.forest.trees.iter().map(|t| t.branches.len()).sum::<usize>(),
+            n_myc = g.forest.mycelium.len(),
+            trees = tree_rows,
+        );
+        // Return raw HTML — special-case the response wrapper
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(), html
+        );
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
     } else if method == "GET" && path == "/graph_dot" {
         // DOT graph: forest trees as nodes + mycelium edges
         let g = brain.lock().unwrap();
