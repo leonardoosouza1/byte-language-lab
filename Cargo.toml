@@ -1,9 +1,9 @@
 [package]
 name = "byte-language-lab"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85.0"
-description = "Empirical lab for byte-as-language hypothesis: structured byte streams as the unit of intelligence, replacing tokens and floats with positional-coded discrete units."
+description = "IARA-Byte Brain v0.5 — hybrid byte-level brain + Qwen teacher. MoE static + domain detection + tool routing + auto-learn. Tese byte-as-language. Veja CHANGELOG.md."
 
 [lib]
 name = "blab"

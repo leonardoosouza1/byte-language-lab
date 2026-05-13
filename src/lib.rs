@@ -23,6 +23,7 @@ pub mod learn;
 pub mod compose;
 pub mod fsm_byte;
 pub mod gpu;
+pub mod wal;
 
 #[cfg(feature = "gpu-aql")]
 pub mod gpu_aql;

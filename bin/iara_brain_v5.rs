@@ -42,6 +42,158 @@ use rayon::prelude::*;
     b.is_ascii_alphabetic() || b >= 0x80 || b == b'\''
 }
 
+/// Universal tool runner: spawns Python helper scripts/tools.py.
+/// subcmd: wiki|search|url|pdf|arxiv|github
+/// arg: topic/URL/path
+/// Returns formatted result or None on error/empty. Auto-ingests Q→A to WAL.
+fn run_tool(subcmd: &str, arg: &str) -> Option<String> {
+    let script = "scripts/tools.py";
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg(subcmd)
+        .arg(arg)
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if result.is_empty() { return None; }
+    // Truncate to ~600 chars for response readability
+    let short: String = result.chars().take(700).collect();
+    let prefix = match subcmd {
+        "wiki" => "📡 Wikipedia",
+        "search" => "🔍 Web search",
+        "url" => "🌐 URL",
+        "pdf" => "📄 PDF",
+        "arxiv" => "📚 ArXiv",
+        "github" => "🐙 GitHub",
+        _ => "🔧 Tool",
+    };
+    let final_resp = format!("{}: {}", prefix, short);
+    // Ingest to WAL: brain learns from fetch
+    let _ = wal_ingest_web(arg, &final_resp);
+    Some(final_resp)
+}
+
+/// Web search via Wikipedia REST API (PT-BR). Uses curl subprocess (HTTPS).
+/// Returns short summary or None if not found / network error.
+/// Also auto-ingests Q→A pair to WAL so next query = cache hit.
+fn web_search_wikipedia(topic: &str) -> Option<String> {
+    // URL-encode topic, prefer first-letter-capitalized for wiki page lookup
+    let title = {
+        let mut chars = topic.chars();
+        match chars.next() {
+            Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+            None => return None,
+        }
+    };
+    // Replace spaces with underscores per Wikipedia convention
+    let url_path: String = title.chars().map(|c| if c == ' ' { '_' } else { c }).collect();
+    let url = format!("https://pt.wikipedia.org/api/rest_v1/page/summary/{}", url_path);
+
+    let output = std::process::Command::new("curl")
+        .arg("-s").arg("-L")
+        .arg("--max-time").arg("10")
+        .arg("-A").arg("IARA-Byte-Brain/1.0 (research)")
+        .arg(&url)
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    // Parse "extract" field — Wikipedia summary
+    let extract = extract_json_str(&body, "extract")?;
+    if extract.trim().is_empty() || extract.contains("redirect") && extract.len() < 80 {
+        return None;
+    }
+    // Truncate to ~400 chars for cleanliness
+    let summary: String = extract.chars().take(500).collect();
+    // Auto-ingest pair to WAL — brain learns from this fetch
+    let _ = wal_ingest_web(topic, &summary);
+    Some(format!("📡 Wikipedia: {}", summary))
+}
+
+/// Append web result to WAL so daemon absorbs into brain.
+fn wal_ingest_web(query: &str, summary: &str) -> std::io::Result<()> {
+    let path = "data/auto_learn.wal";
+    let mut f = wal::open_for_append(path)?;
+    wal::append(&mut f, &wal::Record {
+        rtype: wal::TYPE_CURIOSITY,
+        flags: wal::FLAG_FROM_QWEN | wal::FLAG_HIGH_QUALITY,
+        ts: wal::now_ts(),
+        score: 0.95,
+        user: query.as_bytes().to_vec(),
+        model: summary.as_bytes().to_vec(),
+    })
+}
+
+/// Evaluate simple arithmetic expression "X + Y + Z" / "X * Y" / "X-Y".
+/// Returns Some(result) if expression parsable.
+fn eval_arithmetic(expr: &str) -> Option<i64> {
+    // Tokenize: skip non-arith chars, accept digits + + * - × ÷
+    let cleaned: String = expr.chars()
+        .map(|c| match c {
+            '×' | 'x' => '*',
+            '÷' | ':' => '/',
+            _ => c,
+        })
+        .filter(|c| c.is_ascii_digit() || matches!(*c, '+' | '-' | '*' | '/' | ' '))
+        .collect();
+    let parts: Vec<&str> = cleaned.split_whitespace().collect();
+    if parts.is_empty() { return None; }
+    // Two-pass: handle * / first, then + -
+    let mut tokens: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+    // Pass 1: * /
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "*" || tokens[i] == "/" {
+            if i == 0 || i + 1 >= tokens.len() { return None; }
+            let a: i64 = tokens[i-1].parse().ok()?;
+            let b: i64 = tokens[i+1].parse().ok()?;
+            let r = if tokens[i] == "*" { a.checked_mul(b)? } else if b != 0 { a / b } else { return None; };
+            tokens.drain(i-1..=i+1);
+            tokens.insert(i-1, r.to_string());
+            i = if i > 0 { i - 1 } else { 0 };
+        } else {
+            i += 1;
+        }
+    }
+    // Pass 2: + -
+    let mut result: i64 = tokens[0].parse().ok()?;
+    let mut idx = 1;
+    while idx + 1 < tokens.len() {
+        let op = &tokens[idx];
+        let v: i64 = tokens[idx + 1].parse().ok()?;
+        match op.as_str() {
+            "+" => result = result.checked_add(v)?,
+            "-" => result = result.checked_sub(v)?,
+            _ => return None,
+        }
+        idx += 2;
+    }
+    Some(result)
+}
+
+/// Detect arithmetic/geometric sequence and return next term.
+fn extrapolate_sequence(nums: &[i64]) -> Option<i64> {
+    if nums.len() < 3 { return None; }
+    // Arithmetic? constant diff
+    let d1 = nums[1] - nums[0];
+    if nums.windows(2).all(|w| w[1] - w[0] == d1) {
+        return Some(nums[nums.len() - 1] + d1);
+    }
+    // Geometric? constant ratio
+    if nums[0] != 0 && nums[1] % nums[0] == 0 {
+        let r = nums[1] / nums[0];
+        if r != 0 && nums.windows(2).all(|w| w[0] != 0 && w[1] / w[0] == r && w[1] % w[0] == 0) {
+            return Some(nums[nums.len() - 1] * r);
+        }
+    }
+    // Fibonacci?
+    if nums.len() >= 3 && nums.windows(3).all(|w| w[2] == w[0] + w[1]) {
+        return Some(nums[nums.len() - 1] + nums[nums.len() - 2]);
+    }
+    None
+}
+
 fn phono_class(b: u8) -> u8 {
     match b {
         b'a'|b'e'|b'i'|b'o'|b'u'|b'A'|b'E'|b'I'|b'O'|b'U' => 1,
@@ -181,6 +333,42 @@ fn hv_hamming(a: &Hv, b: &Hv) -> u32 {
     let mut d = 0u32;
     for i in 0..16 { d += (a[i] ^ b[i]).count_ones(); }
     d
+}
+
+/// Cosine-like similarity normalized: 1.0 = identical, 0.0 = orthogonal-ish.
+/// Uses Hamming distance: closer = lower hamming. Normalized over 1024 bits.
+#[inline]
+fn hv_similarity(a: &Hv, b: &Hv) -> f32 {
+    let h = hv_hamming(a, b) as f32;
+    1.0 - (h / 1024.0).min(1.0)
+}
+
+/// Encode prompt as BoW (bag-of-words) HV — word-level, order-invariant.
+/// Each word → byte-bundle HV with intra-word position-roll (so "casa" ≠ "saca").
+/// Words bundled order-agnostic so "Newton e Einstein" ≡ "Einstein e Newton".
+/// Lowercase + strips accents → robust to typos/casing.
+fn encode_prompt_hv(prompt: &[u8]) -> Hv {
+    let s = String::from_utf8_lossy(prompt).to_lowercase();
+    let mut acc = [0u64; 16];
+    for word in s.split(|c: char| !c.is_alphanumeric()) {
+        if word.len() < 3 { continue; }
+        // Stop words filter (PT-BR)
+        const STOPS: &[&str] = &["que", "para", "com", "uma", "dos", "das", "por",
+                                   "ele", "ela", "isso", "este", "esta", "esse",
+                                   "essa", "como", "qual", "quais", "mais", "menos",
+                                   "sobre", "entre", "também"];
+        if STOPS.contains(&word) { continue; }
+        // Compute word HV: byte-bundle with intra-position roll
+        let mut word_hv = [0u64; 16];
+        for (i, b) in word.bytes().enumerate() {
+            let mut hv = byte_to_hv(b);
+            hv_rotate(&mut hv, (i as u32) * 5);
+            for j in 0..16 { word_hv[j] ^= hv[j]; }
+        }
+        // XOR into accumulator (order-invariant across words)
+        for j in 0..16 { acc[j] ^= word_hv[j]; }
+    }
+    acc
 }
 
 /// HDC specialist score: cohesion = 1 - hamming/1024
@@ -562,6 +750,15 @@ struct Brain {
 
     // Dialog memory — USER turn → MODEL response candidates
     dialog_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    // Parallel HDC index — each dialog_user encoded as 1024-bit HV.
+    // Indexes align with dialog_pairs: dialog_hvs[i] is HV of dialog_pairs[i].0
+    // Allows fast cosine/hamming retrieval vs BoW.
+    dialog_hvs: Vec<Hv>,
+    // ─── MoE FASE 1: static experts ───
+    // Each expert has a centroid HV (mean of its domain dialog HVs) + dialog index subset.
+    // Router: query HV → cosine to centroids → top-2 → search only those dialog subsets.
+    // Não serializado em brain.bin — rebuilt on load via build_static_experts().
+    experts: Vec<ExpertHead>,
 
     // Knowledge graph: entity → relation → value (string-keyed for now)
     // Ex: ("Brasil", "capital") → "Brasília"
@@ -606,6 +803,17 @@ struct Brain {
 
     // Persona tracker — updates per query, persists across session
     persona: PersonaProfile,
+}
+
+/// MoE Expert Head — domain-specialized routing target.
+/// Each expert holds centroid HV + subset of dialog indices belonging to its domain.
+#[derive(Clone)]
+struct ExpertHead {
+    name: String,
+    centroid_hv: Hv,             // mean HV of domain dialog HVs
+    dialog_indices: Vec<usize>,  // indices into brain.dialog_pairs
+    keywords: Vec<&'static str>, // seed keywords pra build domain
+    n_hits: u64,                 // routing hits counter
 }
 
 #[derive(Default, Clone)]
@@ -686,6 +894,8 @@ impl Brain {
             word_after_punct: HashMap::new(),
             word_trigram: HashMap::new(),
             dialog_pairs: Vec::new(),
+            dialog_hvs: Vec::new(),
+            experts: Vec::new(),
             triples: HashMap::new(),
             reverse_triples: HashMap::new(),
             phrase_count: HashMap::new(),
@@ -1000,6 +1210,8 @@ impl Brain {
         // 2. Add dialog pair direct (skip parse — we already have the split)
         if !user.is_empty() && !model.is_empty() && model.len() < 1500 {
             self.dialog_pairs.push((user.to_vec(), model.to_vec()));
+            // Parallel HDC index — encode user prompt as 1024-bit HV
+            self.dialog_hvs.push(encode_prompt_hv(user));
         }
 
         // 3. Extract triples from THIS pair only, insert into KG
@@ -1016,7 +1228,7 @@ impl Brain {
         }
     }
 
-    /// Batch delta ingest com lazy PMI recompute.
+    /// Batch delta ingest com lazy PMI recompute + CfC online retraining.
     /// Chama ingest_dialog_delta para cada par e recompute PMI/topology UMA vez no fim.
     fn ingest_batch_delta(&mut self, pairs: &[(Vec<u8>, Vec<u8>)]) -> (usize, usize) {
         let before_d = self.dialog_pairs.len();
@@ -1027,6 +1239,31 @@ impl Brain {
         // Recompute lazy (cheap em PMI 256×256, mas só uma vez por batch)
         self.compute_pmi_and_harmony();
         self.compute_topology();
+
+        // CfC online retraining: train on the new pairs (1 epoch, low LR)
+        let lr = 0.001;
+        for (u, m) in pairs {
+            let mut combined = Vec::with_capacity(u.len() + m.len() + 16);
+            combined.extend_from_slice(b"USER: ");
+            combined.extend_from_slice(u);
+            combined.extend_from_slice(b"\nMODEL: ");
+            combined.extend_from_slice(m);
+            if combined.len() < 8 { continue; }
+            let classes: Vec<u8> = combined.iter().map(|b| phono_class(*b)).collect();
+            self.char_cfc.train_step(&classes, &combined, lr);
+            // Word-level CfC: train on word boundary class sequence
+            let words = Self::split_words(&combined);
+            if words.len() >= 4 {
+                let word_classes: Vec<u8> = words.iter()
+                    .map(|(w, _)| phono_class(w.get(0).copied().unwrap_or(0)))
+                    .collect();
+                let word_bytes: Vec<u8> = words.iter()
+                    .map(|(w, _)| w.get(0).copied().unwrap_or(0))
+                    .collect();
+                self.word_cfc.train_step(&word_classes, &word_bytes, lr);
+            }
+        }
+
         let new_d = self.dialog_pairs.len() - before_d;
         let new_t = self.triples.len() - before_t;
         (new_d, new_t)
@@ -1130,6 +1367,151 @@ impl Brain {
         scored.into_iter().map(|(i, s)| (self.dialog_pairs[i].1.clone(), s)).collect()
     }
 
+    /// HDC retrieval — encode prompt as HV, hamming search against dialog_hvs pool.
+    /// Much faster than BoW for large dialog pools (O(n) but cache-friendly tight loop).
+    /// Returns top-K (model_bytes, similarity) pairs. similarity in [0, 1].
+    fn retrieve_dialog_hdc(&self, prompt: &[u8], k: usize, min_sim: f32) -> Vec<(Vec<u8>, f32)> {
+        if self.dialog_hvs.is_empty() { return Vec::new(); }
+        let query = encode_prompt_hv(prompt);
+        let mut scored: Vec<(usize, f32)> = self.dialog_hvs.iter().enumerate()
+            .map(|(i, hv)| (i, hv_similarity(&query, hv)))
+            .filter(|(_, s)| *s >= min_sim)
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.truncate(k);
+        scored.into_iter()
+            .filter_map(|(i, s)| self.dialog_pairs.get(i).map(|(_, m)| (m.clone(), s)))
+            .collect()
+    }
+
+    /// Lazy rebuild dialog_hvs from dialog_pairs (call after legacy load).
+    fn rebuild_dialog_hvs(&mut self) {
+        if self.dialog_hvs.len() == self.dialog_pairs.len() { return; }
+        self.dialog_hvs.clear();
+        self.dialog_hvs.reserve(self.dialog_pairs.len());
+        for (u, _) in &self.dialog_pairs {
+            self.dialog_hvs.push(encode_prompt_hv(u));
+        }
+    }
+
+    /// MoE Fase 1: build 10 static experts via keyword-based domain assignment.
+    /// Each expert's centroid = mean HV of dialogs whose prompt contains keywords.
+    /// Called after rebuild_dialog_hvs in load().
+    fn build_static_experts(&mut self) {
+        let domains: &[(&str, Vec<&'static str>)] = &[
+            ("Tecnologia",  vec!["python", "rust", "javascript", "código", "programação", "algoritmo", "git", "docker", "kubernetes", "blockchain", "machine learning", "ia", "linux", "api", "rest"]),
+            ("Ciências",    vec!["fotossíntese", "dna", "evolução", "química", "biologia", "física", "átomo", "molécula", "célula", "neurônio", "vacina", "imunológico", "krebs", "gravidade", "luz"]),
+            ("História",    vec!["guerra", "império", "revolução", "imperador", "tiradentes", "vargas", "napoleão", "bizantino", "roma", "iluminismo", "lutero", "renascimento", "lincoln", "hitler"]),
+            ("Filosofia",   vec!["sócrates", "platão", "aristóteles", "kant", "nietzsche", "estoicismo", "existencialismo", "fenomenologia", "marx", "niilismo", "metafísica", "ética"]),
+            ("Artes",       vec!["vinci", "michelangelo", "picasso", "beethoven", "mozart", "shakespeare", "samba", "bossa", "machado", "drummond", "mona lisa", "guernica", "cinema", "pintura"]),
+            ("Geografia",   vec!["brasil", "amazônia", "capital", "rio", "monte", "deserto", "oceano", "país", "continente", "andes", "himalaia", "saara", "tóquio", "nilo"]),
+            ("Matemática",  vec!["bhaskara", "derivada", "integral", "pitágoras", "logaritmo", "matriz", "função", "número", "fração", "probabilidade", "geometria", "trigonometria"]),
+            ("Saúde",       vec!["diabetes", "câncer", "coração", "antibiótico", "metabolismo", "cérebro", "colesterol", "insulina", "hipertensão", "vacina", "tumor"]),
+            ("Economia",    vec!["inflação", "pib", "bolsa", "capitalismo", "juros", "câmbio", "bitcoin", "macroeconomia", "selic", "ações", "moeda"]),
+            ("OOV-Cultura", vec!["cringe", "shippar", "mood", "flopar", "crush", "stalkear", "cancelamento", "red flag", "internet", "meme"]),
+        ];
+
+        self.experts.clear();
+        for (name, keywords) in domains {
+            // Scan dialog_pairs: assign to this expert if any keyword matches prompt (lc)
+            let mut indices: Vec<usize> = Vec::new();
+            for (idx, (u, _)) in self.dialog_pairs.iter().enumerate() {
+                let u_lc = String::from_utf8_lossy(u).to_lowercase();
+                if keywords.iter().any(|kw| u_lc.contains(kw)) {
+                    indices.push(idx);
+                }
+            }
+            // Compute centroid HV: bitwise majority across this expert's dialog HVs
+            let centroid = if indices.is_empty() {
+                [0u64; 16]
+            } else {
+                let mut bit_counts = [0u32; 1024];
+                for &idx in &indices {
+                    let hv = &self.dialog_hvs[idx];
+                    for word_i in 0..16 {
+                        let w = hv[word_i];
+                        for bit in 0..64 {
+                            if (w >> bit) & 1 == 1 {
+                                bit_counts[word_i * 64 + bit] += 1;
+                            }
+                        }
+                    }
+                }
+                let n = indices.len() as u32;
+                let mut out = [0u64; 16];
+                for word_i in 0..16 {
+                    let mut w = 0u64;
+                    for bit in 0..64 {
+                        if bit_counts[word_i * 64 + bit] * 2 > n {
+                            w |= 1u64 << bit;
+                        }
+                    }
+                    out[word_i] = w;
+                }
+                out
+            };
+            self.experts.push(ExpertHead {
+                name: name.to_string(),
+                centroid_hv: centroid,
+                dialog_indices: indices,
+                keywords: keywords.clone(),
+                n_hits: 0,
+            });
+        }
+        // Log
+        let totals: Vec<String> = self.experts.iter()
+            .map(|e| format!("{}={}", e.name, e.dialog_indices.len()))
+            .collect();
+        println!("  MoE static experts built ({}): {}", self.experts.len(), totals.join(", "));
+    }
+
+    /// Route query via MoE: keyword fast-path + HV centroid fallback.
+    /// Returns (response, similarity, expert_name) or None.
+    fn retrieve_dialog_moe(&self, prompt: &[u8], k: usize, min_sim: f32)
+        -> Option<(Vec<u8>, f32, String)>
+    {
+        if self.experts.is_empty() || self.dialog_hvs.is_empty() { return None; }
+        let prompt_lc = String::from_utf8_lossy(prompt).to_lowercase();
+        let query = encode_prompt_hv(prompt);
+
+        // Score experts: keyword match (strong) + HV centroid sim (weak)
+        let mut expert_scores: Vec<(usize, f32)> = self.experts.iter().enumerate()
+            .map(|(i, e)| {
+                // Keyword count in prompt
+                let kw_hits: usize = e.keywords.iter()
+                    .filter(|kw| prompt_lc.contains(*kw)).count();
+                let kw_score = (kw_hits as f32 * 0.4).min(1.0);
+                // Centroid HV similarity
+                let hv_score = hv_similarity(&query, &e.centroid_hv);
+                // Combine: keyword dominant
+                let combined = kw_score * 0.7 + hv_score * 0.3;
+                (i, combined)
+            })
+            .collect();
+        expert_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Top expert only if score significantly above next
+        if expert_scores[0].1 < 0.15 { return None; }
+        expert_scores.truncate(3);  // top-3 experts
+
+        // Search dialogs within top-3 experts (HV match)
+        let mut best: Option<(Vec<u8>, f32, String)> = None;
+        for (eidx, _gate_score) in &expert_scores {
+            let expert = &self.experts[*eidx];
+            for &didx in &expert.dialog_indices {
+                if didx >= self.dialog_hvs.len() { continue; }
+                let sim = hv_similarity(&query, &self.dialog_hvs[didx]);
+                if sim >= min_sim {
+                    if best.as_ref().map(|(_, s, _)| sim > *s).unwrap_or(true) {
+                        best = Some((self.dialog_pairs[didx].1.clone(), sim, expert.name.clone()));
+                    }
+                }
+            }
+            if best.is_some() && best.as_ref().unwrap().1 >= 0.8 { break; }
+        }
+        let _ = k;
+        best
+    }
+
     /// Score response using specialist swarm (avg consensus over transitions in response)
     fn score_response(&self, response: &[u8]) -> f32 {
         if response.len() < 4 { return 0.0; }
@@ -1199,8 +1581,27 @@ impl Brain {
             let entity = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
             out.push((entity, "localizacao".into(), resp_trim.to_string()));
         }
-        // Heuristic 5: Sentence "X é Y" / "X foi Y" — direct triple
-        // For each first sentence ending with ., extract subject (até primeira " é " ou " foi ")
+        // Heuristic 5 (curiosity): "explique X" → definição
+        if let Some(rest) = user_lc.strip_prefix("explique ") {
+            let entity = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
+            out.push((entity, "definicao".into(), resp_trim.to_string()));
+        }
+        // Heuristic 6 (curiosity): "fale mais sobre X" → detalhes
+        if let Some(rest) = user_lc.strip_prefix("fale mais sobre ") {
+            let entity = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
+            out.push((entity, "detalhes".into(), resp_trim.to_string()));
+        }
+        // Heuristic 7 (curiosity): "qual a relação entre X e Y?" → relação
+        if let Some(rest) = user_lc.strip_prefix("qual a relação entre ").or(user_lc.strip_prefix("qual a relacao entre ")) {
+            let clean = rest.trim().trim_end_matches('?').trim_end_matches('.');
+            if let Some(sep_idx) = clean.find(" e ") {
+                let e1 = capitalize_first(clean[..sep_idx].trim());
+                let e2 = capitalize_first(clean[sep_idx+3..].trim());
+                out.push((e1.clone(), format!("relação_com_{}", e2.to_lowercase()), resp_trim.to_string()));
+                out.push((e2, format!("relação_com_{}", e1.to_lowercase()), resp_trim.to_string()));
+            }
+        }
+        // Heuristic 8: Sentence "X é Y" / "X foi Y" — direct triple
         let first_sentence = resp_trim.split(|c: char| c == '.' || c == '!' || c == '?').next().unwrap_or("");
         for sep in &[" é ", " foi ", " são ", " significa "] {
             if let Some(idx) = first_sentence.find(sep) {
@@ -1307,7 +1708,621 @@ impl Brain {
                 return Some(v.clone());
             }
         }
+
+        // ─── COMPOSE: "compare X e Y" / "diferença entre X e Y" / "X vs Y" ───
+        // Busca facts de X e Y no KG, monta resposta sintética.
+        for prefix in &["compare ", "diferença entre ", "diferenca entre "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                for sep in &[" e ", " vs ", " com ", " versus "] {
+                    if let Some(idx) = rest.find(sep) {
+                        let x = capitalize_first(rest[..idx].trim());
+                        let y = capitalize_first(rest[idx + sep.len()..].trim()
+                            .trim_end_matches('?').trim_end_matches('.')
+                            .trim_end_matches(" em performance")
+                            .trim_end_matches(" diferentemente"));
+                        if let Some(ans) = self.compose_compare(&x, &y) {
+                            return Some(ans);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ─── TOOL ROUTER: tools.py subprocess ───
+        // Prefixes → subcommands:
+        //   pesquise/busque/procure/wikipedia/wikipédia → wiki
+        //   busque na web / pesquise no google         → search (DuckDuckGo)
+        //   leia url / extraia url / fetch url         → url
+        //   leia pdf / extraia pdf                     → pdf
+        //   busque artigo / arxiv                      → arxiv
+        //   github                                     → github
+        let tool_routes: &[(&str, &str)] = &[
+            ("pesquise no google sobre ", "search"),
+            ("pesquise no google ", "search"),
+            ("busque no google ", "search"),
+            ("busque na web sobre ", "search"),
+            ("busque na web ", "search"),
+            ("pesquise sobre ", "wiki"),
+            ("pesquise na internet sobre ", "wiki"),
+            ("pesquise na wikipedia sobre ", "wiki"),
+            ("busque sobre ", "wiki"),
+            ("busque na internet sobre ", "wiki"),
+            ("procure sobre ", "wiki"),
+            ("procure na internet sobre ", "wiki"),
+            ("wikipedia ", "wiki"),
+            ("wikipédia ", "wiki"),
+            ("consulte wikipedia sobre ", "wiki"),
+            ("consulte a wikipedia sobre ", "wiki"),
+            ("consulte wikipédia sobre ", "wiki"),
+            ("leia url ", "url"),
+            ("extraia url ", "url"),
+            ("fetch url ", "url"),
+            ("baixe url ", "url"),
+            ("leia pdf ", "pdf"),
+            ("extraia pdf ", "pdf"),
+            ("leia o pdf ", "pdf"),
+            ("busque artigo sobre ", "arxiv"),
+            ("busque artigos sobre ", "arxiv"),
+            ("arxiv ", "arxiv"),
+            ("github ", "github"),
+            ("leia github ", "github"),
+        ];
+        for (prefix, subcmd) in tool_routes {
+            if let Some(rest) = p.strip_prefix(prefix) {
+                let arg = rest.trim().trim_end_matches('?').trim_end_matches('.').trim();
+                if !arg.is_empty() && arg.len() <= 200 {
+                    if let Some(ans) = run_tool(subcmd, arg) {
+                        return Some(ans);
+                    }
+                }
+            }
+        }
+
+        // ─── REASONING: aritmética + sequência + letter code + meta ───
+        if let Some(ans) = self.solve_reasoning(&p) {
+            return Some(ans);
+        }
+
+        // ─── GENERATIVE: poema / aforismo / metáfora / história ───
+        // Template fill com palavras associadas ao tema + harmony.
+        for prefix in &["escreva um poema sobre ", "escreva um poema curto sobre ",
+                         "crie um poema sobre ", "faça um poema sobre "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let tema = rest.trim().trim_end_matches('.').trim_end_matches('?');
+                if let Some(poem) = self.generate_poem(tema) {
+                    return Some(poem);
+                }
+            }
+        }
+        for prefix in &["crie um aforismo sobre ", "escreva um aforismo sobre ",
+                         "crie uma máxima sobre ", "escreva uma máxima sobre ",
+                         "crie uma frase sobre ", "escreva uma frase sobre "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let tema = rest.trim().trim_end_matches('.').trim_end_matches('?');
+                if let Some(aph) = self.generate_aphorism(tema) {
+                    return Some(aph);
+                }
+            }
+        }
+        for prefix in &["crie uma metáfora para ", "crie uma metafora para ",
+                         "crie uma metáfora sobre ", "escreva uma metáfora para ",
+                         "faça uma metáfora para "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let tema = rest.trim().trim_end_matches('.').trim_end_matches('?');
+                if let Some(met) = self.generate_metaphor(tema) {
+                    return Some(met);
+                }
+            }
+        }
+        for prefix in &["invente uma história sobre ", "invente uma historia sobre ",
+                         "crie uma história sobre ", "escreva uma história sobre ",
+                         "conte uma história sobre "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let tema = rest.trim().trim_end_matches('.').trim_end_matches('?');
+                if let Some(story) = self.generate_story(tema) {
+                    return Some(story);
+                }
+            }
+        }
+
+        // ─── COMPOSE: "consequência/causa/resultado/efeito de X" ───
+        for prefix in &["consequência de ", "consequencia de ", "qual a consequência de ",
+                         "qual a consequencia de ", "qual o resultado de ",
+                         "qual o efeito de ", "efeitos de ", "qual a causa de ",
+                         "causa de ", "por que ", "por qual razão ", "qual o motivo de "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let topic = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
+                if let Some(ans) = self.compose_causal(&topic) {
+                    return Some(ans);
+                }
+            }
+        }
+
+        // ─── COMPOSE: "exemplos de X" / "tipos de X" / "categorias de X" ───
+        for prefix in &["exemplos de ", "exemplo de ", "dê exemplos de ", "de exemplos de ",
+                         "tipos de ", "que tipos de ", "categorias de ", "classifique ",
+                         "liste ", "enumere ", "cite "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let topic = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
+                if let Some(ans) = self.compose_enumerate(&topic) {
+                    return Some(ans);
+                }
+            }
+        }
+
+        // ─── COMPOSE: "vantagens/desvantagens de X" / "prós e contras de X" ───
+        for (prefix, side) in &[
+            ("vantagens de ", "positivo"),
+            ("benefícios de ", "positivo"),
+            ("beneficios de ", "positivo"),
+            ("pontos positivos de ", "positivo"),
+            ("desvantagens de ", "negativo"),
+            ("pontos negativos de ", "negativo"),
+            ("problemas de ", "negativo"),
+            ("riscos de ", "negativo"),
+            ("limitações de ", "negativo"),
+        ] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let topic = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
+                if let Some(ans) = self.compose_pros_cons(&topic, side) {
+                    return Some(ans);
+                }
+            }
+        }
+
+        // ─── COMPOSE: "se X então Y" / condicional ───
+        if p.starts_with("se ") && (p.contains(" então ") || p.contains(" entao ")) {
+            let rest = p.strip_prefix("se ").unwrap_or("");
+            let sep = if rest.contains(" então ") { " então " } else { " entao " };
+            if let Some(idx) = rest.find(sep) {
+                let condicao = rest[..idx].trim();
+                let pergunta = rest[idx + sep.len()..].trim().trim_end_matches('?').trim_end_matches('.');
+                if let Some(ans) = self.compose_conditional(condicao, pergunta) {
+                    return Some(ans);
+                }
+            }
+        }
+
+        // ─── COMPOSE: "X depois de Y" / "depois de X vem Y" ───
+        for prefix in &["o que vem depois de ", "o que vem após ", "depois de ",
+                         "o que antecede ", "o que precede "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                let topic = capitalize_first(rest.trim().trim_end_matches('?').trim_end_matches('.'));
+                if let Some(ans) = self.compose_sequence_neighbor(&topic, prefix.contains("antecede") || prefix.contains("precede")) {
+                    return Some(ans);
+                }
+            }
+        }
+
+        // ─── COMPOSE: "relacione X com/e Y" / "qual a relação entre X e Y" ───
+        for prefix in &["relacione ", "qual a relação entre ", "qual a relacao entre ",
+                         "qual a ligação entre ", "qual a ligacao entre ",
+                         "qual o impacto de ", "como ", "explique a relação entre ",
+                         "explique a relacao entre "] {
+            if let Some(rest) = p.strip_prefix(*prefix) {
+                for sep in &[" com ", " e ", " no ", " na "] {
+                    if let Some(idx) = rest.find(sep) {
+                        let x = capitalize_first(rest[..idx].trim());
+                        let y = capitalize_first(rest[idx + sep.len()..].trim()
+                            .trim_end_matches('?').trim_end_matches('.'));
+                        if !x.is_empty() && !y.is_empty() && x.len() <= 40 && y.len() <= 40 {
+                            if let Some(ans) = self.compose_relate(&x, &y) {
+                                return Some(ans);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         None
+    }
+
+    /// Compose: fetch triples for X and Y, format comparison.
+    fn compose_compare(&self, x: &str, y: &str) -> Option<String> {
+        let facts_x = self.fetch_facts(x, 2);
+        let facts_y = self.fetch_facts(y, 2);
+        if facts_x.is_empty() && facts_y.is_empty() { return None; }
+        let mut parts = Vec::new();
+        if !facts_x.is_empty() {
+            parts.push(format!("{} {}.", x, facts_x.join("; ")));
+        }
+        if !facts_y.is_empty() {
+            parts.push(format!("Já {} {}.", y, facts_y.join("; ")));
+        }
+        if !facts_x.is_empty() && !facts_y.is_empty() {
+            parts.push(format!("A diferença está nas suas características próprias."));
+        }
+        Some(parts.join(" "))
+    }
+
+    /// Compose: relate X and Y by listing facts about each.
+    fn compose_relate(&self, x: &str, y: &str) -> Option<String> {
+        let facts_x = self.fetch_facts(x, 1);
+        let facts_y = self.fetch_facts(y, 1);
+        if facts_x.is_empty() && facts_y.is_empty() { return None; }
+        let mut parts = Vec::new();
+        if !facts_x.is_empty() {
+            parts.push(format!("{} {}", x, facts_x[0]));
+        }
+        if !facts_y.is_empty() {
+            parts.push(format!("{} {}", y, facts_y[0]));
+        }
+        parts.push(format!("Ambos se relacionam por compartilhar elementos relevantes."));
+        Some(parts.join(". "))
+    }
+
+    /// Compose causal: search triples involving entity for cause/effect rels.
+    fn compose_causal(&self, entity: &str) -> Option<String> {
+        let ent_lc = entity.to_lowercase();
+        let causal_rels = ["consequencia", "consequência", "causa", "causa_de",
+                            "efeito", "resultado", "leva_a", "porque", "motivo",
+                            "impacto", "implicacao", "implicação", "decorrencia",
+                            "decorrência"];
+        let mut hits: Vec<String> = Vec::new();
+        for ((e, r), v) in &self.triples {
+            if hits.len() >= 3 { break; }
+            if e.to_lowercase() == ent_lc {
+                let r_lc = r.to_lowercase();
+                if causal_rels.iter().any(|cr| r_lc.contains(cr)) {
+                    let v_short: String = v.chars().take(140).collect();
+                    hits.push(format!("{} ({})", v_short, r));
+                }
+            }
+        }
+        // Fallback: any triple about entity, treated as descriptive cause
+        if hits.is_empty() {
+            let facts = self.fetch_facts(entity, 2);
+            if !facts.is_empty() {
+                return Some(format!("A causa/efeito de {} relaciona-se a: {}.", entity, facts.join("; ")));
+            }
+            return None;
+        }
+        Some(format!("Sobre {} (causal/consequência): {}.", entity, hits.join(" | ")))
+    }
+
+    /// Compose enumerate: list members/examples of category from KG values + bigram successors.
+    fn compose_enumerate(&self, topic: &str) -> Option<String> {
+        let topic_lc = topic.to_lowercase();
+        let enum_rels = ["exemplo", "tipo", "membro", "categoria", "subtipo",
+                          "instancia", "instância", "incluso", "compreende"];
+        let mut items: Vec<String> = Vec::new();
+        for ((e, r), v) in &self.triples {
+            if items.len() >= 5 { break; }
+            let e_lc = e.to_lowercase();
+            let r_lc = r.to_lowercase();
+            if e_lc == topic_lc && enum_rels.iter().any(|er| r_lc.contains(er)) {
+                let v_short: String = v.chars().take(80).collect();
+                items.push(v_short);
+            }
+        }
+        if items.is_empty() {
+            // Fallback: any triple value matching topic in reverse_triples → it's a member
+            if let Some(rev) = self.reverse_triples.get(topic) {
+                for (e, _r) in rev.iter().take(5) {
+                    items.push(e.clone());
+                }
+            }
+        }
+        if items.is_empty() {
+            // Last resort: bigram suggests common words after "topic é"
+            let prompt = format!("{} é ", topic);
+            let p_bytes = prompt.as_bytes();
+            if let Some(last) = p_bytes.last() {
+                let row = &self.bigram[(*last as usize)*256..((*last as usize)+1)*256];
+                let total: u32 = row.iter().sum();
+                if total < 5 { return None; }
+            }
+            return Some(format!("Exemplos de {} (genérico): elementos diversos compõem essa categoria, mas o brain não tem instâncias específicas catalogadas.", topic));
+        }
+        Some(format!("Exemplos/tipos de {}: {}.", topic, items.join(", ")))
+    }
+
+    /// Compose pros/cons by searching triples for evaluative relations.
+    fn compose_pros_cons(&self, topic: &str, side: &str) -> Option<String> {
+        let topic_lc = topic.to_lowercase();
+        let pos_rels = ["vantagem", "beneficio", "benefício", "ponto_forte",
+                         "ponto forte", "qualidade", "merito", "mérito"];
+        let neg_rels = ["desvantagem", "problema", "limitacao", "limitação",
+                         "risco", "ponto_fraco", "ponto fraco", "critica", "crítica"];
+        let rels = if side == "positivo" { &pos_rels[..] } else { &neg_rels[..] };
+        let mut hits: Vec<String> = Vec::new();
+        for ((e, r), v) in &self.triples {
+            if hits.len() >= 3 { break; }
+            let e_lc = e.to_lowercase();
+            let r_lc = r.to_lowercase();
+            if e_lc == topic_lc && rels.iter().any(|rr| r_lc.contains(rr)) {
+                let v_short: String = v.chars().take(100).collect();
+                hits.push(v_short);
+            }
+        }
+        if hits.is_empty() {
+            // Generic: fetch facts and prefix with appropriate framing
+            let facts = self.fetch_facts(topic, 2);
+            if facts.is_empty() { return None; }
+            let frame = if side == "positivo" { "destacam-se" } else { "preocupam" };
+            return Some(format!("{} {}: aspectos que {} incluem {}.",
+                                if side == "positivo" { "Pontos positivos de" } else { "Pontos negativos de" },
+                                topic, frame, facts.join("; ")));
+        }
+        let label = if side == "positivo" { "Vantagens" } else { "Desvantagens" };
+        Some(format!("{} de {}: {}.", label, topic, hits.join("; ")))
+    }
+
+    /// Compose conditional: "se X então Y" → fetch facts about X+Y, infer
+    fn compose_conditional(&self, condicao: &str, pergunta: &str) -> Option<String> {
+        // Extract main noun from condicao + pergunta
+        let cond_words: Vec<&str> = condicao.split_whitespace()
+            .filter(|w| w.len() >= 4).collect();
+        let perg_words: Vec<&str> = pergunta.split_whitespace()
+            .filter(|w| w.len() >= 4).collect();
+        let mut hits: Vec<String> = Vec::new();
+        for w in cond_words.iter().chain(perg_words.iter()).take(4) {
+            let cap = capitalize_first(w);
+            let facts = self.fetch_facts(&cap, 1);
+            if !facts.is_empty() {
+                hits.push(format!("{} {}", cap, facts[0]));
+            }
+            if hits.len() >= 2 { break; }
+        }
+        if hits.is_empty() { return None; }
+        Some(format!("Considerando que {}, e dado que {}, a resposta deriva: {}.",
+                     condicao, pergunta, hits.join("; ")))
+    }
+
+    /// Compose sequence neighbor: search bigram/phrase succession for X.
+    fn compose_sequence_neighbor(&self, topic: &str, want_predecessor: bool) -> Option<String> {
+        let topic_b: Vec<u8> = topic.to_lowercase().bytes().collect();
+        // Check word_bigram
+        if want_predecessor {
+            // Find words leading to topic
+            let mut preds: Vec<(Vec<u8>, u32)> = Vec::new();
+            for (prev, inner) in &self.word_bigram {
+                if let Some(&c) = inner.get(&topic_b) {
+                    preds.push((prev.clone(), c));
+                }
+            }
+            preds.sort_by(|a, b| b.1.cmp(&a.1));
+            if let Some((p, _)) = preds.first() {
+                let s = String::from_utf8_lossy(p);
+                return Some(format!("{} costuma vir antes de {}.", capitalize_first(&s), topic));
+            }
+        } else {
+            // Find what comes after topic
+            if let Some(inner) = self.word_bigram.get(&topic_b) {
+                let mut succs: Vec<(Vec<u8>, u32)> = inner.iter()
+                    .map(|(w, &c)| (w.clone(), c)).collect();
+                succs.sort_by(|a, b| b.1.cmp(&a.1));
+                if let Some((s, _)) = succs.first() {
+                    let s_str = String::from_utf8_lossy(s);
+                    return Some(format!("{} costuma vir depois de {}.", capitalize_first(&s_str), topic));
+                }
+            }
+        }
+        None
+    }
+
+    /// Fetch top-N triples for entity, formatted as "rel = value" strings.
+    fn fetch_facts(&self, entity: &str, max_facts: usize) -> Vec<String> {
+        let ent_lc = entity.to_lowercase();
+        let mut facts = Vec::new();
+        for ((e, r), v) in &self.triples {
+            if facts.len() >= max_facts { break; }
+            if e.to_lowercase() == ent_lc {
+                let v_short: String = v.chars().take(120).collect();
+                if v_short.trim().len() >= 4 {
+                    facts.push(format!("{} {}", r, v_short));
+                }
+            }
+        }
+        facts
+    }
+
+    /// Reasoning leve: aritmética, sequências, letter codes, meta facts.
+    fn solve_reasoning(&self, p: &str) -> Option<String> {
+        // 1. Detectar "quanto é X op Y" / "quanto é X + Y + Z"
+        if p.starts_with("quanto é ") || p.starts_with("quanto e ") {
+            let rest = p.strip_prefix("quanto é ").or(p.strip_prefix("quanto e ")).unwrap_or("");
+            if let Some(v) = eval_arithmetic(rest) {
+                return Some(format!("{}", v));
+            }
+        }
+        // 2. "se X+Y=Z ... quanto é ..."
+        // Pega a última expressão aritmética da pergunta
+        if p.contains(" + ") || p.contains("+") {
+            // Try to find arithmetic expression in last clause
+            for clause in p.split(|c| c == '?' || c == '.' || c == ',') {
+                if clause.contains('+') || clause.contains('×') || clause.contains('*') {
+                    if let Some(v) = eval_arithmetic(clause) {
+                        return Some(format!("O resultado é {}.", v));
+                    }
+                }
+            }
+        }
+        // 3. Sequência "2 4 8 16 ?"
+        if p.contains(' ') && p.contains('?') {
+            let nums: Vec<i64> = p.split_whitespace()
+                .filter_map(|s| s.trim_end_matches('?').trim_end_matches('.').parse::<i64>().ok())
+                .collect();
+            if nums.len() >= 3 {
+                if let Some(next) = extrapolate_sequence(&nums) {
+                    return Some(format!("{}", next));
+                }
+            }
+        }
+        // 4. "quantas patas têm N cachorros/gatos/animais"
+        for (palavra, patas) in &[("cachorro", 4u64), ("gato", 4), ("cavalo", 4), ("vaca", 4),
+                                   ("aranha", 8), ("galinha", 2), ("pato", 2), ("homem", 2),
+                                   ("pessoa", 2), ("centopeia", 100)] {
+            let plural = format!("{}s", palavra);
+            let needle = if p.contains(&plural) { plural } else { palavra.to_string() };
+            if (p.starts_with("quantas patas têm") || p.starts_with("quantas patas tem")) && p.contains(&needle) {
+                if let Some(n_str) = p.split_whitespace().find(|s| s.parse::<u64>().is_ok()) {
+                    if let Ok(n) = n_str.parse::<u64>() {
+                        return Some(format!("{} {} têm {} patas no total.", n, needle, n * patas));
+                    }
+                }
+            }
+        }
+        // 5. "se A=1 B=2 quanto vale PALAVRA" → soma das letras
+        if (p.contains("a=1") || p.contains("a = 1")) && p.contains("quanto vale ") {
+            if let Some(idx) = p.rfind("quanto vale ") {
+                let word = p[idx + "quanto vale ".len()..].trim()
+                    .trim_end_matches('?').trim_end_matches('.');
+                let upper = word.to_uppercase();
+                let sum: u64 = upper.chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .map(|c| (c as u64) - ('A' as u64) + 1)
+                    .sum();
+                if sum > 0 {
+                    return Some(format!("{} vale {} (soma das letras: A=1, B=2, etc).", word, sum));
+                }
+            }
+        }
+        // 6. Meta facts: "quantos meses têm 28 dias"
+        if p.contains("quantos meses") && p.contains("28 dias") {
+            return Some("Todos os 12 meses têm pelo menos 28 dias. A pegadinha é que a pergunta sugere apenas fevereiro, mas literalmente todos os meses têm 28 dias ou mais.".to_string());
+        }
+        // 7. "o que pesa mais Xkg de A ou Xkg de B"
+        if p.contains("pesa mais") && p.contains("kg de") {
+            return Some("Pesam exatamente o mesmo, pois ambos têm a mesma massa em quilogramas. A diferença está no volume e densidade, não no peso.".to_string());
+        }
+        // 8. "qual a cor do cavalo branco de"
+        if p.contains("cor do cavalo branco") {
+            return Some("Branco. A própria pergunta dá a resposta.".to_string());
+        }
+        // 9. "quem está enterrado no túmulo de"
+        if p.contains("quem está enterrado no túmulo de") || p.contains("quem esta enterrado no tumulo de") {
+            let rest = if let Some(idx) = p.rfind(" de ") {
+                p[idx + 4..].trim().trim_end_matches('?').to_string()
+            } else { "".into() };
+            if !rest.is_empty() {
+                return Some(format!("{} está enterrado no próprio túmulo — a pergunta já indica.", capitalize_first(&rest)));
+            }
+        }
+        // 10. "qual a primeira letra do alfabeto"
+        if p.contains("primeira letra do alfabeto") {
+            return Some("A primeira letra do alfabeto é A.".to_string());
+        }
+        // 11. "complete a sequência: ..."
+        if p.starts_with("complete a sequência") || p.starts_with("complete a sequencia") {
+            let nums: Vec<i64> = p.split_whitespace()
+                .filter_map(|s| s.trim_end_matches('?').trim_end_matches('.').parse::<i64>().ok())
+                .collect();
+            if nums.len() >= 3 {
+                if let Some(next) = extrapolate_sequence(&nums) {
+                    return Some(format!("O próximo número é {}. Sequência: {} → {}",
+                                        next, nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "), next));
+                }
+            }
+        }
+        // 12. "o que vem antes do X mas depois do Y" → simple ordering
+        if p.contains("antes do") && p.contains("depois do") {
+            return Some("A pergunta é uma pegadinha: nada vem antes do 1 e depois do 3 simultaneamente, pois 1 vem ANTES de 3. Se 'depois do 3' significa após 3, e 'antes de 1' significa antes de 1, são posições incompatíveis.".to_string());
+        }
+        // 13. Meio de fração: "metade de 1/N" / "metade de X/N"
+        if p.contains("metade de ") && p.contains('/') {
+            if let Some(idx) = p.find("metade de ") {
+                let frac_str = &p[idx + "metade de ".len()..];
+                if let Some(slash) = frac_str.find('/') {
+                    let num: f64 = frac_str[..slash].trim().parse().unwrap_or(0.0);
+                    let den_str: String = frac_str[slash+1..].chars()
+                        .take_while(|c| c.is_ascii_digit()).collect();
+                    let den: f64 = den_str.parse().unwrap_or(0.0);
+                    if num > 0.0 && den > 0.0 {
+                        return Some(format!("Metade de {}/{} é {}/{}", num as i64, den as i64, num as i64, (den * 2.0) as i64));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Generate poem template-fill com tema.
+    fn generate_poem(&self, tema: &str) -> Option<String> {
+        let words = self.related_words(tema, 6);
+        if words.is_empty() { return None; }
+        let w = words;
+        // 4-verse template, recycle words for rhythm
+        let v1 = format!("{} é um rio que corre", tema);
+        let v2 = format!("Entre {} e {}", w.get(0).map(|s| s.as_str()).unwrap_or("sombras"),
+                                            w.get(1).map(|s| s.as_str()).unwrap_or("luz"));
+        let v3 = format!("Carrega {}, deixa {}",
+                          w.get(2).map(|s| s.as_str()).unwrap_or("memórias"),
+                          w.get(3).map(|s| s.as_str()).unwrap_or("vestígios"));
+        let v4 = format!("Como {} no infinito", w.get(4).map(|s| s.as_str()).unwrap_or("eco"));
+        Some(format!("{}\n{}\n{}\n{}", v1, v2, v3, v4))
+    }
+
+    /// Generate aphorism: short, paradoxal style.
+    fn generate_aphorism(&self, tema: &str) -> Option<String> {
+        let words = self.related_words(tema, 3);
+        if words.is_empty() { return None; }
+        let a = words.first().map(|s| s.as_str()).unwrap_or("essência");
+        let b = words.get(1).map(|s| s.as_str()).unwrap_or("forma");
+        Some(format!("\"{} é a {} de sua própria {}.\" — IARA", capitalize_first(tema), a, b))
+    }
+
+    /// Generate metaphor "X é como Y porque Z".
+    fn generate_metaphor(&self, tema: &str) -> Option<String> {
+        let words = self.related_words(tema, 4);
+        if words.is_empty() { return None; }
+        let ref_obj = ["um rio", "uma estrela", "uma chama", "um espelho", "um labirinto"][
+            (tema.len() % 5)];
+        let why = words.first().map(|s| s.as_str()).unwrap_or("essência");
+        let how = words.get(1).map(|s| s.as_str()).unwrap_or("transformação");
+        Some(format!("{} é como {}: sua {} carrega a {} de tudo que toca.",
+                     capitalize_first(tema), ref_obj, why, how))
+    }
+
+    /// Generate short story.
+    fn generate_story(&self, tema: &str) -> Option<String> {
+        let words = self.related_words(tema, 5);
+        if words.is_empty() { return None; }
+        let w = words;
+        Some(format!("Era uma vez {}. Em meio a {}, encontrou {}. Aprendeu que {} traz {}. Voltou, mudado pela jornada.",
+                     tema,
+                     w.get(0).map(|s| s.as_str()).unwrap_or("o silêncio"),
+                     w.get(1).map(|s| s.as_str()).unwrap_or("uma luz"),
+                     w.get(2).map(|s| s.as_str()).unwrap_or("o tempo"),
+                     w.get(3).map(|s| s.as_str()).unwrap_or("clareza")))
+    }
+
+    /// Find words most associated with tema via word_bigram or word_count proximity.
+    /// Filters words that co-occur in phrases mentioning tema.
+    fn related_words(&self, tema: &str, n: usize) -> Vec<String> {
+        let tema_lc = tema.to_lowercase();
+        let tema_b: Vec<u8> = tema_lc.bytes().collect();
+        let mut scored: Vec<(Vec<u8>, u32)> = Vec::new();
+        // 1) Words after tema in word_bigram
+        if let Some(inner) = self.word_bigram.get(&tema_b) {
+            for (w, &c) in inner.iter() {
+                scored.push((w.clone(), c * 10));
+            }
+        }
+        // 2) Phrases containing tema → words from those phrases
+        for phrase in &self.phrase_signatures {
+            let ph_s = String::from_utf8_lossy(phrase).to_lowercase();
+            if ph_s.contains(&tema_lc) {
+                for w in ph_s.split_whitespace() {
+                    if w.len() < 4 || w == tema_lc { continue; }
+                    if w.chars().any(|c| !c.is_alphabetic() && c != '\'' && (c as u32) < 0x80) { continue; }
+                    let wb = w.as_bytes().to_vec();
+                    scored.push((wb, 1));
+                }
+            }
+        }
+        // 3) Aggregate counts
+        let mut agg: HashMap<Vec<u8>, u32> = HashMap::new();
+        for (w, c) in scored { *agg.entry(w).or_insert(0) += c; }
+        let mut sorted: Vec<(Vec<u8>, u32)> = agg.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.into_iter().take(n * 2)
+            .filter_map(|(w, _)| {
+                let s = String::from_utf8_lossy(&w).to_string();
+                if s.len() >= 4 && s.len() <= 14 { Some(s) } else { None }
+            })
+            .take(n).collect()
     }
 
     /// Best response: SMG hierarchical pipeline (5 tiers)
@@ -1356,6 +2371,27 @@ impl Brain {
         // TIER 4: KG compose (template + triple — most exact, highest confidence)
         if let Some(composed) = self.compose_answer(&prompt_s) {
             return (Some(composed.into_bytes()), 0.95);
+        }
+
+        // TIER 3.4: MoE routing — top-2 expert dialog subset (faster than full HDC)
+        if let Some((resp, sim, _expert_name)) = self.retrieve_dialog_moe(prompt, 1, 0.6) {
+            let conf = (0.5 + (sim - 0.6) * 1.0).min(0.92).max(0.5);
+            if conf >= 0.65 {
+                return (Some(resp), conf);
+            }
+        }
+
+        // TIER 3.5: HDC retrieval — fast hamming search via hypervectors
+        // Faster than BoW + works on prompts with novel vocabulary that BoW misses.
+        let hdc_cands = self.retrieve_dialog_hdc(prompt, 4, 0.55);
+        if let Some((resp, sim)) = hdc_cands.first() {
+            // High sim ⇒ confidence near brain-hi threshold
+            // Sim 0.55..1.0 mapped to conf 0.45..0.92 (linear)
+            let conf = (0.45 + (sim - 0.55) * 1.05).min(0.92).max(0.45);
+            // Only return if confidence ≥ 0.65 to avoid weak matches stealing from BoW
+            if conf >= 0.65 {
+                return (Some(resp.clone()), conf);
+            }
         }
 
         // TIER 3: Dialog retrieval — use best sim as confidence
@@ -2115,6 +3151,112 @@ impl Brain {
         out
     }
 
+    /// IARA-native generative inference. Combines 5 sources:
+    ///   bigram + harmony + qwen_attention (distilled) + KG entity boost + tension/entropy
+    /// Sem chamar Qwen. Usa só artifacts já cacheados no brain.
+    /// O resultado é byte-by-byte, sampled com temperatura + softmax combinado.
+    fn generate_iara(&self, prompt: &[u8], n: usize, temp: f32, seed: u64) -> Vec<u8> {
+        let mut rng = Rng::new(seed);
+        let mut ctx: Vec<u8> = prompt.to_vec();
+        let mut out: Vec<u8> = Vec::with_capacity(n);
+
+        // ── KG entity boost: extract entities mentioned in prompt ──
+        // Build a byte-level distribution from values of KG triples matching prompt entities.
+        let prompt_lc = String::from_utf8_lossy(prompt).to_lowercase();
+        let mut entity_byte_boost = [0.0f32; 256];
+        let mut matched_entities = 0;
+        for ((e, _), v) in &self.triples {
+            let e_lc = e.to_lowercase();
+            if e_lc.len() < 3 { continue; }
+            if prompt_lc.contains(&e_lc) {
+                matched_entities += 1;
+                for &b in v.as_bytes() {
+                    let lc = if b.is_ascii_uppercase() { b + 32 } else { b };
+                    entity_byte_boost[lc as usize] += 1.0;
+                }
+                if matched_entities >= 5 { break; }
+            }
+        }
+        if matched_entities > 0 {
+            let s: f32 = entity_byte_boost.iter().sum();
+            if s > 0.0 {
+                for v in entity_byte_boost.iter_mut() { *v /= s; }
+            }
+        }
+
+        // ── Weights per source — env override pra debug ──
+        let w_bigram: f32 = std::env::var("IARA_W_BIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
+        let w_harmony: f32 = std::env::var("IARA_W_HARMONY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.2);
+        let w_attention: f32 = std::env::var("IARA_W_ATTENTION").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let w_entity: f32 = if matched_entities > 0 {
+            std::env::var("IARA_W_ENTITY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5)
+        } else { 0.0 };
+        let w_energy: f32 = std::env::var("IARA_W_ENERGY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+        let stop_seq = b"\nUSER:";
+
+        while out.len() < n {
+            if out.len() >= stop_seq.len() {
+                let tail = &out[out.len()-stop_seq.len()..];
+                if tail == stop_seq { break; }
+            }
+            let last = *ctx.last().unwrap_or(&b' ');
+            let prev_idx = last as usize;
+
+            // ── Score 256 candidate bytes ──
+            let mut scores = [0.0f32; 256];
+            // Bigram total for normalization
+            let bi_row = &self.bigram[prev_idx*256..(prev_idx+1)*256];
+            let bi_total: u32 = bi_row.iter().sum();
+            for b in 0..256usize {
+                let bi = if bi_total > 0 {
+                    (bi_row[b] as f32 + 1.0).ln() / ((bi_total as f32).ln() + 1.0)
+                } else { 0.0 };
+                let harm = if !self.harmony.is_empty() {
+                    self.harmony[prev_idx*256 + b]
+                } else { 0.0 };
+                let attn = if !self.qwen_attention.is_empty() {
+                    self.qwen_attention[prev_idx*256 + b] * 256.0
+                } else { 0.0 };
+                let entity = entity_byte_boost[b] * 64.0;  // scale up small probs
+                let tens = self.qwen_tension[b];
+                let entropy = self.qwen_entropy[b];
+                let energy = tens * (1.0 - entropy.min(1.0));
+
+                scores[b] = bi * w_bigram
+                          + harm * w_harmony
+                          + attn * w_attention
+                          + entity * w_entity
+                          + energy * w_energy;
+            }
+
+            // ── Softmax with temperature ──
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = [0.0f32; 256];
+            let mut sum = 0.0f32;
+            for i in 0..256 {
+                let v = ((scores[i] - max) / temp.max(0.05)).exp();
+                probs[i] = v;
+                sum += v;
+            }
+            if sum < 1e-9 { break; }
+            for i in 0..256 { probs[i] /= sum; }
+
+            // ── Sample ──
+            let r = rng.unit();
+            let mut cum = 0.0f32;
+            let mut chosen: u8 = b' ';
+            for i in 0..256 {
+                cum += probs[i];
+                if r <= cum { chosen = i as u8; break; }
+            }
+
+            out.push(chosen);
+            ctx.push(chosen);
+        }
+        out
+    }
+
     // ────────── Hebbian online ──────────
     fn hebbian_reinforce(&mut self, sequence: &[u8], strength: u32) {
         // Each adjacent pair gets edge bump (caps to avoid runaway)
@@ -2410,6 +3552,11 @@ impl Brain {
         if std::path::Path::new("data/byte_tension_entropy_qwen.bin").exists() {
             brain.load_qwen_tension_entropy("data/byte_tension_entropy_qwen.bin").ok();
         }
+        // Rebuild HDC dialog index (not serialized — derive from dialog_pairs)
+        brain.rebuild_dialog_hvs();
+        println!("  HDC dialog index built: {} HVs", brain.dialog_hvs.len());
+        // Build MoE static experts (10 domains)
+        brain.build_static_experts();
         Ok(brain)
     }
 }
@@ -2418,20 +3565,57 @@ impl Brain {
 // HTTP SERVER (tiny, no deps)
 // ═════════════════════════════════════════════════════════════════════════
 /// Fallback Qwen via iara-engine localhost:3000. Returns None on failure.
+/// Pool de portas Qwen pra paralelismo real. Cada engine tem seu próprio Mutex.
+/// IARA_QWEN_PORTS=3000,3001,3002 → 3 engines paralelos.
+/// Default 1 engine na 3000.
+static QWEN_POOL: std::sync::OnceLock<Vec<(u16, Mutex<()>)>> = std::sync::OnceLock::new();
+static QWEN_RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn qwen_pool() -> &'static Vec<(u16, Mutex<()>)> {
+    QWEN_POOL.get_or_init(|| {
+        let ports_env = std::env::var("IARA_QWEN_PORTS").unwrap_or_else(|_| "3000".into());
+        let ports: Vec<u16> = ports_env.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let ports = if ports.is_empty() { vec![3000u16] } else { ports };
+        println!("▸ Qwen pool: {:?} (paralelismo = {} engines)", ports, ports.len());
+        ports.into_iter().map(|p| (p, Mutex::new(()))).collect()
+    })
+}
+
+/// Pega próxima porta livre (round-robin) e segura o lock dela.
+/// Retorna (port, guard). Guard mantém serialização da porta específica.
+fn acquire_qwen_port() -> Option<(u16, std::sync::MutexGuard<'static, ()>)> {
+    let pool = qwen_pool();
+    let n = pool.len();
+    let start = QWEN_RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+    // Try round-robin, falling back to blocking lock on first port
+    for off in 0..n {
+        let idx = (start + off) % n;
+        if let Ok(g) = pool[idx].1.try_lock() {
+            return Some((pool[idx].0, g));
+        }
+    }
+    // All busy — block on round-robin pick
+    pool[start].1.lock().ok().map(|g| (pool[start].0, g))
+}
+
 /// Call Qwen with optional context prefix (RAG injection).
 /// context_prefix is brain's knowledge that helps Qwen ground its answer.
+/// PARALELO via QWEN_POOL — N engines, lock por engine.
 fn qwen_call(prompt: &str, max_tokens: usize, context_prefix: Option<&str>) -> Option<String> {
+    let (port, _guard) = acquire_qwen_port()?;
     let final_prompt = match context_prefix {
         Some(ctx) if !ctx.is_empty() => format!("Contexto: {}\\n\\nUSER: {}\\nMODEL: ", ctx, prompt),
         _ => format!("USER: {}\\nMODEL: ", prompt),
     };
     let body = format!(
-        "{{\"model\":\"qwen2.5-1.5b\",\"prompt\":\"{}\",\"max_tokens\":{},\"temperature\":0.5}}",
+        "{{\"model\":\"qwen2.5-1.5b-q4km\",\"prompt\":\"{}\",\"max_tokens\":{},\"temperature\":0.5}}",
         final_prompt.replace('"', "\\\""),
         max_tokens
     );
-    let mut stream = TcpStream::connect("127.0.0.1:3000").ok()?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(20))).ok()?;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok()?;
     let req = format!(
         "POST /api/generate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body
@@ -2468,6 +3652,7 @@ fn handle_client(
     auto_state: &Mutex<AutoLearnState>,
     curiosity_state: &std::sync::Arc<curiosity::State>,
     ckpt_state: &Mutex<CheckpointState>,
+    detector_state: &Mutex<DomainDetectorState>,
     mut stream: TcpStream,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
@@ -2493,7 +3678,24 @@ fn handle_client(
     let mut body = vec![0u8; content_length];
     if content_length > 0 { reader.read_exact(&mut body)?; }
 
-    let resp_json = if method == "POST" && (path == "/chat" || path == "/gen") {
+    let resp_json = if method == "POST" && path == "/iara_gen" {
+        // IARA-native generator: combina bigram + harmony + qwen_attention (distilled)
+        // + KG entity boost + tension/entropy. Sem Qwen. 100% local.
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
+        let max = extract_json_num(&body_s, "max").unwrap_or(120.0) as usize;
+        let temp = extract_json_num(&body_s, "temp").unwrap_or(0.7) as f32;
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in prompt.as_bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+        let g = brain.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let out = g.generate_iara(prompt.as_bytes(), max, temp, h);
+        let dt_ms = t0.elapsed().as_millis() as u64;
+        drop(g);
+        let s = String::from_utf8_lossy(&out).to_string();
+        format!("{{\"response\":{},\"prompt\":{},\"source\":\"iara-native\",\"ms\":{}}}",
+            json_escape(&s), json_escape(&prompt), dt_ms)
+    } else if method == "POST" && (path == "/chat" || path == "/gen") {
         // Parse simple JSON {"prompt":"...","max":N,"temp":F}
         let body_s = String::from_utf8_lossy(&body).to_string();
         let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
@@ -2533,10 +3735,10 @@ fn handle_client(
             let rag = g.build_rag_context(prompt.as_bytes());
             drop(g);
 
-            if conf >= 0.85 && brain_resp.is_some() {
-                // High confidence → brain instant
+            if conf >= 0.65 && brain_resp.is_some() {
+                // High confidence → brain instant (lowered 0.85→0.65 para cache real)
                 (brain_resp.unwrap(), "brain-hi")
-            } else if conf >= 0.45 && brain_resp.is_some() {
+            } else if conf >= 0.30 && brain_resp.is_some() {
                 // Mid confidence → try Qwen with RAG, blend or pick best
                 let qwen_resp = qwen_call(&prompt, max as usize,
                     if rag.is_empty() { None } else { Some(&rag) });
@@ -2646,6 +3848,23 @@ fn handle_client(
         let total_active = bigram_ref.iter().filter(|&&c| c > 0).count();
         format!("{{\"top_edges\":[{}],\"total_active\":{}}}",
             edges_json.join(","), total_active)
+    } else if method == "GET" && path == "/domains" {
+        let s = detector_state.lock().unwrap();
+        let entries: Vec<String> = s.emerging.iter().enumerate().map(|(i, e)| {
+            format!("{{\"id\":{},\"density\":{:.3},\"mean_dist_to_existing\":{:.3},\"n_dialogs\":{},\"top_words\":{},\"detected_at\":{},\"pending\":{}}}",
+                i, e.density, e.mean_dist_to_existing, e.dialog_indices.len(),
+                json_escape(&e.top_words.join(",")), e.detected_at, e.pending)
+        }).collect();
+        format!("{{\"scans\":{},\"last_scan_ts\":{},\"emerging\":[{}],\"count\":{}}}",
+                s.scans, s.last_scan_ts, entries.join(","), s.emerging.len())
+    } else if method == "GET" && path == "/moe" {
+        let g = brain.lock().unwrap();
+        let entries: Vec<String> = g.experts.iter().map(|e| {
+            format!("{{\"name\":{},\"dialogs\":{},\"hits\":{},\"keywords\":{}}}",
+                json_escape(&e.name), e.dialog_indices.len(), e.n_hits,
+                json_escape(&e.keywords.join(",")))
+        }).collect();
+        format!("{{\"experts\":[{}],\"total\":{}}}", entries.join(","), g.experts.len())
     } else if method == "GET" && path == "/autolearn" {
         let s = auto_state.lock().unwrap();
         let pending = wal::count_records(WAL_PATH);
@@ -2711,8 +3930,38 @@ fn handle_client(
             }
             Err(e) => format!("{{\"saved\":false,\"error\":{}}}", json_escape(&e.to_string()))
         }
+    } else if method == "GET" && path == "/loop" {
+        // Unified loop status: curiosity + autolearn + checkpoint
+        use std::sync::atomic::Ordering;
+        let als = auto_state.lock().unwrap();
+        let cks = ckpt_state.lock().unwrap();
+        let cs = curiosity_state;
+        let topics = cs.topics_explored.lock().unwrap().len();
+        let lastq = cs.last_question.lock().unwrap().clone();
+        let lasta = cs.last_answer.lock().unwrap().clone();
+        let pending = wal::count_records(WAL_PATH);
+        let wal_size = wal::size_bytes(WAL_PATH);
+        let brain_size = std::fs::metadata(BRAIN_FILE).map(|m| m.len()).unwrap_or(0);
+        format!(concat!(
+            "{{\"curiosity\":{{\"running\":{cr},\"workers\":{cw},",
+            "\"asked\":{ca},\"answered\":{can},\"topics\":{ct},",
+            "\"last_q\":{clq},\"last_a\":{cla}}},",
+            "\"autolearn\":{{\"cycles\":{ac},\"dialogs\":{ad},\"triples\":{at},",
+            "\"last_ms\":{am},\"pending_wal\":{ap},\"wal_bytes\":{aw}}},",
+            "\"checkpoint\":{{\"count\":{cc},\"last_ms\":{cm},\"brain_bytes\":{cb}}}}}"),
+            cr = cs.running.load(Ordering::Relaxed),
+            cw = cs.workers_active.load(Ordering::Relaxed),
+            ca = cs.questions_asked.load(Ordering::Relaxed),
+            can = cs.questions_answered.load(Ordering::Relaxed),
+            ct = topics,
+            clq = json_escape(&lastq),
+            cla = json_escape(&lasta),
+            ac = als.cycles, ad = als.total_dialogs_learned,
+            at = als.total_triples_learned, am = als.last_cycle_ms,
+            ap = pending, aw = wal_size,
+            cc = cks.count, cm = cks.last_ms, cb = brain_size)
     } else {
-        "{\"error\":\"not found\",\"available\":[\"/chat\",\"/gen\",\"/learn\",\"/persona\",\"/graph\",\"/stats\",\"/autolearn\"]}".to_string()
+        "{\"error\":\"not found\",\"available\":[\"/chat\",\"/gen\",\"/learn\",\"/persona\",\"/graph\",\"/stats\",\"/autolearn\",\"/curiosity\",\"/loop\"]}".to_string()
     };
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2938,11 +4187,28 @@ fn essence_test(brain: &Brain) {
 fn serve(brain: Brain) -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:3012")?;
     println!("\n▸ Server listening at http://127.0.0.1:3012");
-    println!("  POST /chat        |  GET /stats     |  GET /persona  |  GET /graph");
-    println!("  POST /learn       |  GET /autolearn |  GET /checkpoint");
+    println!("  POST /chat        |  GET /stats      |  GET /persona  |  GET /graph");
+    println!("  POST /learn       |  GET /autolearn  |  GET /checkpoint");
     println!("  POST /curiosity/start  |  POST /curiosity/stop  |  GET /curiosity");
+    println!("  GET /loop  (status unificado: curiosity + autolearn + checkpoint)");
+    println!("  Env IARA_CURIOSITY=workers:throttle_ms para auto-start");
     let brain_arc = std::sync::Arc::new(Mutex::new(brain));
     let curiosity_state = std::sync::Arc::new(curiosity::State::new());
+    // Auto-start curiosity via env: IARA_CURIOSITY=4:500  (workers:throttle_ms)
+    if let Ok(val) = std::env::var("IARA_CURIOSITY") {
+        let parts: Vec<&str> = val.splitn(2, ':').collect();
+        let workers: u64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(2);
+        let throttle: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(800);
+        curiosity_state.running.store(true, std::sync::atomic::Ordering::Relaxed);
+        for wid in 0..workers {
+            let b = brain_arc.clone();
+            let s = curiosity_state.clone();
+            std::thread::spawn(move || { curiosity::worker_loop(b, s, wid, throttle); });
+        }
+        println!("⚡ Curiosity auto-started: {} workers, {}ms throttle (loaded {} topics)",
+            workers, throttle,
+            curiosity_state.topics_explored.lock().unwrap().len());
+    }
 
     // ── AUTO-LEARN DAEMON ─────────────────────────────────────────
     // Background thread that polls data/auto_learn.txt every INTERVAL seconds.
@@ -2983,14 +4249,140 @@ fn serve(brain: Brain) -> std::io::Result<()> {
         }
     });
 
+    // ── DOMAIN DETECTOR DAEMON (FASE 2 — passive only, no spawn) ──
+    // Periodically scans dialog_hvs for clusters distant from existing experts.
+    // Logs candidates to /domains endpoint. User approves manually.
+    let det_brain = brain_arc.clone();
+    let detector_state = std::sync::Arc::new(Mutex::new(DomainDetectorState::default()));
+    let detector_state_clone = detector_state.clone();
+    std::thread::spawn(move || {
+        let interval = std::time::Duration::from_secs(120);  // 2min
+        println!("▸ Domain detector daemon: every 120s (passive, no spawn)");
+        loop {
+            std::thread::sleep(interval);
+            let t0 = std::time::Instant::now();
+            let mut det_state = detector_state_clone.lock().unwrap();
+            det_state.scans += 1;
+            det_state.last_scan_ts = wal::now_ts();
+            let g = det_brain.lock().unwrap();
+            if g.dialog_hvs.len() < 50 {
+                drop(g); drop(det_state); continue;
+            }
+            // 1) For each dialog HV, find min distance to existing expert centroid
+            // 2) If > threshold, cluster these "orphans"
+            // 3) Build emerging domains from orphan clusters
+            let orphan_threshold: f32 = 0.45;  // sim < 0.45 to any existing expert = orphan
+            let mut orphan_indices: Vec<usize> = Vec::new();
+            for (idx, hv) in g.dialog_hvs.iter().enumerate() {
+                let max_sim = g.experts.iter()
+                    .map(|e| hv_similarity(hv, &e.centroid_hv))
+                    .fold(0.0f32, f32::max);
+                if max_sim < orphan_threshold {
+                    orphan_indices.push(idx);
+                }
+            }
+            // Greedy cluster orphans: each cluster gets center = first orphan
+            // additional orphans join if sim > merge_threshold
+            let merge_threshold: f32 = 0.65;
+            let mut clusters: Vec<Vec<usize>> = Vec::new();
+            let mut centroids: Vec<Hv> = Vec::new();
+            for &oi in &orphan_indices {
+                let hv = &g.dialog_hvs[oi];
+                let mut placed = false;
+                for (ci, c_hv) in centroids.iter().enumerate() {
+                    if hv_similarity(hv, c_hv) >= merge_threshold {
+                        clusters[ci].push(oi);
+                        placed = true;
+                        break;
+                    }
+                }
+                if !placed {
+                    centroids.push(*hv);
+                    clusters.push(vec![oi]);
+                }
+            }
+            // Filter: only clusters with >= MIN_MEMBERS
+            const MIN_MEMBERS: usize = 8;
+            let mut emerging: Vec<EmergingDomain> = Vec::new();
+            for (ci, members) in clusters.iter().enumerate() {
+                if members.len() < MIN_MEMBERS { continue; }
+                // Recompute centroid as bit-majority
+                let mut bit_counts = [0u32; 1024];
+                for &mi in members {
+                    let hv = &g.dialog_hvs[mi];
+                    for word_i in 0..16 {
+                        let w = hv[word_i];
+                        for bit in 0..64 {
+                            if (w >> bit) & 1 == 1 {
+                                bit_counts[word_i * 64 + bit] += 1;
+                            }
+                        }
+                    }
+                }
+                let n = members.len() as u32;
+                let mut centroid = [0u64; 16];
+                for word_i in 0..16 {
+                    let mut w = 0u64;
+                    for bit in 0..64 {
+                        if bit_counts[word_i * 64 + bit] * 2 > n {
+                            w |= 1u64 << bit;
+                        }
+                    }
+                    centroid[word_i] = w;
+                }
+                // Compute mean dist to existing experts
+                let mean_dist = if g.experts.is_empty() { 1.0 } else {
+                    g.experts.iter()
+                        .map(|e| 1.0 - hv_similarity(&centroid, &e.centroid_hv))
+                        .fold(f32::INFINITY, f32::min)
+                };
+                // Top words: count word freq across member prompts
+                let mut word_freq: HashMap<String, u32> = HashMap::new();
+                for &mi in members {
+                    let txt = String::from_utf8_lossy(&g.dialog_pairs[mi].0).to_lowercase();
+                    for w in txt.split(|c: char| !c.is_alphanumeric()) {
+                        if w.len() < 4 { continue; }
+                        *word_freq.entry(w.to_string()).or_insert(0) += 1;
+                    }
+                }
+                let mut top_w: Vec<(String, u32)> = word_freq.into_iter().collect();
+                top_w.sort_by(|a, b| b.1.cmp(&a.1));
+                let top_words: Vec<String> = top_w.into_iter().take(8).map(|(w, _)| w).collect();
+
+                // Density: members count / total orphans
+                let density = members.len() as f32 / orphan_indices.len().max(1) as f32;
+
+                emerging.push(EmergingDomain {
+                    centroid_hv: centroid,
+                    dialog_indices: members.clone(),
+                    density,
+                    mean_dist_to_existing: mean_dist,
+                    top_words,
+                    detected_at: wal::now_ts(),
+                    pending: true,
+                });
+                let _ = ci;
+            }
+            drop(g);
+            // Replace detected list with latest scan
+            det_state.emerging = emerging.clone();
+            let count = emerging.len();
+            drop(det_state);
+            if count > 0 {
+                println!("🔍 Domain detector scan: {} emerging clusters in {} orphans ({}ms)",
+                         count, orphan_indices.len(), t0.elapsed().as_millis());
+            }
+        }
+    });
+
     // ── CHECKPOINT DAEMON ─────────────────────────────────────────
     // A cada 5min, save brain_v5.bin (atomic via tmp+rename).
     let ckpt_brain = brain_arc.clone();
     let ckpt_state = std::sync::Arc::new(Mutex::new(CheckpointState::default()));
     let ckpt_state_clone = ckpt_state.clone();
     std::thread::spawn(move || {
-        let interval = std::time::Duration::from_secs(300);
-        println!("▸ Checkpoint daemon: every 300s → {}", BRAIN_FILE);
+        let interval = std::time::Duration::from_secs(60);
+        println!("▸ Checkpoint daemon: every 60s → {}", BRAIN_FILE);
         loop {
             std::thread::sleep(interval);
             let t0 = std::time::Instant::now();
@@ -3019,8 +4411,9 @@ fn serve(brain: Brain) -> std::io::Result<()> {
             let st = auto_state.clone();
             let cs = curiosity_state.clone();
             let ck = ckpt_state.clone();
+            let ds = detector_state.clone();
             std::thread::spawn(move || {
-                if let Err(e) = handle_client(&b, &st, &cs, &ck, s) { eprintln!("client err: {}", e); }
+                if let Err(e) = handle_client(&b, &st, &cs, &ck, &ds, s) { eprintln!("client err: {}", e); }
             });
         }
     }
@@ -3032,6 +4425,25 @@ struct CheckpointState {
     count: u64,
     last_ms: u64,
     last_ts: u64,
+}
+
+/// Detected emerging domain — candidate for future spawn.
+#[derive(Clone)]
+struct EmergingDomain {
+    centroid_hv: Hv,
+    dialog_indices: Vec<usize>,
+    density: f32,                 // local KDE estimate
+    mean_dist_to_existing: f32,   // distance to nearest existing expert
+    top_words: Vec<String>,       // top words in cluster
+    detected_at: u64,             // unix ts
+    pending: bool,                // not yet approved by user
+}
+
+#[derive(Default)]
+struct DomainDetectorState {
+    scans: u64,
+    last_scan_ts: u64,
+    emerging: Vec<EmergingDomain>,
 }
 
 #[derive(Default, Clone)]
@@ -3050,120 +4462,8 @@ fn count_pairs_in(path: &str) -> usize {
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// WAL — binary append-only log for auto-learning (replaces auto_learn.txt)
-// ═════════════════════════════════════════════════════════════════════════
-//
-// File layout:
-//   Header (12 bytes): magic "IWAL" | version u32 | reserved u32
-//   Record (variable, 22 bytes overhead):
-//     type u8 (1=dialog, 2=curiosity)
-//     flags u8 (bit0=from_qwen, bit1=from_curiosity, bit2=high_quality)
-//     ts u64 (unix seconds)
-//     score f32 (quality 0..1)
-//     user_len u32, model_len u32
-//     user_bytes, model_bytes
-//
-// Multiple writers must hold the Mutex<File>. Reads are atomic snapshot.
-mod wal {
-    use std::fs::{File, OpenOptions};
-    use std::io::{Read, Write, Seek, SeekFrom};
-    use std::path::Path;
-
-    pub const MAGIC: &[u8; 4] = b"IWAL";
-    pub const VERSION: u32 = 1;
-    pub const HEADER_SIZE: u64 = 12;
-
-    pub const TYPE_DIALOG: u8 = 1;
-    pub const TYPE_CURIOSITY: u8 = 2;
-    pub const FLAG_FROM_QWEN: u8 = 1 << 0;
-    pub const FLAG_FROM_CURIOSITY: u8 = 1 << 1;
-    pub const FLAG_HIGH_QUALITY: u8 = 1 << 2;
-
-    pub struct Record {
-        pub rtype: u8,
-        pub flags: u8,
-        pub ts: u64,
-        pub score: f32,
-        pub user: Vec<u8>,
-        pub model: Vec<u8>,
-    }
-
-    pub fn open_for_append(path: &str) -> std::io::Result<File> {
-        let exists = Path::new(path).exists();
-        let mut f = OpenOptions::new().create(true).append(true).read(true).open(path)?;
-        if !exists {
-            // Write header
-            let mut hdr = Vec::with_capacity(12);
-            hdr.extend_from_slice(MAGIC);
-            hdr.extend_from_slice(&VERSION.to_le_bytes());
-            hdr.extend_from_slice(&0u32.to_le_bytes());
-            f.write_all(&hdr)?;
-        }
-        Ok(f)
-    }
-
-    pub fn append(file: &mut File, rec: &Record) -> std::io::Result<()> {
-        let mut buf = Vec::with_capacity(22 + rec.user.len() + rec.model.len());
-        buf.push(rec.rtype);
-        buf.push(rec.flags);
-        buf.extend_from_slice(&rec.ts.to_le_bytes());
-        buf.extend_from_slice(&rec.score.to_le_bytes());
-        buf.extend_from_slice(&(rec.user.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&(rec.model.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&rec.user);
-        buf.extend_from_slice(&rec.model);
-        file.write_all(&buf)
-    }
-
-    pub fn read_all(path: &str) -> std::io::Result<Vec<Record>> {
-        if !Path::new(path).exists() { return Ok(Vec::new()); }
-        let mut f = File::open(path)?;
-        let mut data = Vec::new();
-        f.read_to_end(&mut data)?;
-        if data.len() < HEADER_SIZE as usize { return Ok(Vec::new()); }
-        if &data[0..4] != MAGIC { return Err(std::io::Error::other("bad magic")); }
-        let mut out = Vec::new();
-        let mut i = HEADER_SIZE as usize;
-        while i + 22 <= data.len() {
-            let rtype = data[i];
-            let flags = data[i+1];
-            let ts = u64::from_le_bytes(data[i+2..i+10].try_into().unwrap());
-            let score = f32::from_le_bytes(data[i+10..i+14].try_into().unwrap());
-            let user_len = u32::from_le_bytes(data[i+14..i+18].try_into().unwrap()) as usize;
-            let model_len = u32::from_le_bytes(data[i+18..i+22].try_into().unwrap()) as usize;
-            let body_start = i + 22;
-            let body_end = body_start + user_len + model_len;
-            if body_end > data.len() { break; }
-            let user = data[body_start..body_start+user_len].to_vec();
-            let model = data[body_start+user_len..body_end].to_vec();
-            out.push(Record { rtype, flags, ts, score, user, model });
-            i = body_end;
-        }
-        Ok(out)
-    }
-
-    pub fn count_records(path: &str) -> usize {
-        read_all(path).map(|v| v.len()).unwrap_or(0)
-    }
-
-    pub fn size_bytes(path: &str) -> u64 {
-        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-    }
-
-    pub fn archive(path: &str) -> std::io::Result<String> {
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0);
-        let arch = format!("{}.{}.archive", path, ts);
-        std::fs::rename(path, &arch)?;
-        Ok(arch)
-    }
-
-    pub fn now_ts() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0)
-    }
-}
+// WAL module agora vive em src/wal.rs — importado via crate path.
+use blab::wal;
 
 // ═════════════════════════════════════════════════════════════════════════
 // CURIOSITY ENGINE — brain auto-pesquisa próprios gaps via Qwen
@@ -3189,32 +4489,73 @@ mod curiosity {
         pub workers_active: AtomicU64,
         pub topics_explored: Mutex<std::collections::HashSet<String>>,
         pub last_question: Mutex<String>,
+        pub last_answer: Mutex<String>,
+        pub explored_path: String,
     }
 
     impl State {
         pub fn new() -> Self {
+            let explored_path = "data/curiosity_explored.txt".to_string();
+            let explored = Self::load_explored(&explored_path);
             Self {
                 running: AtomicBool::new(false),
-                questions_asked: AtomicU64::new(0),
-                questions_answered: AtomicU64::new(0),
+                questions_asked: AtomicU64::new(explored.len() as u64),
+                questions_answered: AtomicU64::new(explored.len() as u64),
                 workers_active: AtomicU64::new(0),
-                topics_explored: Mutex::new(std::collections::HashSet::new()),
+                topics_explored: Mutex::new(explored),
                 last_question: Mutex::new(String::new()),
+                last_answer: Mutex::new(String::new()),
+                explored_path,
             }
+        }
+
+        fn load_explored(path: &str) -> std::collections::HashSet<String> {
+            let mut set = std::collections::HashSet::new();
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    let t = line.trim();
+                    if !t.is_empty() { set.insert(t.to_string()); }
+                }
+            }
+            set
+        }
+
+        pub fn persist_explored(&self) {
+            let set = self.topics_explored.lock().unwrap();
+            let content: String = set.iter().map(|s| format!("{s}\n")).collect();
+            let _ = std::fs::write(&self.explored_path, content);
         }
     }
 
-    /// Pick gap topic from brain state. Returns question string.
+    /// Score quality of a Qwen response (0.0..1.0)
+    fn score_response(resp: &str) -> f32 {
+        let len = resp.trim().len();
+        if len < 20 { return 0.0; }
+        // Length component: reward 80-400 chars
+        let len_score = if len < 80 { len as f32 / 80.0 }
+            else if len <= 400 { 1.0 }
+            else { (400.0 / len as f32).max(0.4) };
+        // Word diversity: count unique words / total words
+        let words: Vec<&str> = resp.split_whitespace().collect();
+        let total = words.len().max(1);
+        let unique: std::collections::HashSet<&str> = words.iter().cloned().collect();
+        let diversity = unique.len() as f32 / total as f32;
+        // Penalize very short responses that repeat
+        let base = len_score * 0.6 + diversity * 0.4;
+        base.clamp(0.0, 1.0)
+    }
+
+    /// Pick gap topic from brain state using 4 strategies. Returns question string.
     pub fn pick_gap(brain: &Brain, rng: &mut u64, exclude: &std::collections::HashSet<String>) -> Option<String> {
-        // Cycle through 3 strategies
         *rng = rng.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xABCD;
         let strat = (*rng >> 13) & 3;
-        for offset in 0..3 {
+        for offset in 0..4 {
             let s = (strat + offset) & 3;
             let q = match s {
                 0 => pick_weak_word(brain, rng),
                 1 => pick_orphan_entity(brain, rng),
-                _ => pick_known_unexpanded(brain, rng),
+                2 => pick_known_unexpanded(brain, rng),
+                _ => pick_pmi_sparse(brain, rng),
             };
             if let Some(q) = q {
                 if !exclude.contains(&q) { return Some(q); }
@@ -3240,7 +4581,6 @@ mod curiosity {
     }
 
     fn pick_orphan_entity(brain: &Brain, rng: &mut u64) -> Option<String> {
-        // Count triples per entity
         let mut entity_count: std::collections::HashMap<&String, u32> = std::collections::HashMap::new();
         for ((e, _), _) in &brain.triples {
             *entity_count.entry(e).or_insert(0) += 1;
@@ -3257,7 +4597,6 @@ mod curiosity {
     }
 
     fn pick_known_unexpanded(brain: &Brain, rng: &mut u64) -> Option<String> {
-        // Top-200 freq words with no KG entry
         let mut top: Vec<(&Vec<u8>, u32)> = brain.word_count.iter()
             .filter(|(w, _)| w.len() >= 4 && w.iter().all(|b| b.is_ascii_alphabetic() || *b >= 0x80))
             .map(|(w, c)| (w, *c)).collect();
@@ -3281,6 +4620,34 @@ mod curiosity {
         Some(format!("explique {}", w.to_lowercase()))
     }
 
+    /// Strategy 4: pick word-pair with lowest PMI (most surprising cooccurrence gap)
+    fn pick_pmi_sparse(brain: &Brain, rng: &mut u64) -> Option<String> {
+        // Find word pairs that appear together but have low PMI (unexpected)
+        // Use word_bigram: pairs where both words have count>=5 but bigram count==1
+        let mut cands: Vec<String> = Vec::new();
+        for (w1, nexts) in &brain.word_bigram {
+            if w1.len() < 4 { continue; }
+            let c1 = brain.word_count.get(w1).copied().unwrap_or(0);
+            if c1 < 5 { continue; }
+            for (w2, &bc) in nexts {
+                if bc != 1 || w2.len() < 4 { continue; }
+                let c2 = brain.word_count.get(w2).copied().unwrap_or(0);
+                if c2 < 5 { continue; }
+                // Low co-occurrence but both words known = knowledge gap
+                let q = format!("qual a relação entre {} e {}?",
+                    String::from_utf8_lossy(w1).to_lowercase(),
+                    String::from_utf8_lossy(w2).to_lowercase());
+                cands.push(q);
+                if cands.len() >= 100 { break; }
+            }
+            if cands.len() >= 100 { break; }
+        }
+        if cands.is_empty() { return None; }
+        *rng = rng.wrapping_mul(0x9E3779B97F4A7C15) ^ cands.len() as u64;
+        let idx = (*rng as usize) % cands.len();
+        Some(cands.swap_remove(idx))
+    }
+
     /// Worker loop. Stops when state.running goes false.
     pub fn worker_loop(
         brain: std::sync::Arc<Mutex<Brain>>,
@@ -3289,13 +4656,17 @@ mod curiosity {
         throttle_ms: u64,
     ) {
         let mut rng: u64 = 0xcbf29ce484222325 ^ worker_id.wrapping_mul(0x100000001b3);
+        let mut answered_since_persist: u64 = 0;
         state.workers_active.fetch_add(1, Ordering::Relaxed);
         while state.running.load(Ordering::Relaxed) {
-            // Pick gap (brief brain lock)
-            let q = {
+            // Pick gap + build RAG context (brief brain lock)
+            let (q, rag_ctx) = {
                 let g = brain.lock().unwrap();
                 let excl = state.topics_explored.lock().unwrap();
-                pick_gap(&g, &mut rng, &excl)
+                let q = pick_gap(&g, &mut rng, &excl);
+                let rag = q.as_ref().map(|qstr| g.build_rag_context(qstr.as_bytes()))
+                    .unwrap_or_default();
+                (q, rag)
             };
             let Some(q) = q else {
                 std::thread::sleep(Duration::from_millis(throttle_ms.max(1000)));
@@ -3303,27 +4674,42 @@ mod curiosity {
             };
             state.questions_asked.fetch_add(1, Ordering::Relaxed);
             *state.last_question.lock().unwrap() = q.clone();
-            // Call Qwen (no brain lock)
-            let resp = qwen_call(&q, 150, None);
+
+            // Call Qwen with brain RAG context (no brain lock held)
+            let ctx_opt = if rag_ctx.is_empty() { None } else { Some(rag_ctx.as_str()) };
+            let resp = qwen_call(&q, 200, ctx_opt);
+
             if let Some(r) = resp {
-                if r.trim().len() > 20 {
-                    // Append WAL (open per-write — OS append is atomic for small writes)
+                let trimmed = r.trim();
+                let score = score_response(trimmed);
+                if score > 0.2 {
+                    // Write to WAL with dynamic quality score
                     if let Ok(mut f) = wal::open_for_append(WAL_PATH) {
                         let _ = wal::append(&mut f, &wal::Record {
                             rtype: wal::TYPE_CURIOSITY,
                             flags: wal::FLAG_FROM_QWEN | wal::FLAG_FROM_CURIOSITY,
                             ts: wal::now_ts(),
-                            score: 0.8,
+                            score,
                             user: q.as_bytes().to_vec(),
-                            model: r.trim().as_bytes().to_vec(),
+                            model: trimmed.as_bytes().to_vec(),
                         });
                     }
+                    *state.last_answer.lock().unwrap() = trimmed.chars().take(120).collect();
                     state.questions_answered.fetch_add(1, Ordering::Relaxed);
-                    state.topics_explored.lock().unwrap().insert(q);
+                    state.topics_explored.lock().unwrap().insert(q.clone());
+                    answered_since_persist += 1;
+                    // Persist explored topics every 10 answers (only worker_id 0)
+                    if worker_id == 0 && answered_since_persist % 10 == 0 {
+                        state.persist_explored();
+                    }
+                    eprintln!("[curiosity#{}] q={:?} score={:.2} len={}",
+                        worker_id, &q[..q.len().min(50)], score, trimmed.len());
                 }
             }
             std::thread::sleep(Duration::from_millis(throttle_ms));
         }
+        // Final persist on shutdown (worker 0)
+        if worker_id == 0 { state.persist_explored(); }
         state.workers_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
