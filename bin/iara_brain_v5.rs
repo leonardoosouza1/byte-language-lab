@@ -3961,12 +3961,37 @@ fn handle_client(
         let ds = detector_state.lock().unwrap();
         let ck = ckpt_state.lock().unwrap();
 
-        let unigram_sum: u32 = g.unigram.iter().sum();
+        let _unigram_sum: u32 = g.unigram.iter().sum();
         let n_words = g.word_count.len();
         let n_phrases = g.phrase_count.len();
         let n_dialogs = g.dialog_pairs.len();
         let n_triples = g.triples.len();
         let n_bigram = g.bigram.iter().filter(|&&c| c > 0).count();
+        let brain_bytes = std::fs::metadata(BRAIN_FILE).map(|m| m.len()).unwrap_or(0);
+        let brain_mb = format!("{:.1}", brain_bytes as f32 / (1024.0 * 1024.0));
+        // Format compact human-readable: 12488 → "12.5k"
+        let fmt_h = |n: usize| -> String {
+            if n >= 1_000_000 { format!("{:.1}M", n as f32 / 1_000_000.0) }
+            else if n >= 10_000 { format!("{:.1}k", n as f32 / 1000.0) }
+            else if n >= 1_000 { format!("{:.2}k", n as f32 / 1000.0) }
+            else { format!("{}", n) }
+        };
+        let fmt_raw = |n: usize| -> String {
+            let s = n.to_string();
+            let bytes = s.as_bytes();
+            let mut out = String::new();
+            for (i, &c) in bytes.iter().enumerate() {
+                if i > 0 && (bytes.len() - i) % 3 == 0 { out.push('.'); }
+                out.push(c as char);
+            }
+            out
+        };
+        let nd_h = fmt_h(n_dialogs);
+        let nd_raw = fmt_raw(n_dialogs);
+        let nt_h = fmt_h(n_triples);
+        let nw_h = fmt_h(n_words);
+        let np_h = fmt_h(n_phrases);
+        let nb_h = fmt_h(n_bigram);
 
         let moe_cards: String = g.experts.iter().map(|e| {
             format!("<div class=\"row\"><span class=\"name\">{}</span><span class=\"val\">{}d / {}h</span></div>",
@@ -4000,14 +4025,20 @@ fn handle_client(
              <style>\
                *{{box-sizing:border-box;margin:0;padding:0}}\
                body{{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,sans-serif;\
-                     background:#0f1419;color:#bfbdb6;padding:env(safe-area-inset-top,12px) 14px env(safe-area-inset-bottom,14px) 14px;\
+                     background:#0f1419;color:#bfbdb6;padding:0 14px env(safe-area-inset-bottom,80px) 14px;\
                      font-size:15px;line-height:1.4;-webkit-tap-highlight-color:transparent}}\
+               .topbar{{position:sticky;top:0;background:#0f1419;padding:env(safe-area-inset-top,12px) 0 8px;z-index:10;border-bottom:1px solid #1f2430;margin:0 -14px 14px;padding-left:14px;padding-right:14px}}\
+               .navbar{{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin-top:8px}}\
+               .navbar::-webkit-scrollbar{{display:none}}\
+               .navbar a{{flex:0 0 auto;padding:8px 14px;background:#1f2430;border-radius:18px;color:#bfbdb6;font-size:13px;text-decoration:none;white-space:nowrap;border:1px solid #273347;font-weight:500}}\
+               .navbar a.active{{background:#73d0ff;color:#0f1419;border-color:#73d0ff}}\
                h1{{color:#ffb454;font-size:20px;font-weight:600;margin-bottom:4px}}\
-               .ver{{color:#5c6773;font-size:12px;margin-bottom:14px}}\
+               .ver{{color:#5c6773;font-size:12px}}\
                .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}}\
-               .kpi{{background:#1f2430;border-radius:10px;padding:10px;border:1px solid #273347}}\
-               .kpi .lbl{{color:#5c6773;font-size:11px;text-transform:uppercase;letter-spacing:.5px}}\
-               .kpi .num{{color:#73d0ff;font-size:18px;font-weight:600;margin-top:2px}}\
+               .kpi{{background:#1f2430;border-radius:10px;padding:12px;border:1px solid #273347;min-height:78px}}\
+               .kpi .lbl{{color:#5c6773;font-size:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:600}}\
+               .kpi .num{{color:#73d0ff;font-size:22px;font-weight:700;margin-top:2px;line-height:1.1}}\
+               .kpi .sub{{color:#5c6773;font-size:10px;margin-top:2px}}\
                .card{{background:#1f2430;border-radius:10px;padding:12px;margin-bottom:10px;border:1px solid #273347}}\
                .card h2{{color:#ffb454;font-size:13px;font-weight:600;text-transform:uppercase;\
                           letter-spacing:.5px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}}\
@@ -4025,16 +4056,27 @@ fn handle_client(
                @media(min-width:600px){{.grid{{grid-template-columns:repeat(3,1fr)}}}}\
                @media(min-width:900px){{body{{max-width:900px;margin:0 auto}}}}\
              </style></head><body>\
-             <h1>🧠 IARA-Byte Brain</h1>\
-             <div class=\"ver\">v0.6.1 · auto-refresh 15s</div>\
+             <div class=\"topbar\">\
+               <h1>🧠 IARA-Byte Brain</h1>\
+               <div class=\"ver\">v0.6.1 · auto-refresh 15s</div>\
+               <nav class=\"navbar\">\
+                 <a href=\"/dashboard\" class=\"active\">📊 Dashboard</a>\
+                 <a href=\"/chat-ui\">💬 Chat</a>\
+                 <a href=\"/control-ui\">🎛 Control</a>\
+                 <a href=\"/forest-ui\">🌳 Forest</a>\
+                 <a href=\"/domains-ui\">🌱 Domains</a>\
+                 <a href=\"/neurons-ui\">🧬 Neurons</a>\
+                 <a href=\"/api-ui\">🔌 API</a>\
+               </nav>\
+             </div>\
              \
              <div class=\"grid\">\
-               <div class=\"kpi\"><div class=\"lbl\">Dialogs</div><div class=\"num\">{n_dialogs}</div></div>\
-               <div class=\"kpi\"><div class=\"lbl\">Triples</div><div class=\"num\">{n_triples}</div></div>\
-               <div class=\"kpi\"><div class=\"lbl\">Words</div><div class=\"num\">{n_words}</div></div>\
-               <div class=\"kpi\"><div class=\"lbl\">Phrases</div><div class=\"num\">{n_phrases}</div></div>\
-               <div class=\"kpi\"><div class=\"lbl\">Bytes</div><div class=\"num\">{ub}</div></div>\
-               <div class=\"kpi\"><div class=\"lbl\">Bigram</div><div class=\"num\">{nb}</div></div>\
+               <div class=\"kpi\" title=\"Tamanho do brain.bin em disco\"><div class=\"lbl\">Brain size</div><div class=\"num\">{brain_mb}</div><div class=\"sub\">MB no disco</div></div>\
+               <div class=\"kpi\" title=\"Pares pergunta→resposta aprendidos\"><div class=\"lbl\">Dialogs</div><div class=\"num\">{nd_h}</div><div class=\"sub\">{nd_raw} pairs Q→A</div></div>\
+               <div class=\"kpi\" title=\"Fatos (entidade, relação, valor) extraídos\"><div class=\"lbl\">KG Facts</div><div class=\"num\">{nt_h}</div><div class=\"sub\">triplas no graph</div></div>\
+               <div class=\"kpi\" title=\"Palavras únicas no vocabulário\"><div class=\"lbl\">Vocab</div><div class=\"num\">{nw_h}</div><div class=\"sub\">palavras únicas</div></div>\
+               <div class=\"kpi\" title=\"Frases capturadas\"><div class=\"lbl\">Phrases</div><div class=\"num\">{np_h}</div><div class=\"sub\">sentenças</div></div>\
+               <div class=\"kpi\" title=\"Conexões byte→byte aprendidas\"><div class=\"lbl\">Synapses</div><div class=\"num\">{nb_h}</div><div class=\"sub\">bigram edges</div></div>\
              </div>\
              \
              <div class=\"card\">\
@@ -4088,8 +4130,8 @@ fn handle_client(
                byte-language-lab · github.com/leonardoosouza1\
              </div>\
              </body></html>",
-            n_dialogs = n_dialogs, n_triples = n_triples, n_words = n_words,
-            n_phrases = n_phrases, ub = unigram_sum, nb = n_bigram,
+            brain_mb = brain_mb, nd_h = nd_h, nd_raw = nd_raw,
+            nt_h = nt_h, nw_h = nw_h, np_h = np_h, nb_h = nb_h,
             cyc = a.cycles, dl = a.total_dialogs_learned, tl = a.total_triples_learned,
             lcms = a.last_cycle_ms,
             cur_w = cur_workers, cur_a = cur_asked, cur_ans = cur_answered, cur_t = cur_topics,
@@ -4100,6 +4142,377 @@ fn handle_client(
             n_exp = n_exp, moe = moe_cards,
             n_trees = n_trees, n_branches = n_branches, n_myc = n_myc,
             trees = tree_cards,
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(), html
+        );
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    } else if method == "POST" && path == "/distill" {
+        // Trigger distillation script via subprocess
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let corpus = extract_json_str(&body_s, "corpus")
+            .unwrap_or_else(|| "data/lists/perguntas-5k.txt".into());
+        let n = extract_json_num(&body_s, "n").unwrap_or(20.0) as usize;
+        // Spawn distill script in background (non-blocking)
+        let script = "scripts/distill_qwen.py";
+        let res = std::process::Command::new("python3")
+            .arg(script).arg(&corpus).arg(n.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match res {
+            Ok(child) => format!("{{\"started\":true,\"pid\":{},\"corpus\":{},\"n\":{}}}",
+                                  child.id(), json_escape(&corpus), n),
+            Err(e) => format!("{{\"started\":false,\"error\":{}}}", json_escape(&e.to_string()))
+        }
+    } else if method == "GET" && path == "/neurons" {
+        // Neuron-like observability — JSON com byte-level activations
+        let g = brain.lock().unwrap();
+        let total_uni: u32 = g.unigram.iter().sum::<u32>().max(1);
+        // Top-32 most frequent bytes (proxy "alive neurons")
+        let mut bytes_ranked: Vec<(u8, u32, u32, f32, f32, f32)> = (0..=255u8).map(|b| {
+            let bi = b as usize;
+            (b, g.unigram[bi], g.byte_degree[bi],
+                g.byte_freq[bi], g.qwen_tension[bi], g.qwen_entropy[bi])
+        }).collect();
+        bytes_ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_bytes: Vec<String> = bytes_ranked.iter().take(64).map(|(b, count, deg, freq, tens, ent)| {
+            let pct = (*count as f32) / (total_uni as f32) * 100.0;
+            let ch = if *b >= 0x20 && *b < 0x7F { format!("'{}'", *b as char).replace('"', "''")  } else { format!("0x{:02x}", b) };
+            format!("{{\"byte\":{},\"char\":{},\"count\":{},\"pct\":{:.2},\"degree\":{},\"freq\":{:.1},\"tension\":{:.3},\"entropy\":{:.3}}}",
+                b, json_escape(&ch.trim_matches('\'').to_string()), count, pct, deg, freq, tens, ent)
+        }).collect();
+        // Top 64 hottest bigram pairs (a, b, count)
+        let mut bigrams: Vec<(u8, u8, u32)> = Vec::new();
+        for a in 0..256usize {
+            for b in 0..256usize {
+                let c = g.bigram[a*256 + b];
+                if c >= 50 { bigrams.push((a as u8, b as u8, c)); }
+            }
+        }
+        bigrams.sort_by(|x, y| y.2.cmp(&x.2));
+        bigrams.truncate(64);
+        let top_bi: Vec<String> = bigrams.iter().map(|(a, b, c)| {
+            let ca = if *a >= 0x20 && *a < 0x7F { format!("{}", *a as char) } else { format!("·") };
+            let cb = if *b >= 0x20 && *b < 0x7F { format!("{}", *b as char) } else { format!("·") };
+            format!("{{\"a\":{},\"b\":{},\"ca\":{},\"cb\":{},\"count\":{}}}",
+                a, b, json_escape(&ca), json_escape(&cb), c)
+        }).collect();
+        format!("{{\"total_bytes\":{},\"top_neurons\":[{}],\"top_bigrams\":[{}]}}",
+                total_uni, top_bytes.join(","), top_bi.join(","))
+    } else if method == "GET" && (path == "/chat-ui" || path == "/control-ui"
+            || path == "/forest-ui" || path == "/domains-ui" || path == "/api-ui"
+            || path == "/neurons-ui") {
+        let (title_emoji, page_id, content) = match path.as_str() {
+            "/chat-ui" => ("💬", "chat", r#"
+<div class="card">
+  <h2>💬 Chat com brain <span class="badge">live</span></h2>
+  <div id="msgs" style="max-height:50vh;overflow-y:auto;padding:8px 0">
+    <div style="color:#5c6773;font-size:13px;text-align:center;padding:14px">Faça uma pergunta abaixo...</div>
+  </div>
+  <div style="display:flex;gap:6px;margin-top:8px">
+    <input id="q" type="text" placeholder="Pergunte algo..." style="flex:1;padding:12px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:10px;font-size:15px;font-family:inherit">
+    <button onclick="ask()" style="padding:12px 18px;background:#73d0ff;color:#0f1419;border:none;border-radius:10px;font-weight:600;font-size:14px">Enviar</button>
+  </div>
+</div>
+<script>
+function ask(){
+  var q=document.getElementById('q');var t=q.value.trim();if(!t)return;
+  var m=document.getElementById('msgs');
+  var u=document.createElement('div');u.style.cssText='background:#273347;padding:8px 12px;border-radius:10px;margin:6px 0;color:#73d0ff';u.textContent='› '+t;m.appendChild(u);
+  var loader=document.createElement('div');loader.style.cssText='color:#5c6773;font-size:12px;padding:4px 12px';loader.textContent='pensando...';m.appendChild(loader);
+  m.scrollTop=m.scrollHeight;q.value='';
+  fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify({prompt:t,max:160,temp:0.5})})
+    .then(r=>r.json()).then(d=>{
+      loader.remove();
+      var r=document.createElement('div');r.style.cssText='background:#1f2430;padding:10px 12px;border-radius:10px;margin:6px 0;border-left:3px solid '+(d.source.startsWith('brain')?'#7fd962':'#ffb454');
+      var src=document.createElement('span');src.style.cssText='font-size:10px;color:#5c6773;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px';src.textContent=d.source;
+      var ans=document.createElement('div');ans.style.cssText='color:#bfbdb6;white-space:pre-wrap';ans.textContent=d.response;
+      r.appendChild(src);r.appendChild(ans);m.appendChild(r);m.scrollTop=m.scrollHeight;
+    }).catch(e=>{loader.textContent='erro: '+e});
+}
+document.getElementById('q').addEventListener('keydown',function(e){if(e.key==='Enter')ask()});
+</script>"#),
+            "/control-ui" => ("🎛", "control", r#"
+<div class="card">
+  <h2>🔍 Curiosity Loop</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Brain pesquisa próprios gaps. Workers = paralelo.</p>
+  <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+    <label style="font-size:13px;color:#bfbdb6">Workers:</label>
+    <input id="curW" type="number" value="4" min="1" max="8" style="width:60px;padding:6px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px">
+    <label style="font-size:13px;color:#bfbdb6">Throttle ms:</label>
+    <input id="curT" type="number" value="600" min="100" max="5000" step="100" style="width:80px;padding:6px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px">
+  </div>
+  <div style="display:flex;gap:6px">
+    <button onclick="startCur()" style="flex:1;padding:10px;background:#7fd962;color:#0f1419;border:none;border-radius:8px;font-weight:600">▶ Start</button>
+    <button onclick="post('/curiosity/stop')" style="flex:1;padding:10px;background:#ffb454;color:#0f1419;border:none;border-radius:8px;font-weight:600">⏸ Stop</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>📚 Distillation manual</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Roda script Python pra puxar Qwen sobre N perguntas do corpus.</p>
+  <label style="font-size:13px;color:#bfbdb6;display:block;margin-bottom:4px">Corpus:</label>
+  <select id="corpus" style="width:100%;padding:8px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px;margin-bottom:8px">
+    <option value="data/lists/perguntas-500.txt">perguntas-500 (500q)</option>
+    <option value="data/lists/perguntas-1500.txt">perguntas-1500 (1500q)</option>
+    <option value="data/lists/perguntas-5k.txt" selected>perguntas-5k (5000q)</option>
+    <option value="data/lists/perguntas-1k-manus.txt">perguntas-10k-manus (10000q)</option>
+  </select>
+  <label style="font-size:13px;color:#bfbdb6;display:block;margin-bottom:4px">N prompts:</label>
+  <input id="nPrompts" type="number" value="20" min="1" max="500" style="width:100%;padding:8px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px;margin-bottom:8px">
+  <label style="font-size:13px;color:#bfbdb6;display:block;margin-bottom:4px">Teacher model:</label>
+  <select id="teacher" style="width:100%;padding:8px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px;margin-bottom:8px">
+    <option value="qwen2.5-1.5b-q4km" selected>Qwen 1.5b Q4_K_M (fast PT-BR)</option>
+    <option value="qwen2.5-1.5b">Qwen 1.5b BF16</option>
+    <option value="qwen3-4b">Qwen3 4B (thinking)</option>
+    <option value="qwen2.5-0.5b">Qwen 0.5b (tiny)</option>
+  </select>
+  <div style="display:flex;gap:6px">
+    <button onclick="loadModel()" style="flex:1;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600">🔄 Load teacher</button>
+    <button onclick="runDistill()" style="flex:1;padding:10px;background:#7fd962;color:#0f1419;border:none;border-radius:8px;font-weight:600">📚 Distill</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>♻️ Auto-learn / Checkpoint</h2>
+  <div style="display:flex;gap:6px;flex-wrap:wrap">
+    <button onclick="post('/learn')" style="flex:1;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600;min-width:120px">Ingest WAL</button>
+    <button onclick="post('/checkpoint')" style="flex:1;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600;min-width:120px">💾 Save</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>🎯 Targeted Learn</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Ensina brain sobre tópico específico.</p>
+  <input id="topic" type="text" placeholder="ex: fotossíntese, Sócrates, Rust..." style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
+  <input id="nQ" type="number" value="10" min="1" max="50" placeholder="N questions" style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
+  <button onclick="targetedLearn()" style="width:100%;padding:10px;background:#7fd962;color:#0f1419;border:none;border-radius:8px;font-weight:600">📖 Aprender sobre tópico</button>
+</div>
+
+<div class="card">
+  <h2>📤 Saída última ação</h2>
+  <pre id="out" style="background:#1a1f2b;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;overflow-x:auto;color:#bfbdb6;white-space:pre-wrap;border:1px solid #273347;min-height:40px;max-height:300px">(nenhuma)</pre>
+</div>
+
+<script>
+function show(r){document.getElementById('out').textContent=typeof r==='string'?r:JSON.stringify(r,null,2)}
+function post(url){fetch(url,{method:'POST'}).then(r=>r.json()).then(show).catch(e=>show({error:String(e)}))}
+function postBody(url,body){fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(show).catch(e=>show({error:String(e)}))}
+function startCur(){
+  var w=parseInt(document.getElementById('curW').value)||4;
+  var t=parseInt(document.getElementById('curT').value)||600;
+  postBody('/curiosity/start',{workers:w,throttle_ms:t});
+}
+function loadModel(){
+  var m=document.getElementById('teacher').value;
+  show('Loading '+m+'...');
+  fetch('http://'+location.hostname+':3000/api/load-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:m})})
+    .then(r=>r.json()).then(show).catch(e=>show({error:String(e)+' (engine porta 3000 acessível?)'}));
+}
+function runDistill(){
+  var c=document.getElementById('corpus').value;
+  var n=parseInt(document.getElementById('nPrompts').value)||20;
+  show('Distill iniciado: '+c+' x '+n+' prompts.\nAguarde, isso roda no terminal do server.\nTriggering /distill backend endpoint...');
+  postBody('/distill',{corpus:c,n:n});
+}
+function targetedLearn(){
+  var t=document.getElementById('topic').value.trim();if(!t)return;
+  var n=parseInt(document.getElementById('nQ').value)||10;
+  var templates=['o que é '+t,'quem foi '+t,'explique '+t,'fale sobre '+t,'qual a importância de '+t,
+    'quais os exemplos de '+t,'qual a história de '+t,'compare '+t+' e seus similares',
+    'consequências de '+t,'tipos de '+t];
+  show('Targeted learn: '+t+' ('+n+' questions)...');
+  var done=0;
+  for(var i=0;i<Math.min(n,templates.length);i++){
+    (function(q){
+      fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q,max:120,temp:0.5})})
+        .then(r=>r.json()).then(d=>{done++;show('['+done+'/'+n+'] '+q+' → '+d.source);});
+    })(templates[i]);
+  }
+}
+</script>"#),
+            "/forest-ui" => ("🌳", "forest", r#"
+<div class="card">
+  <h2>🌳 Gravity Forest <span class="badge" id="forest-count">…</span></h2>
+  <div id="trees"></div>
+</div>
+<div class="card">
+  <h2>🍄 Mycelium edges <span class="badge" id="myc-count">…</span></h2>
+  <div id="edges"></div>
+</div>
+<div class="card">
+  <h2>🧪 Test routing</h2>
+  <input id="rq" type="text" placeholder="pergunta..." style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px">
+  <button onclick="route()" style="margin-top:8px;padding:10px;background:#73d0ff;color:#0f1419;border:none;border-radius:8px;font-weight:600;width:100%">Route via gravity</button>
+  <pre id="rout" style="background:#1a1f2b;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;margin-top:8px;color:#bfbdb6;white-space:pre-wrap"></pre>
+</div>
+<script>
+fetch('/forest').then(r=>r.json()).then(d=>{
+  document.getElementById('forest-count').textContent=d.n_trees+'t · '+d.total_branches+'br';
+  document.getElementById('trees').innerHTML=d.trees.map(t=>'<div class="row"><span class="name">'+t.name+'</span><span class="val">m='+t.mass.toFixed(1)+' d='+t.n_dialogs+' b='+t.branches+'</span></div>').join('');
+});
+fetch('/mycelium').then(r=>r.json()).then(d=>{
+  document.getElementById('myc-count').textContent=d.n_edges+' edges';
+  document.getElementById('edges').innerHTML=d.edges.slice(0,30).map(e=>'<div class="row"><span class="name">'+e.a+' ↔ '+e.b+'</span><span class="val">w='+e.weight.toFixed(2)+'</span></div>').join('');
+});
+function route(){
+  var t=document.getElementById('rq').value;if(!t)return;
+  fetch('/forest_route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t})})
+    .then(r=>r.json()).then(d=>document.getElementById('rout').textContent=JSON.stringify(d,null,2));
+}
+</script>"#),
+            "/domains-ui" => ("🌱", "domains", r#"
+<div class="card">
+  <h2>🌱 Detector daemon <span class="badge" id="scans">…</span></h2>
+  <div id="state"></div>
+</div>
+<div class="card">
+  <h2>📊 Emerging clusters <span class="badge" id="emcount">…</span></h2>
+  <div id="emerging"></div>
+</div>
+<script>
+fetch('/domains').then(r=>r.json()).then(d=>{
+  document.getElementById('scans').textContent=d.scans+' scans';
+  document.getElementById('state').innerHTML='<div class="row"><span class="name">Last scan ts</span><span class="val">'+d.last_scan_ts+'</span></div><div class="row"><span class="name">Auto-spawned</span><span class="val">'+d.auto_spawned+'</span></div><div class="row"><span class="name">Last spawn ts</span><span class="val">'+d.last_spawn_ts+'</span></div>';
+  document.getElementById('emcount').textContent=d.count+' clusters';
+  if(d.emerging.length===0){document.getElementById('emerging').innerHTML='<div style="color:#5c6773;padding:10px;text-align:center">(nenhum cluster orfão detectado)</div>'}
+  else{document.getElementById('emerging').innerHTML=d.emerging.map(e=>'<div class="row"><span class="name">#'+e.id+' · '+e.top_words.slice(0,40)+'</span><span class="val">ρ='+e.density.toFixed(2)+' d='+e.n_dialogs+'</span></div>').join('');}
+});
+</script>"#),
+            "/neurons-ui" => ("🧬", "neurons", r#"
+<div class="card">
+  <h2>🧬 Byte Neurons (top 64 hottest) <span class="badge" id="totb">…</span></h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Cada byte é um neurônio. Brilho = atividade. Degree = conexões. Tension = energy. Entropy = uncertainty.</p>
+  <div id="neugrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(50px,1fr));gap:4px"></div>
+</div>
+<div class="card">
+  <h2>🔥 Top bigram firing (hot synapses)</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Pares byte→byte mais ativos. Espessura = força.</p>
+  <div id="bigrams" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+</div>
+<div class="card">
+  <h2>📊 Activity heatmap</h2>
+  <canvas id="heatmap" width="256" height="256" style="image-rendering:pixelated;width:100%;height:auto;background:#0f1419;border-radius:8px"></canvas>
+  <p style="font-size:11px;color:#5c6773;margin-top:6px">Bigram 256×256 — eixo X = prev byte, Y = next byte. Brilho ∝ log(count).</p>
+</div>
+<script>
+fetch('/neurons').then(r=>r.json()).then(d=>{
+  document.getElementById('totb').textContent=d.total_bytes.toLocaleString()+' tokens';
+  // Neurons grid: each byte cell with intensity
+  var maxCount=d.top_neurons[0]?d.top_neurons[0].count:1;
+  document.getElementById('neugrid').innerHTML=d.top_neurons.map(n=>{
+    var intensity=Math.min(1,n.count/maxCount);
+    var hue=Math.round(intensity*40+200); // blue->cyan->green
+    var bg='hsl('+hue+',70%,'+(15+intensity*35)+'%)';
+    return '<div style="background:'+bg+';padding:6px;border-radius:6px;text-align:center;font-family:monospace;font-size:11px;color:#bfbdb6"><div style="font-size:14px;font-weight:600;color:#fff">'+(n.char||'·')+'</div><div style="opacity:.7">'+n.count+'</div><div style="opacity:.5;font-size:9px">d'+n.degree+'</div></div>';
+  }).join('');
+  // Bigrams
+  var maxB=d.top_bigrams[0]?d.top_bigrams[0].count:1;
+  document.getElementById('bigrams').innerHTML=d.top_bigrams.map(b=>{
+    var w=Math.min(1,b.count/maxB);
+    var size=10+w*8;
+    return '<span style="background:#273347;padding:'+(2+w*4)+'px '+(6+w*4)+'px;border-radius:'+(4+w*4)+'px;font-family:monospace;font-size:'+size+'px;color:hsl('+Math.round(w*60+180)+',70%,70%);border:1px solid hsla('+Math.round(w*60+180)+',70%,50%,'+w+')">'+b.ca+'→'+b.cb+'<small style="opacity:.6;margin-left:4px">'+b.count+'</small></span>';
+  }).join('');
+  // Heatmap: 256x256 canvas
+  var canvas=document.getElementById('heatmap');var ctx=canvas.getContext('2d');
+  var img=ctx.createImageData(256,256);
+  // Use top bigrams to populate
+  d.top_bigrams.forEach(function(bg){
+    var idx=(bg.b*256+bg.a)*4;
+    var intensity=Math.min(255,Math.log(bg.count+1)*30);
+    img.data[idx]=intensity*0.4;
+    img.data[idx+1]=intensity;
+    img.data[idx+2]=intensity*0.7;
+    img.data[idx+3]=255;
+  });
+  // Fill rest dim
+  for(var i=0;i<img.data.length;i+=4){
+    if(img.data[i+3]===0){img.data[i+3]=255;img.data[i]=15;img.data[i+1]=20;img.data[i+2]=25;}
+  }
+  ctx.putImageData(img,0,0);
+});
+</script>"#),
+            "/api-ui" => ("🔌", "api", r#"
+<div class="card">
+  <h2>🔌 Endpoints disponíveis</h2>
+  <div class="row"><span class="name">POST /chat</span><span class="val">main chat</span></div>
+  <div class="row"><span class="name">POST /iara_gen</span><span class="val">brain-native gen</span></div>
+  <div class="row"><span class="name">GET /stats</span><span class="val">brain counters</span></div>
+  <div class="row"><span class="name">GET /persona</span><span class="val">user profile</span></div>
+  <div class="row"><span class="name">GET /graph</span><span class="val">top byte edges</span></div>
+  <div class="row"><span class="name">GET /graph_dot</span><span class="val">DOT format</span></div>
+  <div class="row"><span class="name">GET /moe</span><span class="val">MoE experts</span></div>
+  <div class="row"><span class="name">GET /forest</span><span class="val">tree forest</span></div>
+  <div class="row"><span class="name">GET /mycelium</span><span class="val">edge graph</span></div>
+  <div class="row"><span class="name">POST /forest_route</span><span class="val">gravity routing</span></div>
+  <div class="row"><span class="name">GET /domains</span><span class="val">emerging clusters</span></div>
+  <div class="row"><span class="name">GET /curiosity</span><span class="val">curiosity state</span></div>
+  <div class="row"><span class="name">POST /curiosity/start</span><span class="val">{workers,throttle_ms}</span></div>
+  <div class="row"><span class="name">POST /curiosity/stop</span><span class="val">stop workers</span></div>
+  <div class="row"><span class="name">GET /autolearn</span><span class="val">daemon state</span></div>
+  <div class="row"><span class="name">GET /checkpoint</span><span class="val">save state</span></div>
+  <div class="row"><span class="name">POST /checkpoint</span><span class="val">force save</span></div>
+  <div class="row"><span class="name">POST /learn</span><span class="val">manual WAL ingest</span></div>
+</div>
+<div class="card">
+  <h2>📡 Exemplo curl</h2>
+  <pre style="background:#1a1f2b;padding:10px;border-radius:8px;font-family:monospace;font-size:11px;overflow-x:auto;color:#bfbdb6;border:1px solid #273347">curl -X POST http://192.168.1.54:3012/chat \\
+  -H 'Content-Type: application/json' \\
+  -d '{"prompt":"oi","max":80}'</pre>
+</div>"#),
+            _ => ("?", "unknown", "<p>page not found</p>"),
+        };
+        let nav_link = |p: &str, label: &str| -> String {
+            let active = if p == path.as_str() { " class=\"active\"" } else { "" };
+            format!("<a href=\"{}\"{}>{}</a>", p, active, label)
+        };
+        let html = format!(
+            "<!DOCTYPE html><html lang=\"pt-BR\"><head>\
+             <meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
+             <meta name=\"theme-color\" content=\"#0f1419\">\
+             <title>{} IARA · {}</title>\
+             <style>\
+               *{{box-sizing:border-box;margin:0;padding:0}}\
+               body{{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,sans-serif;\
+                     background:#0f1419;color:#bfbdb6;padding:0 14px env(safe-area-inset-bottom,80px) 14px;\
+                     font-size:15px;line-height:1.4;-webkit-tap-highlight-color:transparent}}\
+               .topbar{{position:sticky;top:0;background:#0f1419;padding:env(safe-area-inset-top,12px) 0 8px;z-index:10;border-bottom:1px solid #1f2430;margin:0 -14px 14px;padding-left:14px;padding-right:14px}}\
+               .navbar{{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin-top:8px}}\
+               .navbar::-webkit-scrollbar{{display:none}}\
+               .navbar a{{flex:0 0 auto;padding:8px 14px;background:#1f2430;border-radius:18px;color:#bfbdb6;font-size:13px;text-decoration:none;white-space:nowrap;border:1px solid #273347;font-weight:500}}\
+               .navbar a.active{{background:#73d0ff;color:#0f1419;border-color:#73d0ff}}\
+               h1{{color:#ffb454;font-size:20px;font-weight:600;margin-bottom:4px}}\
+               .ver{{color:#5c6773;font-size:12px}}\
+               .card{{background:#1f2430;border-radius:10px;padding:12px;margin-bottom:10px;border:1px solid #273347}}\
+               .card h2{{color:#ffb454;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}}\
+               .card h2 .badge{{background:#273347;color:#73d0ff;font-size:10px;padding:2px 8px;border-radius:10px;letter-spacing:0;text-transform:none}}\
+               .row{{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1a1f2b;font-size:14px;gap:8px}}\
+               .row:last-child{{border-bottom:none}}\
+               .row .name{{color:#bfbdb6;flex:1}}\
+               .row .val{{color:#73d0ff;font-family:monospace;font-size:13px;text-align:right}}\
+               input,button{{font-family:inherit}}\
+               @media(min-width:900px){{body{{max-width:900px;margin:0 auto}}}}\
+             </style></head><body>\
+             <div class=\"topbar\">\
+               <h1>{} IARA · {}</h1>\
+               <div class=\"ver\">v0.6.1</div>\
+               <nav class=\"navbar\">{}{}{}{}{}{}{}</nav>\
+             </div>\
+             {}\
+             </body></html>",
+            title_emoji, page_id, title_emoji, page_id,
+            nav_link("/dashboard", "📊 Dashboard"),
+            nav_link("/chat-ui", "💬 Chat"),
+            nav_link("/control-ui", "🎛 Control"),
+            nav_link("/forest-ui", "🌳 Forest"),
+            nav_link("/domains-ui", "🌱 Domains"),
+            nav_link("/neurons-ui", "🧬 Neurons"),
+            nav_link("/api-ui", "🔌 API"),
+            content,
         );
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
