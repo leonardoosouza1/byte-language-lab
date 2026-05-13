@@ -4389,8 +4389,15 @@ fn essence_test(brain: &Brain) {
 }
 
 fn serve(brain: Brain) -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:3012")?;
-    println!("\n▸ Server listening at http://127.0.0.1:3012");
+    // Bind 0.0.0.0 → LAN accessible (celular, outros devices na mesma rede).
+    // Use 127.0.0.1 só se IARA_BIND_LOCAL=1.
+    let bind_addr = if std::env::var("IARA_BIND_LOCAL").ok().as_deref() == Some("1") {
+        "127.0.0.1:3012".to_string()
+    } else {
+        "0.0.0.0:3012".to_string()
+    };
+    let listener = TcpListener::bind(&bind_addr)?;
+    println!("\n▸ Server listening at http://{} (LAN accessible)", bind_addr);
     println!("  POST /chat        |  GET /stats      |  GET /persona  |  GET /graph");
     println!("  POST /learn       |  GET /autolearn  |  GET /checkpoint");
     println!("  POST /curiosity/start  |  POST /curiosity/stop  |  GET /curiosity");
