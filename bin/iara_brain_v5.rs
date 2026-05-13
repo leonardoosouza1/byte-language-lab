@@ -4383,6 +4383,74 @@ fn serve(brain: Brain) -> std::io::Result<()> {
         }
     });
 
+    // ── DISTILLATION DAEMON (auto, background) ──
+    // Run scripts/distill_qwen.py periodically em chunks pequenos pra crescer
+    // o brain de forma contínua sem intervenção. Default: 5 prompts a cada 600s.
+    // Env IARA_DISTILL=N:M ativa N prompts cada M segundos (M >= 60).
+    if let Ok(val) = std::env::var("IARA_DISTILL") {
+        let parts: Vec<&str> = val.split(':').collect();
+        let n_prompts = parts.get(0).and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
+        let interval_s = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(600).max(60);
+        let corpus = std::env::var("IARA_DISTILL_CORPUS")
+            .unwrap_or_else(|_| "data/lists/perguntas-5k.txt".into());
+        let dist_brain = brain_arc.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            println!("▸ Distillation daemon: {} prompts every {}s from {}",
+                     n_prompts, interval_s, corpus);
+            // Load prompts from corpus once
+            let prompts: Vec<String> = match std::fs::File::open(&corpus) {
+                Ok(f) => {
+                    let r = BufReader::new(f);
+                    r.lines().filter_map(|l| l.ok()).filter(|l| !l.trim().is_empty()).collect()
+                }
+                Err(_) => {
+                    eprintln!("⚠ Distillation daemon: corpus not found {}", corpus);
+                    return;
+                }
+            };
+            if prompts.is_empty() {
+                eprintln!("⚠ Distillation daemon: empty corpus");
+                return;
+            }
+            let mut cursor: usize = 0;
+            let mut cycle = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(interval_s));
+                cycle += 1;
+                let mut written = 0;
+                for _ in 0..n_prompts {
+                    let prompt = &prompts[cursor % prompts.len()];
+                    cursor += 1;
+                    // Skip if brain already knows confidently
+                    let g = dist_brain.lock().unwrap();
+                    let (_, conf) = g.respond_with_confidence(prompt.as_bytes());
+                    drop(g);
+                    if conf >= 0.85 { continue; }  // já sabe, skip
+                    // Call Qwen at temp 0.5
+                    if let Some(resp) = qwen_call(prompt, 80, None) {
+                        if resp.trim().len() > 20 {
+                            if let Ok(mut f) = wal::open_for_append(WAL_PATH) {
+                                let _ = wal::append(&mut f, &wal::Record {
+                                    rtype: wal::TYPE_CURIOSITY,
+                                    flags: wal::FLAG_FROM_QWEN | wal::FLAG_HIGH_QUALITY,
+                                    ts: wal::now_ts(), score: 0.9,
+                                    user: prompt.as_bytes().to_vec(),
+                                    model: resp.trim().as_bytes().to_vec(),
+                                });
+                                written += 1;
+                            }
+                        }
+                    }
+                }
+                if written > 0 {
+                    println!("📚 Distillation cycle #{}: +{} WAL records (cursor {}/{})",
+                             cycle, written, cursor % prompts.len(), prompts.len());
+                }
+            }
+        });
+    }
+
     // ── DOMAIN DETECTOR DAEMON (FASE 2 — passive only, no spawn) ──
     // Periodically scans dialog_hvs for clusters distant from existing experts.
     // Logs candidates to /domains endpoint. User approves manually.
