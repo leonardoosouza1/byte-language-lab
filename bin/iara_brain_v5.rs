@@ -1445,7 +1445,11 @@ impl Brain {
             ("História",    vec!["guerra", "império", "revolução", "imperador", "tiradentes", "vargas", "napoleão", "bizantino", "iluminismo", "lutero", "renascimento", "lincoln", "hitler", "século", "civilização", "antiguidade", "medieval", "moderna", "império romano", "idade média", "história", "histórico"]),
             ("Filosofia",   vec!["sócrates", "platão", "aristóteles", "kant", "nietzsche", "estoicismo", "existencialismo", "fenomenologia", "niilismo", "metafísica", "ética", "epistemologia", "hegel", "schopenhauer", "descartes", "spinoza", "kierkegaard", "filosofia", "filósofo"]),
             ("Artes",       vec!["vinci", "michelangelo", "picasso", "beethoven", "mozart", "shakespeare", "samba", "bossa", "machado", "drummond", "mona lisa", "guernica", "cinema", "pintura"]),
-            ("Geografia",   vec!["brasil", "amazônia", "capital", "rio", "monte", "deserto", "oceano", "país", "continente", "andes", "himalaia", "saara", "tóquio", "nilo"]),
+            ("Geografia",   vec!["brasil", "amazônia", "capital", "rio", "monte", "deserto", "oceano", "país", "continente", "andes", "himalaia", "saara", "tóquio", "nilo",
+                "estado", "estados", "região", "regiões", "norte", "sul", "leste", "oeste", "sudeste", "nordeste", "centro-oeste",
+                "cidade", "cidades", "fronteira", "território", "litoral", "península", "ilha", "arquipélago",
+                "paraná", "santa catarina", "rio grande", "minas gerais", "são paulo", "bahia", "pernambuco",
+                "europa", "ásia", "áfrica", "américa", "oceania", "antártida", "geografia"]),
             ("Matemática",  vec!["bhaskara", "derivada", "integral", "pitágoras", "logaritmo", "matriz", "função", "número", "fração", "probabilidade", "geometria", "trigonometria"]),
             ("Saúde",       vec!["diabetes", "câncer", "coração", "antibiótico", "metabolismo", "cérebro", "colesterol", "insulina", "hipertensão", "vacina", "tumor"]),
             ("Economia",    vec!["inflação", "pib", "bolsa", "capitalismo", "juros", "câmbio", "bitcoin", "macroeconomia", "selic", "ações", "moeda"]),
@@ -5470,6 +5474,95 @@ updThermo();
             }
             None => "{\"error\":\"no trees\"}".to_string()
         }
+    } else if method == "POST" && path == "/qwen_label_topic" {
+        // Qwen labela prompt → expert idx. Acts as teacher signal for curator training.
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
+        let topics_list = "1=Tecnologia, 2=Ciências (biologia/química/física), 3=História, 4=Filosofia, 5=Artes, 6=Geografia (estados/países/regiões/cidades), 7=Matemática, 8=Saúde (medicina/doenças), 9=Economia, 10=OOV-Cultura (gírias/internet)";
+        let labeler_prompt = format!(
+            "Classifique em UMA categoria. Apenas número. Categorias: {} | Pergunta: {} | Resposta:",
+            topics_list, prompt
+        );
+        let qwen_resp = qwen_call(&labeler_prompt, 8, None).unwrap_or_default();
+        // Parse: extract first digit 1-10 from Qwen response
+        let mut expert_id: i32 = -1;
+        let chars: Vec<char> = qwen_resp.chars().collect();
+        for i in 0..chars.len() {
+            if chars[i].is_ascii_digit() {
+                let mut num_str = String::new();
+                num_str.push(chars[i]);
+                if i + 1 < chars.len() && chars[i+1].is_ascii_digit() {
+                    num_str.push(chars[i+1]);
+                }
+                if let Ok(n) = num_str.parse::<i32>() {
+                    if (1..=10).contains(&n) {
+                        expert_id = n - 1;
+                        break;
+                    }
+                }
+            }
+        }
+        let g = brain.lock().unwrap();
+        let expert_name = if expert_id >= 0 {
+            g.experts.get(expert_id as usize).map(|e| e.name.clone()).unwrap_or_default()
+        } else { String::new() };
+        format!("{{\"prompt\":{},\"qwen_raw\":{},\"expert_idx\":{},\"expert_name\":{}}}",
+            json_escape(&prompt), json_escape(&qwen_resp.chars().take(60).collect::<String>()),
+            expert_id, json_escape(&expert_name))
+    } else if method == "POST" && path == "/train_curator_qwen" {
+        // Train curator usando Qwen-labeled samples (ground truth via LLM).
+        // Itera sobre N queries, label cada via Qwen, train.
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let n_samples = extract_json_num(&body_s, "n_samples").unwrap_or(50.0) as usize;
+        let epochs = extract_json_num(&body_s, "epochs").unwrap_or(5.0) as usize;
+        let lr = extract_json_num(&body_s, "lr").unwrap_or(0.02) as f32;
+
+        // Pull prompts from existing dialog_pairs
+        let prompts: Vec<String> = {
+            let g = brain.lock().unwrap();
+            g.dialog_pairs.iter().take(n_samples)
+                .map(|(u, _)| String::from_utf8_lossy(u).to_string())
+                .collect()
+        };
+
+        let topics_list = "1=Tecnologia, 2=Ciências (biologia/química/física), 3=História, 4=Filosofia, 5=Artes, 6=Geografia (estados/países/regiões/cidades), 7=Matemática, 8=Saúde (medicina/doenças), 9=Economia, 10=OOV-Cultura (gírias/internet)";
+        let mut labeled: Vec<([u64; 16], blab::curator::Outcome)> = Vec::new();
+        for p in &prompts {
+            let labeler_prompt = format!(
+                "Classifique em UMA categoria. Apenas número. {} | P: {} | R:",
+                topics_list, p
+            );
+            let qwen_resp = qwen_call(&labeler_prompt, 8, None).unwrap_or_default();
+            let mut expert_id: i32 = -1;
+            for c in qwen_resp.chars() {
+                if c.is_ascii_digit() {
+                    if let Some(d) = c.to_digit(10) {
+                        if (1..=10).contains(&d) {
+                            expert_id = d as i32 - 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if expert_id < 0 { continue; }
+            let hv = encode_prompt_hv(p.as_bytes());
+            labeled.push((hv, blab::curator::Outcome {
+                expert_used: expert_id as usize,
+                qwen_called: false,
+            }));
+        }
+
+        let n_labeled = labeled.len();
+        let final_loss = {
+            let mut g = brain.lock().unwrap();
+            let refs: Vec<(&[u64; 16], blab::curator::Outcome)> = labeled.iter()
+                .map(|(hv, oc)| (hv as &[u64; 16], oc.clone())).collect();
+            let loss = g.curator.train_batch(&refs, epochs, lr);
+            let _ = g.curator.save("data/curator.bin");
+            loss
+        };
+        format!("{{\"labeled\":{},\"requested\":{},\"epochs\":{},\"final_loss\":{:.3}}}",
+            n_labeled, n_samples, epochs, final_loss)
     } else if method == "POST" && path == "/train_curator" {
         // Train curator on existing dialogs
         let body_s = String::from_utf8_lossy(&body).to_string();
