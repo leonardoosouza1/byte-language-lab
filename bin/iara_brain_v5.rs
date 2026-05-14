@@ -2001,6 +2001,46 @@ impl Brain {
             }
         }
 
+        // ─── LIST FILTER: "estados da região sul" / "X da Y" / hardcoded knowledge ───
+        // Algumas listas são triviais — responde sem chamar Qwen.
+        let p_norm = p.replace('?', "").trim().to_string();
+        if p_norm.contains("estados") && p_norm.contains("sul") {
+            return Some("Os estados da região Sul do Brasil são: Paraná, Santa Catarina e Rio Grande do Sul.".to_string());
+        }
+        if p_norm.contains("estados") && p_norm.contains("sudeste") {
+            return Some("Os estados da região Sudeste do Brasil são: São Paulo, Rio de Janeiro, Minas Gerais e Espírito Santo.".to_string());
+        }
+        if p_norm.contains("estados") && (p_norm.contains("nordeste")) {
+            return Some("Os estados da região Nordeste do Brasil são: Bahia, Sergipe, Alagoas, Pernambuco, Paraíba, Rio Grande do Norte, Ceará, Piauí e Maranhão.".to_string());
+        }
+        if p_norm.contains("estados") && (p_norm.contains("norte")) && !p_norm.contains("nordeste") {
+            return Some("Os estados da região Norte do Brasil são: Acre, Amazonas, Roraima, Rondônia, Pará, Amapá e Tocantins.".to_string());
+        }
+        if p_norm.contains("estados") && (p_norm.contains("centro-oeste") || p_norm.contains("centro oeste")) {
+            return Some("Os estados da região Centro-Oeste do Brasil são: Mato Grosso, Mato Grosso do Sul, Goiás e o Distrito Federal.".to_string());
+        }
+        if p_norm.contains("regiões") && p_norm.contains("brasil") {
+            return Some("O Brasil é dividido em 5 regiões: Norte, Nordeste, Centro-Oeste, Sudeste e Sul.".to_string());
+        }
+        if p_norm.contains("quantos estados") && p_norm.contains("brasil") {
+            return Some("O Brasil possui 26 estados e 1 Distrito Federal, totalizando 27 unidades federativas.".to_string());
+        }
+        if p_norm.contains("planetas") && p_norm.contains("sistema solar") {
+            return Some("Os 8 planetas do Sistema Solar são: Mercúrio, Vênus, Terra, Marte, Júpiter, Saturno, Urano e Netuno.".to_string());
+        }
+        if p_norm.contains("continentes") {
+            return Some("Os 6 continentes são: África, América, Antártida, Ásia, Europa e Oceania.".to_string());
+        }
+        if p_norm.contains("oceanos") {
+            return Some("Os 5 oceanos são: Pacífico, Atlântico, Índico, Ártico e Antártico.".to_string());
+        }
+        if p_norm.contains("dias da semana") || p_norm.contains("dias semana") {
+            return Some("Os dias da semana são: domingo, segunda, terça, quarta, quinta, sexta e sábado.".to_string());
+        }
+        if p_norm.contains("meses do ano") || p_norm.contains("meses ano") {
+            return Some("Os 12 meses do ano são: janeiro, fevereiro, março, abril, maio, junho, julho, agosto, setembro, outubro, novembro e dezembro.".to_string());
+        }
+
         // ─── COMPOSE: "consequência/causa/resultado/efeito de X" ───
         for prefix in &["consequência de ", "consequencia de ", "qual a consequência de ",
                          "qual a consequencia de ", "qual o resultado de ",
@@ -3936,7 +3976,27 @@ fn handle_client(
             let rag = g.build_rag_context(prompt.as_bytes());
             drop(g);
 
-            if conf >= 0.65 && brain_resp.is_some() {
+            // Quality check: detecta resposta degenerada (loop, repetição) → escalate
+            let brain_resp_clean = brain_resp.as_ref().map(|b| {
+                let s = String::from_utf8_lossy(b).to_string();
+                dedup_repeats(&s)
+            });
+            let degenerate = brain_resp.as_ref().map(|b| {
+                let s = String::from_utf8_lossy(b);
+                let cleaned = brain_resp_clean.as_ref().map(|x| x.len()).unwrap_or(s.len());
+                // Se dedup reduziu mais de 40%, era loop
+                s.len() > 0 && cleaned * 100 / s.len().max(1) < 60
+            }).unwrap_or(false);
+
+            if degenerate {
+                // Brain response was looping/repeating → call Qwen direto
+                let qwen_resp = qwen_call(&prompt, max as usize,
+                    if rag.is_empty() { None } else { Some(&rag) });
+                match qwen_resp {
+                    Some(r) if r.trim().len() > 20 => (r.into_bytes(), "qwen-degen-escape"),
+                    _ => (brain_resp_clean.unwrap_or_default().into_bytes(), "brain-deduped"),
+                }
+            } else if conf >= 0.65 && brain_resp.is_some() {
                 // High confidence → brain instant (lowered 0.85→0.65 para cache real)
                 (brain_resp.unwrap(), "brain-hi")
             } else if conf >= 0.30 && brain_resp.is_some() {
@@ -3970,8 +4030,7 @@ fn handle_client(
             (g.generate(full_prompt.as_bytes(), max, temp, h), "markov")
         };
         let raw_s = String::from_utf8_lossy(&bytes).to_string();
-        // Post-process: strip leaked chat markers like "MODEL:", "USER:", "BACKEND:" etc
-        // that contaminate retrievals dos dialog_pairs antigos.
+        // Post-process: strip leaked chat markers + dedup repeated phrases
         let s = {
             let mut t = raw_s.clone();
             for marker in &["MODEL:", "USER:", "BACKEND:", "ASSISTENTE:", "CHATBOT:",
@@ -3979,6 +4038,9 @@ fn handle_client(
                             "<think>", "</think>", "[INST]", "[/INST]"] {
                 t = t.replace(marker, "");
             }
+            // Dedup tokens repetidos consecutivamente (palavra ou frase curta)
+            // Detecta loops como "X, Y, X, Y, X, Y..." e trunca
+            t = dedup_repeats(&t);
             t.trim().to_string()
         };
 
@@ -5462,6 +5524,66 @@ updThermo();
     );
     stream.write_all(resp.as_bytes())?;
     Ok(())
+}
+
+/// Detecta repetições em texto de resposta e trunca antes do loop.
+/// Casos: "X Y X Y X Y..." vira "X Y..."; "A B C A B C A B C" vira "A B C".
+fn dedup_repeats(text: &str) -> String {
+    // Split em frases/itens via vírgulas e pontos
+    let separators = [", ", "; ", ". ", " - ", "\n"];
+    // Tenta detectar window repetido
+    let bytes = text.as_bytes();
+    if bytes.len() < 30 { return text.to_string(); }
+
+    // Approach 1: detect token-level repetition (palavra)
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() > 6 {
+        // Procura padrão de 2-5 palavras se repetindo 3+ vezes
+        for pat_len in 2..=5 {
+            if words.len() < pat_len * 3 { break; }
+            for start in 0..(words.len() - pat_len * 3) {
+                let pat = &words[start..start + pat_len];
+                let mut matches = 1;
+                let mut pos = start + pat_len;
+                while pos + pat_len <= words.len() {
+                    if &words[pos..pos + pat_len] == pat {
+                        matches += 1;
+                        pos += pat_len;
+                    } else { break; }
+                }
+                if matches >= 3 {
+                    // Truncate ao primeiro padrão completo
+                    let truncated = words[..start + pat_len].join(" ");
+                    return truncated + "...";
+                }
+            }
+        }
+    }
+
+    // Approach 2: dedup sentenças via separadores
+    for sep in &separators {
+        if text.matches(sep).count() < 3 { continue; }
+        let parts: Vec<&str> = text.split(sep).collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        let mut dup_count = 0;
+        for p in &parts {
+            let p_norm = p.trim().to_lowercase();
+            if p_norm.is_empty() { continue; }
+            if seen.contains(&p_norm) {
+                dup_count += 1;
+                if dup_count > 2 { break; }
+                continue;
+            }
+            seen.insert(p_norm);
+            out.push(p.to_string());
+        }
+        if dup_count > 2 {
+            return out.join(sep);
+        }
+    }
+
+    text.to_string()
 }
 
 fn extract_json_str(body: &str, key: &str) -> Option<String> {
