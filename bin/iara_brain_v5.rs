@@ -4439,6 +4439,16 @@ document.getElementById('q').addEventListener('keydown',function(e){if(e.key==='
 </div>
 
 <div class="card">
+  <h2>🧪 Auto-Validation Suite</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">10 probes × keyword expectations. Wrong → Qwen → WAL. Brain self-heals.</p>
+  <label style="font-size:13px;color:#bfbdb6;display:block;margin-bottom:4px">
+    <input id="autofix" type="checkbox" checked style="vertical-align:middle"> Auto-fix wrongs via Qwen
+  </label>
+  <button class="btn ok" onclick="act('benchmark',this,'Rodando benchmark suite...')">🧪 Run benchmark</button>
+  <div id="benchOut" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
   <h2>🎯 Targeted Learn</h2>
   <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Ensina brain sobre tópico específico.</p>
   <input id="topic" type="text" placeholder="ex: fotossíntese, Sócrates, Rust..." style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
@@ -4548,6 +4558,24 @@ var ACTIONS = {
     if(!r.ok)throw new Error('HTTP '+r.status);
     var mb=(r.data.size_bytes/1024/1024).toFixed(1);
     return {ok:true, message:'✓ Saved '+mb+'MB ('+r.data.ms+'ms)', data:r.data};
+  },
+  benchmark: async function(){
+    var auto = document.getElementById('autofix').checked ? 1 : 0;
+    var r = await callJSON('/benchmark',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_fix:auto})});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var d = r.data;
+    var html = '<div style="background:#1a1f2b;padding:12px;border-radius:8px;border:1px solid #273347">';
+    var color = d.pct>=80?'#7fd962':d.pct>=50?'#ffb454':'#ff6b6b';
+    html += '<div style="font-size:20px;font-weight:700;color:'+color+'">'+d.hits+'/'+d.total+' · '+d.pct.toFixed(0)+'%</div>';
+    html += '<div style="font-size:11px;color:#5c6773;margin-bottom:8px">fixed via Qwen: '+d.fixed_via_qwen+'</div>';
+    d.details.forEach(function(x){
+      var mark = x.ok ? '✓' : '✗';
+      var c = x.ok ? '#7fd962' : '#ff6b6b';
+      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12px;border-bottom:1px solid #273347"><span style="color:'+c+'">'+mark+' '+x.q+'</span><span style="color:#5c6773;font-family:monospace">'+x.hits+'/'+x.need+' c='+x.conf.toFixed(2)+'</span></div>';
+    });
+    html += '</div>';
+    document.getElementById('benchOut').innerHTML = html;
+    return {ok:true, message:'✓ Score '+d.pct.toFixed(0)+'% fixed='+d.fixed_via_qwen, data:d};
   },
   targetedLearn: async function(){
     var t=document.getElementById('topic').value.trim();
