@@ -3934,7 +3934,18 @@ fn handle_client(
         } else {
             (g.generate(full_prompt.as_bytes(), max, temp, h), "markov")
         };
-        let s = String::from_utf8_lossy(&bytes).to_string();
+        let raw_s = String::from_utf8_lossy(&bytes).to_string();
+        // Post-process: strip leaked chat markers like "MODEL:", "USER:", "BACKEND:" etc
+        // that contaminate retrievals dos dialog_pairs antigos.
+        let s = {
+            let mut t = raw_s.clone();
+            for marker in &["MODEL:", "USER:", "BACKEND:", "ASSISTENTE:", "CHATBOT:",
+                            "MODEL: ", "USER: ", "<|im_start|>", "<|im_end|>",
+                            "<think>", "</think>", "[INST]", "[/INST]"] {
+                t = t.replace(marker, "");
+            }
+            t.trim().to_string()
+        };
 
         // AUTO-LEARN: se Qwen respondeu, append WAL binário (replaces auto_learn.txt)
         if source.starts_with("qwen-") && s.len() > 20 {
@@ -5011,6 +5022,68 @@ updThermo();
             .collect();
         format!("{{\"prompt\":{},\"n_bins\":{},\"top_bins\":[{}]}}",
             json_escape(&prompt), spec.mag.len(), top10.join(","))
+    } else if method == "POST" && path == "/benchmark" {
+        // Run probe battery + auto-validation. Each probe expects keywords.
+        // Wrong responses trigger Qwen call + WAL ingest (online learning).
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let auto_fix = extract_json_num(&body_s, "auto_fix").unwrap_or(1.0) as u32 > 0;
+
+        let probes: &[(&str, &[&str])] = &[
+            ("o que é Rust", &["linguagem", "programação", "sistema", "memória"]),
+            ("como criar função em Rust", &["fn ", "fn(", "return", "Rust"]),
+            ("como criar função em JavaScript", &["function", "=>", "arrow"]),
+            ("o que é Python", &["interpretada", "linguagem", "dinâmica"]),
+            ("o que é fotossíntese", &["plantas", "luz", "oxigênio", "clorofila"]),
+            ("quem foi Dom Pedro I", &["1822", "independência", "Brasil"]),
+            ("qual a capital do Brasil", &["Brasília"]),
+            ("quem foi Einstein", &["físico", "relatividade"]),
+            ("o que é estoicismo", &["filosofia", "razão", "virtude"]),
+            ("o que é Bitcoin", &["criptomoeda", "Satoshi", "blockchain"]),
+        ];
+
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        let mut details: Vec<String> = Vec::new();
+        let mut fixed = 0usize;
+
+        for (prompt, keywords) in probes {
+            total += 1;
+            // Ask brain
+            let g = brain.lock().unwrap();
+            let (resp_opt, conf) = g.respond_with_confidence(prompt.as_bytes());
+            drop(g);
+            let resp = resp_opt.map(|b| String::from_utf8_lossy(&b).to_string())
+                .unwrap_or_default();
+            let resp_lc = resp.to_lowercase();
+            let hit_kw: Vec<&&str> = keywords.iter()
+                .filter(|kw| resp_lc.contains(&kw.to_lowercase())).collect();
+            let ok = hit_kw.len() as f32 / keywords.len() as f32 >= 0.4;
+            if ok { hits += 1; }
+            details.push(format!("{{\"q\":{},\"ok\":{},\"hits\":{},\"need\":{},\"conf\":{:.2}}}",
+                json_escape(prompt), ok, hit_kw.len(), keywords.len(), conf));
+
+            // Auto-fix: if wrong, ask Qwen + ingest
+            if !ok && auto_fix {
+                if let Some(qresp) = qwen_call(prompt, 100, None) {
+                    if qresp.trim().len() > 20 {
+                        if let Ok(mut f) = wal::open_for_append(WAL_PATH) {
+                            let _ = wal::append(&mut f, &wal::Record {
+                                rtype: wal::TYPE_DIALOG,
+                                flags: wal::FLAG_FROM_QWEN | wal::FLAG_HIGH_QUALITY,
+                                ts: wal::now_ts(),
+                                score: 1.0,
+                                user: prompt.as_bytes().to_vec(),
+                                model: qresp.trim().as_bytes().to_vec(),
+                            });
+                            fixed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let pct = hits as f32 / total as f32 * 100.0;
+        format!("{{\"total\":{},\"hits\":{},\"pct\":{:.1},\"fixed_via_qwen\":{},\"details\":[{}]}}",
+            total, hits, pct, fixed, details.join(","))
     } else if method == "GET" && path == "/brain_status" {
         // Comprehensive state — neurons + trees + curator + thermo + lyapunov
         let g = brain.lock().unwrap();
