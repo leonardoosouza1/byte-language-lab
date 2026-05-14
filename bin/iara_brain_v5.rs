@@ -4281,6 +4281,7 @@ fn handle_client(
                  <a href=\"/neurons-ui\">🧬 Neurons</a>\
                  <a href=\"/physics-ui\">⚛️ Physics</a>\
                  <a href=\"/scales-ui\">📊 Scales</a>\
+                 <a href=\"/trace-ui\">🔬 Trace</a>\
                  <a href=\"/api-ui\">🔌 API</a>\
                </nav>\
              </div>\
@@ -4420,7 +4421,7 @@ fn handle_client(
     } else if method == "GET" && (path == "/chat-ui" || path == "/control-ui"
             || path == "/forest-ui" || path == "/domains-ui" || path == "/api-ui"
             || path == "/neurons-ui" || path == "/physics-ui"
-            || path == "/scales-ui") {
+            || path == "/scales-ui" || path == "/trace-ui") {
         let (title_emoji, page_id, content) = match path.as_str() {
             "/chat-ui" => ("💬", "chat", r#"
 <div class="card">
@@ -4798,6 +4799,197 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
   ctx.putImageData(img,0,0);
 });
 </script>"#),
+            "/trace-ui" => ("🔬", "trace", r#"
+<div id="toast" style="position:fixed;top:env(safe-area-inset-top,12px);left:14px;right:14px;z-index:1000;display:none;padding:12px;border-radius:10px;font-weight:600;font-size:14px;text-align:center"></div>
+
+<div class="card">
+  <h2>🔬 Query Pipeline Trace</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Vê cada estágio do brain processando query: tokenização → curator → árvore → KG → compose → HDC → resposta final.</p>
+  <input id="trQ" type="text" placeholder="ex: quais são os estados do sul" value="quais são os estados do sul do brasil" style="width:100%;padding:12px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;font-size:15px;margin-bottom:8px">
+  <button onclick="trace()" id="bTr" style="width:100%;padding:14px;background:#73d0ff;color:#0f1419;border:none;border-radius:10px;font-weight:700;font-size:15px">🔬 Trace</button>
+</div>
+
+<div id="stages" style="display:none">
+
+  <div class="card">
+    <h2>① Tokenização <span class="badge" id="tok-meta">…</span></h2>
+    <div id="tok"></div>
+  </div>
+
+  <div class="card">
+    <h2>② Multi-scale (bit/byte) <span class="badge" id="mv-meta">…</span></h2>
+    <div id="mv"></div>
+  </div>
+
+  <div class="card">
+    <h2>③ Curator routing (fast brain) <span class="badge" id="cur-meta">…</span></h2>
+    <div id="cur"></div>
+  </div>
+
+  <div class="card">
+    <h2>④ Gravity Forest (tree selection) <span class="badge" id="for-meta">…</span></h2>
+    <div id="for"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑤ KG triples matched <span class="badge" id="kg-meta">…</span></h2>
+    <div id="kg"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑥ Compose handler <span class="badge" id="comp-meta">…</span></h2>
+    <div id="comp"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑦ HDC retrieval (top-3) <span class="badge" id="hdc-meta">…</span></h2>
+    <div id="hdc"></div>
+  </div>
+
+  <div class="card" style="border:2px solid #7fd962">
+    <h2>⑧ FINAL response <span class="badge" id="fin-meta">…</span></h2>
+    <div id="fin"></div>
+  </div>
+
+  <div class="card">
+    <h2>🗺️ Pipeline diagram</h2>
+    <pre id="ascii" style="background:#1a1f2b;padding:12px;border-radius:8px;font-family:monospace;font-size:11px;color:#bfbdb6;white-space:pre-wrap;overflow-x:auto"></pre>
+  </div>
+
+</div>
+
+<style>
+.spin{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.tok-pill{display:inline-block;background:#273347;color:#73d0ff;padding:3px 8px;border-radius:6px;font-family:monospace;font-size:11px;margin:2px}
+.kg-row{background:#1a1f2b;padding:8px;border-radius:6px;margin:4px 0;font-size:12px;border-left:3px solid #ffb454}
+.kg-row .e{color:#73d0ff;font-weight:600}
+.kg-row .r{color:#5c6773;margin:0 6px}
+.kg-row .v{color:#bfbdb6}
+.hdc-row{background:#1a1f2b;padding:8px;border-radius:6px;margin:4px 0;font-size:12px;border-left:3px solid #73d0ff}
+.expert-bar{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px}
+.expert-bar .name{width:100px;color:#bfbdb6}
+.expert-bar .meter{flex:1;height:10px;background:#1a1f2b;border-radius:5px;overflow:hidden}
+.expert-bar .fill{height:100%;background:linear-gradient(90deg,#73d0ff,#7fd962);transition:width .3s}
+.fin-resp{background:#1a1f2b;padding:12px;border-radius:8px;color:#7fd962;font-size:14px;border-left:3px solid #7fd962;white-space:pre-wrap}
+#toast.show{display:block;animation:slideIn .2s ease}
+#toast.ok{background:#7fd962;color:#0f1419}
+#toast.err{background:#ff6b6b;color:#fff}
+@keyframes slideIn{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
+</style>
+
+<script>
+function toast(m,k){var t=document.getElementById('toast');t.textContent=m;t.className='show '+(k||'ok');clearTimeout(window._t);window._t=setTimeout(()=>t.style.display='none',2500)}
+async function trace(){
+  var q=document.getElementById('trQ').value.trim();if(!q)return;
+  var b=document.getElementById('bTr');b.disabled=true;var orig=b.innerHTML;b.innerHTML='<span class="spin"></span>Tracing...';
+  try {
+    var r=await fetch('/trace_query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q})});
+    var d=await r.json();
+    document.getElementById('stages').style.display='block';
+
+    // Stage 1 Tokenization
+    var t=d.stage1_tokenization;
+    document.getElementById('tok-meta').textContent=t.n_bytes+'B · '+t.n_words+'w';
+    document.getElementById('tok').innerHTML=t.words.map(w=>'<span class="tok-pill">'+w+'</span>').join(' ');
+
+    // Stage 2 Multi-view
+    var mv=d.stage2_multiview;
+    document.getElementById('mv-meta').textContent=mv.n_active_bytes+' unique';
+    document.getElementById('mv').innerHTML=
+      '<div class="expert-bar"><span class="name">bit entropy</span><div class="meter"><div class="fill" style="width:'+(mv.bit_entropy*100).toFixed(0)+'%"></div></div><span style="font-family:monospace;color:#73d0ff;width:60px;text-align:right">'+mv.bit_entropy.toFixed(2)+'</span></div>'+
+      '<div class="expert-bar"><span class="name">byte entropy</span><div class="meter"><div class="fill" style="width:'+(mv.byte_entropy/6*100).toFixed(0)+'%"></div></div><span style="font-family:monospace;color:#73d0ff;width:60px;text-align:right">'+mv.byte_entropy.toFixed(2)+'</span></div>';
+
+    // Stage 3 Curator
+    var c=d.stage3_curator;
+    document.getElementById('cur-meta').textContent=c.expert_name+' '+(c.confidence*100).toFixed(0)+'%';
+    document.getElementById('cur').innerHTML=
+      '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center">'+
+      '<div><div style="font-size:10px;color:#5c6773">EXPERT</div><div style="font-size:16px;color:#73d0ff;font-weight:600">'+c.expert_name+'</div></div>'+
+      '<div><div style="font-size:10px;color:#5c6773">CONFIDENCE</div><div style="font-size:16px;color:#7fd962;font-weight:600">'+(c.confidence*100).toFixed(0)+'%</div></div>'+
+      '<div><div style="font-size:10px;color:#5c6773">NEED QWEN</div><div style="font-size:16px;color:'+(c.need_qwen>0.5?'#ff6b6b':'#5c6773')+';font-weight:600">'+(c.need_qwen*100).toFixed(0)+'%</div></div>'+
+      '</div>';
+
+    // Stage 4 Forest
+    var f=d.stage4_forest;
+    if(f){
+      document.getElementById('for-meta').textContent=f.tree_name;
+      document.getElementById('for').innerHTML=
+        '<div style="font-family:monospace;color:#bfbdb6;font-size:13px">'+
+        '🌳 Tree: <b style="color:#7fd962">'+f.tree_name+'</b> (idx '+f.tree_idx+')<br>'+
+        '📍 Position: ('+f.pos.map(x=>x.toFixed(2)).join(', ')+')<br>'+
+        '⚡ Descent steps: '+f.descent_steps+
+        '</div>';
+    } else {
+      document.getElementById('for').textContent='(forest sem trees)';
+    }
+
+    // Stage 5 KG
+    document.getElementById('kg-meta').textContent=d.stage5_kg.length+' triples';
+    if(d.stage5_kg.length){
+      document.getElementById('kg').innerHTML=d.stage5_kg.map(t=>
+        '<div class="kg-row"><span class="e">'+t.entity+'</span><span class="r">→ '+t.relation+' →</span><span class="v">'+t.value+'</span></div>').join('');
+    } else {
+      document.getElementById('kg').innerHTML='<div style="color:#5c6773;padding:8px;text-align:center">(nenhum triple matching)</div>';
+    }
+
+    // Stage 6 Compose
+    var co=d.stage6_compose;
+    document.getElementById('comp-meta').textContent=co.hit?'HIT ✓':'miss';
+    document.getElementById('comp').innerHTML=co.hit
+      ? '<div style="background:#1f3a1f;padding:10px;border-radius:6px;color:#7fd962;font-size:13px">'+co.response+'</div>'
+      : '<div style="color:#5c6773;padding:8px">(nenhum pattern matched)</div>';
+
+    // Stage 7 HDC
+    document.getElementById('hdc-meta').textContent=d.stage7_hdc.length+' matches';
+    if(d.stage7_hdc.length){
+      document.getElementById('hdc').innerHTML=d.stage7_hdc.map((h,i)=>
+        '<div class="hdc-row">#'+(i+1)+' sim='+h.sim.toFixed(2)+'<br><span style="color:#bfbdb6">'+h.resp+'</span></div>').join('');
+    } else {
+      document.getElementById('hdc').innerHTML='<div style="color:#5c6773;padding:8px">(nenhum match HDC ≥ 0.4)</div>';
+    }
+
+    // Stage 8 Final
+    var fin=d.stage8_final;
+    document.getElementById('fin-meta').textContent='conf '+(fin.confidence*100).toFixed(0)+'%';
+    document.getElementById('fin').innerHTML='<div class="fin-resp">'+fin.response+'</div>';
+
+    // ASCII pipeline diagram
+    var pipeline=`
+PROMPT: "`+q+`"  (${t.n_bytes} bytes, ${t.n_words} words)
+   │
+   ▼
+[ TOKENIZE ]  ───→ words: ${t.words.length}
+   │
+   ▼
+[ MULTI-SCALE ]  bit=${mv.bit_entropy.toFixed(2)}, byte=${mv.byte_entropy.toFixed(2)}
+   │
+   ▼
+[ CURATOR ]  ───→ ${c.expert_name} (conf ${(c.confidence*100).toFixed(0)}%)
+   │
+   ▼
+[ GRAVITY FOREST ]  ───→ tree: ${f?f.tree_name:'(none)'}
+   │
+   ▼
+[ KG LOOKUP ]  ${d.stage5_kg.length} triples matched
+   │
+   ▼
+[ COMPOSE ]  ${co.hit?'✓ HIT (pattern-based response)':'✗ miss → try HDC'}
+   │
+   ▼
+[ HDC RETRIEVE ]  ${d.stage7_hdc.length} dialogs ≥ 0.4 sim
+   │
+   ▼
+[ FINAL ]  ═══► conf ${(fin.confidence*100).toFixed(0)}%
+   "${fin.response.substring(0, 120)}..."
+`;
+    document.getElementById('ascii').textContent=pipeline;
+    toast('✓ Pipeline traced','ok');
+  } catch(e){toast('✗ '+e.message,'err');}
+  b.disabled=false; b.innerHTML=orig;
+}
+setTimeout(trace, 200);
+</script>"#),
             "/scales-ui" => ("📊", "scales", r#"
 <div id="toast" style="position:fixed;top:env(safe-area-inset-top,12px);left:14px;right:14px;z-index:1000;display:none;padding:12px;border-radius:10px;font-weight:600;font-size:14px;text-align:center"></div>
 
@@ -5154,7 +5346,7 @@ updThermo();
              <div class=\"topbar\">\
                <h1>{} IARA · {}</h1>\
                <div class=\"ver\">v0.6.1</div>\
-               <nav class=\"navbar\">{}{}{}{}{}{}{}{}{}</nav>\
+               <nav class=\"navbar\">{}{}{}{}{}{}{}{}{}{}</nav>\
              </div>\
              {}\
              </body></html>",
@@ -5167,6 +5359,7 @@ updThermo();
             nav_link("/neurons-ui", "🧬 Neurons"),
             nav_link("/physics-ui", "⚛️ Physics"),
             nav_link("/scales-ui", "📊 Scales"),
+            nav_link("/trace-ui", "🔬 Trace"),
             nav_link("/api-ui", "🔌 API"),
             content,
         );
@@ -5248,6 +5441,91 @@ updThermo();
         let g = brain.lock().unwrap();
         format!("{{\"n_experts\":{},\"n_routes\":{},\"weights_size\":{}}}",
             g.curator.n_experts, g.curator.n_routes, g.curator.weights.len())
+    } else if method == "POST" && path == "/trace_query" {
+        // Full pipeline introspection — mostra cada estágio do processamento.
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
+        let mut g = brain.lock().unwrap();
+
+        // Stage 1: Tokenization
+        let words: Vec<String> = prompt.split_whitespace().map(String::from).collect();
+        let n_bytes = prompt.as_bytes().len();
+
+        // Stage 2: Multi-view signature
+        let mut mv = blab::multi_view::MultiView::new();
+        mv.ingest(prompt.as_bytes());
+        let mv_sig = mv.signature();
+
+        // Stage 3: Curator routing
+        let cur_out = g.curate(prompt.as_bytes());
+        let cur_expert_name = g.experts.get(cur_out.top_expert)
+            .map(|e| e.name.clone()).unwrap_or_default();
+
+        // Stage 4: Forest gravity routing
+        let gravity_info = g.route_via_gravity(prompt.as_bytes())
+            .map(|(idx, pos, steps)| {
+                let name = g.forest.trees.get(idx).map(|t| t.name.clone()).unwrap_or_default();
+                format!("{{\"tree_idx\":{},\"tree_name\":{},\"pos\":[{:.2},{:.2},{:.2}],\"descent_steps\":{}}}",
+                    idx, json_escape(&name), pos.x, pos.y, pos.z, steps)
+            }).unwrap_or_else(|| "null".to_string());
+
+        // Stage 5: KG triple lookup
+        let p_lc = prompt.to_lowercase();
+        let p_words_lc: Vec<&str> = p_lc.split_whitespace().collect();
+        let mut kg_hits: Vec<String> = Vec::new();
+        for ((e, r), v) in g.triples.iter().take(2000) {
+            let e_lc = e.to_lowercase();
+            if p_words_lc.iter().any(|w| w.len() >= 4 && e_lc.contains(w)) {
+                let v_short: String = v.chars().take(80).collect();
+                kg_hits.push(format!("{{\"entity\":{},\"relation\":{},\"value\":{}}}",
+                    json_escape(e), json_escape(r), json_escape(&v_short)));
+                if kg_hits.len() >= 5 { break; }
+            }
+        }
+
+        // Stage 6: Compose handler check
+        let compose_match = g.compose_answer(&p_lc);
+        let compose_hit = compose_match.is_some();
+        let compose_response = compose_match.unwrap_or_default();
+
+        // Stage 7: HDC retrieval top-3
+        let hdc_results = g.retrieve_dialog_hdc(prompt.as_bytes(), 3, 0.4);
+        let hdc_json: Vec<String> = hdc_results.iter().map(|(resp, sim)| {
+            let resp_short: String = String::from_utf8_lossy(resp).chars().take(100).collect();
+            format!("{{\"sim\":{:.3},\"resp\":{}}}", sim, json_escape(&resp_short))
+        }).collect();
+
+        // Stage 8: Final respond_with_confidence
+        let (final_resp, final_conf) = g.respond_with_confidence(prompt.as_bytes());
+        let final_resp_str = final_resp.map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default();
+        let final_short: String = final_resp_str.chars().take(300).collect();
+
+        drop(g);
+
+        format!("{{\
+            \"prompt\":{},\
+            \"stage1_tokenization\":{{\"n_bytes\":{},\"n_words\":{},\"words\":[{}]}},\
+            \"stage2_multiview\":{{\"bit_entropy\":{:.3},\"byte_entropy\":{:.3},\"n_active_bytes\":{}}},\
+            \"stage3_curator\":{{\"top_expert\":{},\"expert_name\":{},\"confidence\":{:.3},\"need_qwen\":{:.3}}},\
+            \"stage4_forest\":{},\
+            \"stage5_kg\":[{}],\
+            \"stage6_compose\":{{\"hit\":{},\"response\":{}}},\
+            \"stage7_hdc\":[{}],\
+            \"stage8_final\":{{\"confidence\":{:.3},\"response\":{}}}\
+            }}",
+            json_escape(&prompt),
+            n_bytes, words.len(),
+            words.iter().map(|w| json_escape(w)).collect::<Vec<_>>().join(","),
+            mv_sig.bit_entropy, mv_sig.byte_entropy, mv_sig.n_active_bytes,
+            cur_out.top_expert, json_escape(&cur_expert_name),
+            cur_out.confidence, cur_out.need_qwen,
+            gravity_info,
+            kg_hits.join(","),
+            compose_hit, json_escape(&compose_response.chars().take(200).collect::<String>()),
+            hdc_json.join(","),
+            final_conf, json_escape(&final_short)
+        )
     } else if method == "POST" && path == "/multiview" {
         // Decompose text into multi-resolution view (bit/nibble/byte/hex).
         let body_s = String::from_utf8_lossy(&body).to_string();
