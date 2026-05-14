@@ -4171,6 +4171,7 @@ fn handle_client(
                  <a href=\"/forest-ui\">🌳 Forest</a>\
                  <a href=\"/domains-ui\">🌱 Domains</a>\
                  <a href=\"/neurons-ui\">🧬 Neurons</a>\
+                 <a href=\"/physics-ui\">⚛️ Physics</a>\
                  <a href=\"/api-ui\">🔌 API</a>\
                </nav>\
              </div>\
@@ -4309,7 +4310,7 @@ fn handle_client(
                 total_uni, top_bytes.join(","), top_bi.join(","))
     } else if method == "GET" && (path == "/chat-ui" || path == "/control-ui"
             || path == "/forest-ui" || path == "/domains-ui" || path == "/api-ui"
-            || path == "/neurons-ui") {
+            || path == "/neurons-ui" || path == "/physics-ui") {
         let (title_emoji, page_id, content) = match path.as_str() {
             "/chat-ui" => ("💬", "chat", r#"
 <div class="card">
@@ -4659,6 +4660,187 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
   ctx.putImageData(img,0,0);
 });
 </script>"#),
+            "/physics-ui" => ("⚛️", "physics", r#"
+<div id="toast" style="position:fixed;top:env(safe-area-inset-top,12px);left:14px;right:14px;z-index:1000;display:none;padding:12px;border-radius:10px;font-weight:600;font-size:14px;text-align:center"></div>
+
+<div class="card">
+  <h2>🎯 Curator Router test</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Digite query → ver qual expert ativa + confidence</p>
+  <input id="curQ" type="text" placeholder="ex: explique fotossíntese" style="width:100%;padding:12px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px;font-size:15px">
+  <button onclick="routeCur()" id="bRoute" style="width:100%;padding:14px;background:#73d0ff;color:#0f1419;border:none;border-radius:10px;font-weight:700;font-size:15px">🚀 Route via Curator</button>
+  <div id="curOut" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+  <h2>📚 Train Curator</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Treina curator sobre dialog_pairs existentes via keyword labels</p>
+  <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+    <label style="font-size:13px;color:#bfbdb6">Epochs:</label>
+    <input id="epc" type="number" value="3" min="1" max="20" style="width:60px;padding:8px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px">
+    <label style="font-size:13px;color:#bfbdb6">LR:</label>
+    <input id="lr" type="number" value="0.02" step="0.005" min="0.001" max="0.1" style="width:80px;padding:8px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:6px">
+  </div>
+  <button onclick="trainCur()" id="bTrain" style="width:100%;padding:14px;background:#7fd962;color:#0f1419;border:none;border-radius:10px;font-weight:700;font-size:15px">🎓 Train</button>
+  <div id="trainOut" style="margin-top:10px;font-family:monospace;font-size:12px;color:#bfbdb6"></div>
+</div>
+
+<div class="card">
+  <h2>♨️ Thermodynamics — sliders interactive</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Ajuste sliders, veja T adaptativo + tau relaxation</p>
+  <div style="margin-bottom:10px">
+    <label style="font-size:13px;color:#bfbdb6;display:block;margin-bottom:4px">Confidence: <span id="cfLbl" style="color:#73d0ff;font-weight:600">0.50</span></label>
+    <input id="cf" type="range" min="0" max="100" value="50" oninput="updThermo()" style="width:100%;-webkit-appearance:none;height:6px;background:#1a1f2b;border-radius:4px;outline:none">
+  </div>
+  <div style="margin-bottom:10px">
+    <label style="font-size:13px;color:#bfbdb6;display:block;margin-bottom:4px">Difficulty: <span id="dfLbl" style="color:#73d0ff;font-weight:600">0.50</span></label>
+    <input id="df" type="range" min="0" max="100" value="50" oninput="updThermo()" style="width:100%;-webkit-appearance:none;height:6px;background:#1a1f2b;border-radius:4px;outline:none">
+  </div>
+  <div id="thermoOut" style="background:#1a1f2b;padding:14px;border-radius:8px;font-family:monospace;color:#73d0ff;font-size:14px;border:1px solid #273347">Move sliders pra ver resultado...</div>
+</div>
+
+<div class="card">
+  <h2>📐 Wave Spectrum visualization</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Cada prompt → 64-bin FFT signature</p>
+  <input id="spQ" type="text" placeholder="prompt para spectrum..." value="fotossintese" style="width:100%;padding:12px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
+  <button onclick="spectrum()" id="bSpec" style="width:100%;padding:14px;background:#ffb454;color:#0f1419;border:none;border-radius:10px;font-weight:700;font-size:15px">📊 Compute Spectrum</button>
+  <canvas id="specCanvas" width="600" height="200" style="width:100%;height:200px;background:#1a1f2b;border-radius:8px;margin-top:10px"></canvas>
+</div>
+
+<div class="card">
+  <h2>🌀 Lyapunov Chaos Test</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Compare 2 prompts similares → measure response divergence</p>
+  <input id="lQa" type="text" placeholder="prompt A" value="o que é fotossíntese" style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:6px">
+  <input id="lQb" type="text" placeholder="prompt B (similar)" value="o que e fotossintese" style="width:100%;padding:10px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;margin-bottom:8px">
+  <button onclick="lyap()" id="bLyap" style="width:100%;padding:14px;background:#ff6b6b;color:#fff;border:none;border-radius:10px;font-weight:700;font-size:15px">🌀 Measure λ</button>
+  <div id="lyapOut" style="margin-top:10px;font-family:monospace;font-size:13px;color:#bfbdb6"></div>
+</div>
+
+<style>
+.spin{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+input[type=range]{appearance:none}
+input[type=range]::-webkit-slider-thumb{appearance:none;width:24px;height:24px;background:#73d0ff;border-radius:50%;cursor:pointer;border:none}
+input[type=range]::-moz-range-thumb{width:24px;height:24px;background:#73d0ff;border-radius:50%;cursor:pointer;border:none}
+#toast.show{display:block;animation:slideIn .2s ease;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+#toast.ok{background:#7fd962;color:#0f1419}
+#toast.err{background:#ff6b6b;color:#fff}
+#toast.info{background:#73d0ff;color:#0f1419}
+@keyframes slideIn{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.expert-bar{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px}
+.expert-bar .name{width:90px;color:#bfbdb6}
+.expert-bar .meter{flex:1;height:14px;background:#1a1f2b;border-radius:7px;overflow:hidden}
+.expert-bar .fill{height:100%;background:linear-gradient(90deg,#73d0ff,#7fd962);transition:width .3s}
+.expert-bar .val{width:48px;text-align:right;color:#73d0ff;font-family:monospace;font-size:11px}
+</style>
+
+<script>
+function toast(msg,k){var t=document.getElementById('toast');t.textContent=msg;t.className='show '+(k||'info');clearTimeout(window._tt);window._tt=setTimeout(function(){t.style.display='none'},3000)}
+function setBtn(id,loading,labelOrig){var b=document.getElementById(id);if(loading){if(!b.dataset.o)b.dataset.o=b.innerHTML;b.disabled=true;b.innerHTML='<span class="spin"></span>'+(labelOrig||'...')}else{b.disabled=false;b.innerHTML=b.dataset.o||b.innerHTML;delete b.dataset.o}}
+
+async function routeCur(){
+  var q=document.getElementById('curQ').value.trim();if(!q)return;
+  setBtn('bRoute',true,'Routing...');
+  try {
+    var r=await fetch('/curator',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q})});
+    var d=await r.json();
+    var html='<div style="background:#1a1f2b;padding:12px;border-radius:8px;border:1px solid #273347">';
+    html+='<div style="font-size:14px;color:#73d0ff;margin-bottom:6px"><b>'+d.expert_name+'</b> · conf '+(d.confidence*100).toFixed(0)+'%</div>';
+    html+='<div style="font-size:11px;color:#5c6773;margin-bottom:8px">need_qwen: '+(d.need_qwen*100).toFixed(0)+'%</div>';
+    if(d.expert_probs){
+      var names=['Tecnologia','Ciências','História','Filosofia','Artes','Geografia','Matemática','Saúde','Economia','OOV-Cultura'];
+      d.expert_probs.forEach(function(p,i){
+        var pct=(p*100).toFixed(1);
+        var bar='<div class="expert-bar"><span class="name">'+(names[i]||('e'+i))+'</span><div class="meter"><div class="fill" style="width:'+pct+'%"></div></div><span class="val">'+pct+'%</span></div>';
+        html+=bar;
+      });
+    }
+    html+='</div>';
+    document.getElementById('curOut').innerHTML=html;
+    toast('Routed → '+d.expert_name,'ok');
+  } catch(e){toast('✗ '+e.message,'err');}
+  setBtn('bRoute',false);
+}
+
+async function trainCur(){
+  var e=parseInt(document.getElementById('epc').value)||3;
+  var lr=parseFloat(document.getElementById('lr').value)||0.02;
+  setBtn('bTrain',true,'Training...');
+  toast('Training '+e+' epochs lr='+lr,'info');
+  try {
+    var r=await fetch('/train_curator',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epochs:e,lr:lr})});
+    var d=await r.json();
+    document.getElementById('trainOut').textContent='Trained '+d.samples+' samples · loss='+d.final_loss.toFixed(3)+' · '+d.ms+'ms · saved='+d.saved;
+    toast('✓ Trained loss='+d.final_loss.toFixed(2),'ok');
+  } catch(e){toast('✗ '+e.message,'err');}
+  setBtn('bTrain',false);
+}
+
+function updThermo(){
+  var cf=parseInt(document.getElementById('cf').value)/100;
+  var df=parseInt(document.getElementById('df').value)/100;
+  document.getElementById('cfLbl').textContent=cf.toFixed(2);
+  document.getElementById('dfLbl').textContent=df.toFixed(2);
+  fetch('/thermo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confidence:cf,difficulty:df})})
+    .then(r=>r.json()).then(d=>{
+      var html='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;text-align:center">';
+      html+='<div><div style="font-size:10px;color:#5c6773">T_adaptive</div><div style="font-size:22px;font-weight:600;color:#73d0ff">'+d.adaptive_T.toFixed(2)+'</div></div>';
+      html+='<div><div style="font-size:10px;color:#5c6773">τ (ms)</div><div style="font-size:22px;font-weight:600;color:#7fd962">'+d.tau_ms.toFixed(0)+'</div></div>';
+      html+='<div><div style="font-size:10px;color:#5c6773">Surprise</div><div style="font-size:22px;font-weight:600;color:#ffb454">'+d.surprise.toFixed(2)+'</div></div>';
+      html+='</div>';
+      document.getElementById('thermoOut').innerHTML=html;
+    });
+}
+
+async function spectrum(){
+  var q=document.getElementById('spQ').value.trim();if(!q)return;
+  setBtn('bSpec',true,'Computing...');
+  try {
+    var r=await fetch('/spectrum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q})});
+    var d=await r.json();
+    // Draw canvas bars
+    var canvas=document.getElementById('specCanvas');var ctx=canvas.getContext('2d');
+    ctx.fillStyle='#1a1f2b';ctx.fillRect(0,0,canvas.width,canvas.height);
+    var bins=d.top_bins;
+    if(bins.length){
+      var maxMag=Math.max.apply(null,bins.map(b=>b.mag));
+      var w=canvas.width/bins.length;
+      bins.forEach(function(b,i){
+        var h=(b.mag/maxMag)*(canvas.height-20);
+        var grad=ctx.createLinearGradient(0,canvas.height,0,canvas.height-h);
+        grad.addColorStop(0,'#73d0ff');grad.addColorStop(1,'#7fd962');
+        ctx.fillStyle=grad;
+        ctx.fillRect(i*w+1,canvas.height-h,w-2,h);
+      });
+    }
+    toast('✓ Spectrum: '+d.n_bins+' bins','ok');
+  } catch(e){toast('✗ '+e.message,'err');}
+  setBtn('bSpec',false);
+}
+
+async function lyap(){
+  var a=document.getElementById('lQa').value.trim();
+  var b=document.getElementById('lQb').value.trim();
+  if(!a||!b)return;
+  setBtn('bLyap',true,'Measuring...');
+  try {
+    var ra=await (await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:a,max:80})})).json();
+    var rb=await (await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:b,max:80})})).json();
+    // Approximate lev distance JS-side
+    function lev(s,t){var n=s.length,m=t.length;if(!n)return m;if(!m)return n;var p=[];for(var i=0;i<=m;i++)p[i]=i;for(var i=1;i<=n;i++){var c=[i];for(var j=1;j<=m;j++){c.push(Math.min(c[j-1]+1,p[j]+1,p[j-1]+(s[i-1]===t[j-1]?0:1)))}p=c}return p[m]}
+    var dIn=Math.max(lev(a,b),1);
+    var dOut=Math.max(lev(ra.response.substring(0,200),rb.response.substring(0,200)),1);
+    var lam=Math.log(dOut/dIn)/(Math.max(ra.response.length,rb.response.length)/50);
+    var cls=lam<-0.3?'stable':lam>0.3?'chaotic':'edge-of-chaos';
+    var color=lam<-0.3?'#7fd962':lam>0.3?'#ff6b6b':'#ffb454';
+    document.getElementById('lyapOut').innerHTML='<div style="background:#1a1f2b;padding:12px;border-radius:8px;border-left:3px solid '+color+'"><div>δ_in='+dIn+', δ_out='+dOut+'</div><div style="font-size:18px;color:'+color+';margin-top:4px">λ = '+lam.toFixed(3)+' · '+cls+'</div><div style="font-size:11px;color:#5c6773;margin-top:8px">A: ['+ra.source+'] '+ra.response.substring(0,80)+'...</div><div style="font-size:11px;color:#5c6773">B: ['+rb.source+'] '+rb.response.substring(0,80)+'...</div></div>';
+    toast('λ = '+lam.toFixed(2)+' '+cls,'info');
+  } catch(e){toast('✗ '+e.message,'err');}
+  setBtn('bLyap',false);
+}
+
+// Init thermo display
+updThermo();
+</script>"#),
             "/api-ui" => ("🔌", "api", r#"
 <div class="card">
   <h2>🔌 Endpoints disponíveis</h2>
@@ -4724,7 +4906,7 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
              <div class=\"topbar\">\
                <h1>{} IARA · {}</h1>\
                <div class=\"ver\">v0.6.1</div>\
-               <nav class=\"navbar\">{}{}{}{}{}{}{}</nav>\
+               <nav class=\"navbar\">{}{}{}{}{}{}{}{}</nav>\
              </div>\
              {}\
              </body></html>",
@@ -4735,6 +4917,7 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
             nav_link("/forest-ui", "🌳 Forest"),
             nav_link("/domains-ui", "🌱 Domains"),
             nav_link("/neurons-ui", "🧬 Neurons"),
+            nav_link("/physics-ui", "⚛️ Physics"),
             nav_link("/api-ui", "🔌 API"),
             content,
         );
