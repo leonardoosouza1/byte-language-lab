@@ -104,7 +104,9 @@ impl Curator {
             logits[o] += self.bias[o];
         }
 
-        let expert_logits: Vec<f32> = logits[..self.n_experts].to_vec();
+        // Scale logits pra evitar one-hot collapse (temperature softmax)
+        let scale = 1.0 / (HV_BITS as f32).sqrt();
+        let expert_logits: Vec<f32> = logits[..self.n_experts].iter().map(|x| x * scale).collect();
         let expert_probs = softmax(&expert_logits);
         let top_expert = argmax(&expert_logits);
 

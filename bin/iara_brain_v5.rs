@@ -1440,10 +1440,10 @@ impl Brain {
     /// Called after rebuild_dialog_hvs in load().
     fn build_static_experts(&mut self) {
         let domains: &[(&str, Vec<&'static str>)] = &[
-            ("Tecnologia",  vec!["python", "rust", "javascript", "código", "programação", "algoritmo", "git", "docker", "kubernetes", "blockchain", "machine learning", "ia", "linux", "api", "rest"]),
-            ("Ciências",    vec!["fotossíntese", "dna", "evolução", "química", "biologia", "física", "átomo", "molécula", "célula", "neurônio", "vacina", "imunológico", "krebs", "gravidade", "luz"]),
-            ("História",    vec!["guerra", "império", "revolução", "imperador", "tiradentes", "vargas", "napoleão", "bizantino", "roma", "iluminismo", "lutero", "renascimento", "lincoln", "hitler"]),
-            ("Filosofia",   vec!["sócrates", "platão", "aristóteles", "kant", "nietzsche", "estoicismo", "existencialismo", "fenomenologia", "marx", "niilismo", "metafísica", "ética"]),
+            ("Tecnologia",  vec!["python", "rust", "javascript", "código", "programação", "algoritmo", "docker", "kubernetes", "blockchain", "machine learning", "linux", "compilador", "framework", "frontend", "backend", "função", "lifetime", "função em", "função js", "função rust"]),
+            ("Ciências",    vec!["fotossínte", "fotossinte", "dna", "evolução", "química", "biologia", "física", "átomo", "molécula", "célula", "neurônio", "vacina", "imunológico", "krebs", "gravidade", "clorofila", "espécie", "ecossistema", "organismo", "genética", "termodinâmica", "ciência", "experimento"]),
+            ("História",    vec!["guerra", "império", "revolução", "imperador", "tiradentes", "vargas", "napoleão", "bizantino", "iluminismo", "lutero", "renascimento", "lincoln", "hitler", "século", "civilização", "antiguidade", "medieval", "moderna", "império romano", "idade média", "história", "histórico"]),
+            ("Filosofia",   vec!["sócrates", "platão", "aristóteles", "kant", "nietzsche", "estoicismo", "existencialismo", "fenomenologia", "niilismo", "metafísica", "ética", "epistemologia", "hegel", "schopenhauer", "descartes", "spinoza", "kierkegaard", "filosofia", "filósofo"]),
             ("Artes",       vec!["vinci", "michelangelo", "picasso", "beethoven", "mozart", "shakespeare", "samba", "bossa", "machado", "drummond", "mona lisa", "guernica", "cinema", "pintura"]),
             ("Geografia",   vec!["brasil", "amazônia", "capital", "rio", "monte", "deserto", "oceano", "país", "continente", "andes", "himalaia", "saara", "tóquio", "nilo"]),
             ("Matemática",  vec!["bhaskara", "derivada", "integral", "pitágoras", "logaritmo", "matriz", "função", "número", "fração", "probabilidade", "geometria", "trigonometria"]),
@@ -1585,15 +1585,33 @@ impl Brain {
                 }
             }
             if best_score == 0 { continue; }  // skip unmatchable
-            // HV from dialog_hvs (already computed)
             if idx >= self.dialog_hvs.len() { continue; }
             let hv = self.dialog_hvs[idx];
             samples.push((hv, blab::curator::Outcome {
                 expert_used: best_expert,
-                qwen_called: false,  // assume cached implies brain knew
+                qwen_called: false,
             }));
-            if samples.len() >= 5000 { break; }  // cap pra training rápido
+            if samples.len() >= 10000 { break; }
         }
+        // Class balance — limit majority classes to median size pra evitar bias
+        let mut per_expert: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, (_, oc)) in samples.iter().enumerate() {
+            per_expert.entry(oc.expert_used).or_insert_with(Vec::new).push(i);
+        }
+        let sizes: Vec<usize> = per_expert.values().map(|v| v.len()).collect();
+        let mut sorted_sizes = sizes.clone();
+        sorted_sizes.sort();
+        // Cap at 2× median pra reduzir bias
+        let median = sorted_sizes.get(sorted_sizes.len()/2).copied().unwrap_or(50);
+        let cap = (median * 2).max(50);
+        let mut balanced_idx: Vec<usize> = Vec::new();
+        for (_, indices) in per_expert.iter() {
+            let take = indices.len().min(cap);
+            balanced_idx.extend_from_slice(&indices[..take]);
+        }
+        let balanced: Vec<([u64; 16], blab::curator::Outcome)> = balanced_idx.iter()
+            .map(|&i| samples[i].clone()).collect();
+        let samples = balanced;
         // Convert para refs
         let sample_refs: Vec<(&[u64; 16], blab::curator::Outcome)> = samples.iter()
             .map(|(hv, oc)| (hv as &[u64; 16], oc.clone())).collect();
