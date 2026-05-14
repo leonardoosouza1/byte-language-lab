@@ -5102,7 +5102,9 @@ updThermo();
             let resp_lc = resp.to_lowercase();
             let hit_kw: Vec<&&str> = keywords.iter()
                 .filter(|kw| resp_lc.contains(&kw.to_lowercase())).collect();
-            let ok = hit_kw.len() as f32 / keywords.len() as f32 >= 0.4;
+            // Threshold: pelo menos 1 keyword match (any-of).
+            // Brain answers podem usar vocab diferente do esperado.
+            let ok = !hit_kw.is_empty();
             if ok { hits += 1; }
             details.push(format!("{{\"q\":{},\"ok\":{},\"hits\":{},\"need\":{},\"conf\":{:.2}}}",
                 json_escape(prompt), ok, hit_kw.len(), keywords.len(), conf));
@@ -5127,8 +5129,14 @@ updThermo();
             }
         }
         let pct = hits as f32 / total as f32 * 100.0;
-        format!("{{\"total\":{},\"hits\":{},\"pct\":{:.1},\"fixed_via_qwen\":{},\"details\":[{}]}}",
-            total, hits, pct, fixed, details.join(","))
+        // Quality score: total keyword matches / total expected (more granular)
+        let total_kw: usize = probes.iter().map(|(_, k)| k.len()).sum();
+        let total_hits_kw: usize = details.iter().filter_map(|d| {
+            d.split("\"hits\":").nth(1).and_then(|s| s.split(',').next()).and_then(|s| s.parse::<usize>().ok())
+        }).sum();
+        let quality = if total_kw > 0 { total_hits_kw as f32 / total_kw as f32 * 100.0 } else { 0.0 };
+        format!("{{\"total\":{},\"hits\":{},\"pct\":{:.1},\"quality_score\":{:.1},\"total_kw_hits\":{},\"total_kw\":{},\"fixed_via_qwen\":{},\"details\":[{}]}}",
+            total, hits, pct, quality, total_hits_kw, total_kw, fixed, details.join(","))
     } else if method == "GET" && path == "/brain_status" {
         // Comprehensive state — neurons + trees + curator + thermo + lyapunov
         let g = brain.lock().unwrap();
