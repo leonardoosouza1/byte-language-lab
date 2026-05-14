@@ -27,6 +27,7 @@ pub mod wal;
 pub mod gravity_forest;
 pub mod curator;
 pub mod wave_encoding;
+pub mod thermo;
 
 #[cfg(feature = "gpu-aql")]
 pub mod gpu_aql;
