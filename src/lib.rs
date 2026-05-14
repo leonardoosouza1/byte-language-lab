@@ -29,6 +29,7 @@ pub mod curator;
 pub mod wave_encoding;
 pub mod thermo;
 pub mod lyapunov;
+pub mod physics_pack;
 
 #[cfg(feature = "gpu-aql")]
 pub mod gpu_aql;
