@@ -25,6 +25,7 @@ pub mod fsm_byte;
 pub mod gpu;
 pub mod wal;
 pub mod gravity_forest;
+pub mod curator;
 
 #[cfg(feature = "gpu-aql")]
 pub mod gpu_aql;

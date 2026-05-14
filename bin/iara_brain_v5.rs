@@ -763,6 +763,10 @@ struct Brain {
     // 3D potential field + tree forest pra particle-based routing.
     // Cada expert vira uma tree no terreno. Query → particle → gravity descent.
     forest: blab::gravity_forest::Forest,
+    // ─── CURATOR (dual-brain fast router) ───
+    // Linear classifier 1024→12 (10 experts + conf + need_qwen).
+    // Inicializado dos expert centroids, aprende online via routing outcomes.
+    curator: blab::curator::Curator,
 
     // Knowledge graph: entity → relation → value (string-keyed for now)
     // Ex: ("Brasil", "capital") → "Brasília"
@@ -901,6 +905,7 @@ impl Brain {
             dialog_hvs: Vec::new(),
             experts: Vec::new(),
             forest: blab::gravity_forest::Forest::new(),
+            curator: blab::curator::Curator::new(10),
             triples: HashMap::new(),
             reverse_triples: HashMap::new(),
             phrase_count: HashMap::new(),
@@ -1529,6 +1534,25 @@ impl Brain {
         // Build mycelium from tree proximity
         self.forest.auto_build_mycelium(0.35);
         println!("  Mycelium edges: {} (threshold 0.35)", self.forest.mycelium.len());
+
+        // ── Init Curator (dual-brain fast router) ──
+        let centroids: Vec<[u64; 16]> = self.experts.iter().map(|e| e.centroid_hv).collect();
+        self.curator = blab::curator::Curator::new(self.experts.len());
+        self.curator.init_from_centroids(&centroids);
+        println!("  Curator initialized: {}-experts router (weights from centroids)",
+            self.experts.len());
+    }
+
+    /// Route via curator (fast path). Returns (expert_idx, confidence, need_qwen).
+    fn curate(&mut self, prompt: &[u8]) -> blab::curator::CuratorOutput {
+        let hv = encode_prompt_hv(prompt);
+        self.curator.route(&hv)
+    }
+
+    /// Update curator with outcome of a query (online learning).
+    fn curator_observe(&mut self, prompt: &[u8], expert_used: usize, qwen_called: bool) {
+        let hv = encode_prompt_hv(prompt);
+        self.curator.observe(&hv, &blab::curator::Outcome { expert_used, qwen_called }, 0.005);
     }
 
     /// Route query via forest: project HV → nearest tree by Euclidean distance.
@@ -3790,10 +3814,21 @@ fn handle_client(
         let p_trim = prompt.trim();
         let p_lc = p_trim.to_lowercase();
         let question_prefixes = ["qual", "o que", "quem", "como", "quanto", "onde", "por que", "porque",
-                                  "quando", "quais", "diferença", "explique", "explica", "me diga", "me fala"];
+                                  "quando", "quais", "diferença", "explique", "explica", "me diga", "me fala",
+                                  "me conte", "conte", "fale", "fala", "diga", "descreva", "defina",
+                                  "compare", "relacione", "resuma", "analise", "comente", "avalie",
+                                  "liste", "cite", "discorra", "elabore", "apresente", "mostre",
+                                  "consegue", "você consegue", "vc consegue", "pode me", "poderia",
+                                  "imagine", "invente", "crie", "escreva", "faça", "gere", "produz",
+                                  "ensine", "ajuda", "ajude", "explica aí", "explain", "tell me"];
         let is_question = question_prefixes.iter().any(|p| p_lc.starts_with(p))
             || p_trim.ends_with('?');
-        let starts_narrative = p_trim.starts_with(|c: char| c.is_uppercase()) && !is_question;
+        // Narrative mode SÓ se path == /gen ou prompt > 40 chars começando uppercase sem question prefix.
+        // /chat sempre força non-narrative (user quer resposta, não story completion).
+        let starts_narrative = path == "/gen"
+            && p_trim.starts_with(|c: char| c.is_uppercase())
+            && !is_question
+            && p_trim.len() > 40;
         let full_prompt = if starts_narrative {
             prompt.clone()
         } else if path == "/gen" {
@@ -3866,6 +3901,26 @@ fn handle_client(
                     model: s.trim().as_bytes().to_vec(),
                 });
             }
+        }
+
+        // CURATOR ONLINE LEARN: observa outcome (which expert "won", qwen_called)
+        // Tries to guess best expert from prompt keywords
+        {
+            let qwen_called = source.starts_with("qwen-");
+            // Find best matching expert via keyword overlap (cheap heuristic)
+            let mut g_obs = brain.lock().unwrap();
+            let p_lc = prompt.to_lowercase();
+            let mut best_expert: usize = 0;
+            let mut best_score: usize = 0;
+            for (i, e) in g_obs.experts.iter().enumerate() {
+                let score: usize = e.keywords.iter()
+                    .filter(|kw| p_lc.contains(*kw)).count();
+                if score > best_score {
+                    best_score = score;
+                    best_expert = i;
+                }
+            }
+            g_obs.curator_observe(prompt.as_bytes(), best_expert, qwen_called);
         }
 
         format!("{{\"response\":{},\"prompt\":{},\"source\":{}}}",
@@ -4677,6 +4732,22 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
             }
             None => "{\"error\":\"no trees\"}".to_string()
         }
+    } else if method == "POST" && path == "/curator" {
+        // Test curator routing for a prompt
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
+        let mut g = brain.lock().unwrap();
+        let out = g.curate(prompt.as_bytes());
+        let n_routes = g.curator.n_routes;
+        let expert_name = g.experts.get(out.top_expert).map(|e| e.name.clone()).unwrap_or_default();
+        drop(g);
+        format!("{{\"top_expert\":{},\"expert_name\":{},\"confidence\":{:.3},\"need_qwen\":{:.3},\"n_routes\":{},\"expert_probs\":[{}]}}",
+            out.top_expert, json_escape(&expert_name), out.confidence, out.need_qwen, n_routes,
+            out.expert_probs.iter().map(|p| format!("{:.4}", p)).collect::<Vec<_>>().join(","))
+    } else if method == "GET" && path == "/curator" {
+        let g = brain.lock().unwrap();
+        format!("{{\"n_experts\":{},\"n_routes\":{},\"weights_size\":{}}}",
+            g.curator.n_experts, g.curator.n_routes, g.curator.weights.len())
     } else if method == "GET" && path == "/moe" {
         let g = brain.lock().unwrap();
         let entries: Vec<String> = g.experts.iter().map(|e| {
