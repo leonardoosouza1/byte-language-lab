@@ -4455,7 +4455,6 @@ function setBtn(loading){
 async function ask(){
   var q=document.getElementById('q');var t=q.value.trim();if(!t)return;
   var m=document.getElementById('msgs');
-  // Remove placeholder if first
   if(m.children.length===1 && m.children[0].textContent.indexOf('Faça uma')===0) m.innerHTML='';
   var u=document.createElement('div');u.style.cssText='background:#273347;padding:8px 12px;border-radius:10px;margin:6px 0;color:#73d0ff';u.textContent='› '+t;m.appendChild(u);
   var loader=document.createElement('div');loader.style.cssText='color:#5c6773;font-size:12px;padding:4px 12px;display:flex;align-items:center;gap:6px';loader.innerHTML='<span class="spin"></span>pensando...';m.appendChild(loader);
@@ -4463,9 +4462,14 @@ async function ask(){
   setBtn(true); setStatus('thinking', 'thinking');
   var t0=Date.now();
   try {
-    var resp=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify({prompt:t,max:160,temp:0.5})});
+    // Parallel: chat + trace
+    var [resp, trResp] = await Promise.all([
+      fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify({prompt:t,max:160,temp:0.5})}),
+      fetch('/trace_query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t})}).catch(()=>null)
+    ]);
     if(!resp.ok) throw new Error('HTTP '+resp.status);
     var d=await resp.json();
+    var tr=trResp ? await trResp.json() : null;
     var dt=Date.now()-t0;
     loader.remove();
     var r=document.createElement('div');
@@ -4475,7 +4479,27 @@ async function ask(){
     var meta=document.createElement('div');meta.style.cssText='display:flex;justify-content:space-between;font-size:10px;color:#5c6773;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px';
     meta.innerHTML='<span style="color:'+color+'">'+d.source+'</span><span>'+dt+'ms</span>';
     var ans=document.createElement('div');ans.style.cssText='color:#bfbdb6;white-space:pre-wrap';ans.textContent=d.response;
-    r.appendChild(meta);r.appendChild(ans);m.appendChild(r);m.scrollTop=m.scrollHeight;
+    r.appendChild(meta);r.appendChild(ans);
+    // Micro-trace collapsible
+    if(tr){
+      var det=document.createElement('details');det.style.marginTop='8px';
+      var sum=document.createElement('summary');sum.style.cssText='cursor:pointer;color:#73d0ff;font-size:11px';sum.textContent='🔬 ver internals (pipeline)';det.appendChild(sum);
+      var inner=document.createElement('div');inner.style.cssText='margin-top:8px;font-family:monospace;font-size:11px;color:#bfbdb6;background:#1a1f2b;padding:8px;border-radius:6px';
+      var co=tr.stage6_compose, c2=tr.stage3_curator, fst=tr.stage4_forest;
+      var txt=
+        '① bytes: '+(tr.stage0_bytes||[]).map(b=>b.char).join('')+'\n'+
+        '② entropy: bit='+tr.stage2_multiview.bit_entropy.toFixed(2)+' byte='+tr.stage2_multiview.byte_entropy.toFixed(2)+'\n'+
+        '③ curator → '+c2.expert_name+' ('+(c2.confidence*100).toFixed(0)+'%)\n'+
+        '④ forest tree → '+(fst?fst.tree_name:'(none)')+'\n'+
+        '⑤ KG triples matched: '+tr.stage5_kg.length+'\n'+
+        '⑥ compose pattern: '+(co.hit?'✓ HIT':'✗ miss')+'\n'+
+        '⑦ HDC matches: '+tr.stage7_hdc.length+' (top sim: '+(tr.stage7_hdc[0]?tr.stage7_hdc[0].sim.toFixed(2):'-')+')\n'+
+        '⑧ final conf: '+(tr.stage8_final.confidence*100).toFixed(0)+'%';
+      inner.textContent=txt;
+      det.appendChild(inner);
+      r.appendChild(det);
+    }
+    m.appendChild(r);m.scrollTop=m.scrollHeight;
     setStatus('ready', 'live');
   } catch(e) {
     loader.remove();
@@ -4812,8 +4836,16 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
 <div id="stages" style="display:none">
 
   <div class="card">
+    <h2>⓪ Bytes (letras + ligações) <span class="badge" id="byt-meta">…</span></h2>
+    <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Cada byte = neurônio. Cor = freq cache. Bigram_prev = quantas vezes byte_anterior→byte_atual já apareceu.</p>
+    <div id="byt" style="display:flex;flex-wrap:wrap;gap:4px;font-family:monospace;font-size:11px"></div>
+  </div>
+
+  <div class="card">
     <h2>① Tokenização <span class="badge" id="tok-meta">…</span></h2>
     <div id="tok"></div>
+    <div style="margin-top:8px;font-size:11px;color:#5c6773">Word counts no vocab:</div>
+    <div id="wc" style="font-family:monospace;font-size:11px;color:#bfbdb6"></div>
   </div>
 
   <div class="card">
@@ -4824,6 +4856,8 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
   <div class="card">
     <h2>③ Curator routing (fast brain) <span class="badge" id="cur-meta">…</span></h2>
     <div id="cur"></div>
+    <div style="margin-top:8px;font-size:11px;color:#5c6773">Top-3 candidatos:</div>
+    <div id="cur-top3"></div>
   </div>
 
   <div class="card">
@@ -4888,10 +4922,32 @@ async function trace(){
     var d=await r.json();
     document.getElementById('stages').style.display='block';
 
+    // Stage 0 Bytes — letras + bigram links
+    var bytes=d.stage0_bytes||[];
+    document.getElementById('byt-meta').textContent=bytes.length+' bytes';
+    var maxUni=Math.max.apply(null,bytes.map(b=>b.unigram_count||1));
+    var maxBi=Math.max.apply(null,bytes.map(b=>b.prev_bigram||1));
+    document.getElementById('byt').innerHTML=bytes.map(b=>{
+      var intensity=Math.min(1,(b.unigram_count||0)/maxUni);
+      var bg='hsl('+(200+intensity*40)+',70%,'+(15+intensity*25)+'%)';
+      var biPct=Math.min(100,(b.prev_bigram||0)/Math.max(maxBi,1)*100);
+      return '<div title="byte '+b.byte+' '+b.hex+' freq='+b.freq+'Hz" style="background:'+bg+';padding:6px;border-radius:6px;text-align:center;min-width:32px;border:1px solid #273347">'+
+        '<div style="font-size:14px;color:#fff;font-weight:600">'+b.char+'</div>'+
+        '<div style="font-size:9px;color:#5c6773">'+b.hex.replace('0x','')+'</div>'+
+        '<div style="font-size:8px;color:#73d0ff">'+b.unigram_count+'</div>'+
+        (b.pos>0?'<div style="height:2px;background:#7fd962;width:'+biPct+'%;margin-top:2px;border-radius:1px"></div>':'')+
+        '</div>';
+    }).join('');
+
     // Stage 1 Tokenization
     var t=d.stage1_tokenization;
     document.getElementById('tok-meta').textContent=t.n_bytes+'B · '+t.n_words+'w';
     document.getElementById('tok').innerHTML=t.words.map(w=>'<span class="tok-pill">'+w+'</span>').join(' ');
+    if(t.word_counts){
+      document.getElementById('wc').innerHTML=t.word_counts.map(w=>
+        '<div style="display:inline-block;background:#1a1f2b;padding:3px 8px;border-radius:6px;margin:2px;border:1px solid #273347">'+
+        w.word+' <span style="color:'+(w.count>0?'#7fd962':'#ff6b6b')+'">×'+w.count+'</span></div>').join('');
+    }
 
     // Stage 2 Multi-view
     var mv=d.stage2_multiview;
@@ -4909,6 +4965,13 @@ async function trace(){
       '<div><div style="font-size:10px;color:#5c6773">CONFIDENCE</div><div style="font-size:16px;color:#7fd962;font-weight:600">'+(c.confidence*100).toFixed(0)+'%</div></div>'+
       '<div><div style="font-size:10px;color:#5c6773">NEED QWEN</div><div style="font-size:16px;color:'+(c.need_qwen>0.5?'#ff6b6b':'#5c6773')+';font-weight:600">'+(c.need_qwen*100).toFixed(0)+'%</div></div>'+
       '</div>';
+    if(c.top3){
+      document.getElementById('cur-top3').innerHTML=c.top3.map((e,i)=>{
+        var pct=(e.prob*100).toFixed(1);
+        var col=i===0?'#7fd962':i===1?'#73d0ff':'#5c6773';
+        return '<div class="expert-bar"><span class="name" style="color:'+col+'">'+(i+1)+'. '+e.name+'</span><div class="meter"><div class="fill" style="width:'+pct+'%"></div></div><span style="color:#73d0ff;font-family:monospace;font-size:11px;width:50px;text-align:right">'+pct+'%</span></div>';
+      }).join('');
+    }
 
     // Stage 4 Forest
     var f=d.stage4_forest;
@@ -5447,9 +5510,32 @@ updThermo();
         let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
         let mut g = brain.lock().unwrap();
 
+        // Stage 0: Byte-by-byte breakdown — what each byte represents + bigram link
+        let bytes_vec = prompt.as_bytes();
+        let mut byte_details: Vec<String> = Vec::new();
+        for (i, &b) in bytes_vec.iter().enumerate().take(40) {
+            let ch = if b >= 0x20 && b < 0x7F { format!("{}", b as char) }
+                else if b == 0x20 { "·".to_string() }
+                else { format!("0x{:02x}", b) };
+            let bigram_cnt = if i > 0 {
+                let prev = bytes_vec[i-1] as usize;
+                g.bigram[prev * 256 + b as usize]
+            } else { 0 };
+            let unigram_cnt = g.unigram[b as usize];
+            let freq = g.byte_freq[b as usize];
+            byte_details.push(format!("{{\"pos\":{},\"byte\":{},\"hex\":\"0x{:02x}\",\"char\":{},\"unigram_count\":{},\"prev_bigram\":{},\"freq\":{:.1}}}",
+                i, b, b, json_escape(&ch), unigram_cnt, bigram_cnt, freq));
+        }
+
         // Stage 1: Tokenization
         let words: Vec<String> = prompt.split_whitespace().map(String::from).collect();
         let n_bytes = prompt.as_bytes().len();
+        // Word counts in vocab
+        let word_counts: Vec<String> = words.iter().take(20).map(|w| {
+            let w_lc = w.to_lowercase().into_bytes();
+            let cnt = g.word_count.get(&w_lc).copied().unwrap_or(0);
+            format!("{{\"word\":{},\"count\":{}}}", json_escape(w), cnt)
+        }).collect();
 
         // Stage 2: Multi-view signature
         let mut mv = blab::multi_view::MultiView::new();
@@ -5501,13 +5587,23 @@ updThermo();
             .unwrap_or_default();
         let final_short: String = final_resp_str.chars().take(300).collect();
 
+        // Stage 3.5: Curator reasoning — top-3 experts by prob (compute BEFORE drop)
+        let mut sorted_probs: Vec<(usize, f32)> = cur_out.expert_probs.iter().enumerate()
+            .map(|(i, &p)| (i, p)).collect();
+        sorted_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let cur_top3: Vec<String> = sorted_probs.iter().take(3).map(|(i, p)| {
+            let name = g.experts.get(*i).map(|e| e.name.clone()).unwrap_or_default();
+            format!("{{\"name\":{},\"prob\":{:.3}}}", json_escape(&name), p)
+        }).collect();
+
         drop(g);
 
         format!("{{\
             \"prompt\":{},\
-            \"stage1_tokenization\":{{\"n_bytes\":{},\"n_words\":{},\"words\":[{}]}},\
+            \"stage0_bytes\":[{}],\
+            \"stage1_tokenization\":{{\"n_bytes\":{},\"n_words\":{},\"words\":[{}],\"word_counts\":[{}]}},\
             \"stage2_multiview\":{{\"bit_entropy\":{:.3},\"byte_entropy\":{:.3},\"n_active_bytes\":{}}},\
-            \"stage3_curator\":{{\"top_expert\":{},\"expert_name\":{},\"confidence\":{:.3},\"need_qwen\":{:.3}}},\
+            \"stage3_curator\":{{\"top_expert\":{},\"expert_name\":{},\"confidence\":{:.3},\"need_qwen\":{:.3},\"top3\":[{}]}},\
             \"stage4_forest\":{},\
             \"stage5_kg\":[{}],\
             \"stage6_compose\":{{\"hit\":{},\"response\":{}}},\
@@ -5515,11 +5611,14 @@ updThermo();
             \"stage8_final\":{{\"confidence\":{:.3},\"response\":{}}}\
             }}",
             json_escape(&prompt),
+            byte_details.join(","),
             n_bytes, words.len(),
             words.iter().map(|w| json_escape(w)).collect::<Vec<_>>().join(","),
+            word_counts.join(","),
             mv_sig.bit_entropy, mv_sig.byte_entropy, mv_sig.n_active_bytes,
             cur_out.top_expert, json_escape(&cur_expert_name),
             cur_out.confidence, cur_out.need_qwen,
+            cur_top3.join(","),
             gravity_info,
             kg_hits.join(","),
             compose_hit, json_escape(&compose_response.chars().take(200).collect::<String>()),
