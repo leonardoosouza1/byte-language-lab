@@ -4200,6 +4200,7 @@ fn handle_client(
                  <a href=\"/domains-ui\">🌱 Domains</a>\
                  <a href=\"/neurons-ui\">🧬 Neurons</a>\
                  <a href=\"/physics-ui\">⚛️ Physics</a>\
+                 <a href=\"/scales-ui\">📊 Scales</a>\
                  <a href=\"/api-ui\">🔌 API</a>\
                </nav>\
              </div>\
@@ -4338,7 +4339,8 @@ fn handle_client(
                 total_uni, top_bytes.join(","), top_bi.join(","))
     } else if method == "GET" && (path == "/chat-ui" || path == "/control-ui"
             || path == "/forest-ui" || path == "/domains-ui" || path == "/api-ui"
-            || path == "/neurons-ui" || path == "/physics-ui") {
+            || path == "/neurons-ui" || path == "/physics-ui"
+            || path == "/scales-ui") {
         let (title_emoji, page_id, content) = match path.as_str() {
             "/chat-ui" => ("💬", "chat", r#"
 <div class="card">
@@ -4716,6 +4718,116 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
   ctx.putImageData(img,0,0);
 });
 </script>"#),
+            "/scales-ui" => ("📊", "scales", r#"
+<div id="toast" style="position:fixed;top:env(safe-area-inset-top,12px);left:14px;right:14px;z-index:1000;display:none;padding:12px;border-radius:10px;font-weight:600;font-size:14px;text-align:center"></div>
+
+<div class="card">
+  <h2>📊 Multi-Scale Decomposition</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Mesma frase em 5 visões simultâneas: bit · nibble · byte · hex · bigram</p>
+  <textarea id="mvText" rows="2" placeholder="Digite texto..." style="width:100%;padding:12px;background:#1a1f2b;border:1px solid #273347;color:#bfbdb6;border-radius:8px;font-size:15px;font-family:inherit;resize:vertical">Brasil é um país da América do Sul</textarea>
+  <button onclick="decomp()" id="bMv" style="width:100%;padding:14px;background:#73d0ff;color:#0f1419;border:none;border-radius:10px;font-weight:700;font-size:15px;margin-top:8px">⚙️ Decompose</button>
+</div>
+
+<div class="card" id="sigCard" style="display:none">
+  <h2>🔢 Signature</h2>
+  <div id="sig" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px"></div>
+</div>
+
+<div class="card" id="bitsCard" style="display:none">
+  <h2>⚡ Bit view (2 states)</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Total bits = 8 × n_bytes. Entropy max = 1.0 nat ≈ 0.693</p>
+  <div id="bitsOut"></div>
+</div>
+
+<div class="card" id="nibCard" style="display:none">
+  <h2>🔵 Nibble view (16 states)</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">2 nibbles/byte. Hex chars 0-F. Max entropy = ln(16) ≈ 2.77</p>
+  <div id="nibOut" style="display:grid;grid-template-columns:repeat(8,1fr);gap:4px"></div>
+</div>
+
+<div class="card" id="byteCard" style="display:none">
+  <h2>🟢 Top bytes (256 states)</h2>
+  <p style="font-size:11px;color:#5c6773;margin-bottom:8px">Max entropy = ln(256) ≈ 5.55. Texto natural ≈ 4.5</p>
+  <div id="byteOut"></div>
+</div>
+
+<div class="card">
+  <h2>🔬 Correlation hint</h2>
+  <p style="font-size:13px;color:#bfbdb6">MI(bit5, byte) revela case structure: alto MI → texto tem distinção UPPER/lower forte. KL=0.003 validado experimentalmente.</p>
+</div>
+
+<style>
+.spin{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.sig-cell{background:#1a1f2b;padding:10px;border-radius:8px;border:1px solid #273347}
+.sig-cell .lbl{color:#5c6773;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.sig-cell .val{color:#73d0ff;font-size:18px;font-weight:600;margin-top:2px}
+.nib-cell{background:#1a1f2b;padding:8px;border-radius:6px;text-align:center;border:1px solid #273347}
+.nib-cell .h{font-family:monospace;font-size:11px;color:#5c6773}
+.nib-cell .c{font-size:14px;font-weight:600;color:#73d0ff}
+.byte-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #1a1f2b}
+.byte-row .ch{width:30px;text-align:center;font-family:monospace;font-size:14px;color:#fff;background:#273347;padding:4px;border-radius:4px}
+.byte-row .hex{font-family:monospace;color:#5c6773;font-size:11px;width:30px}
+.byte-row .bar{flex:1;height:10px;background:#1a1f2b;border-radius:5px;overflow:hidden}
+.byte-row .bar .fill{height:100%;background:linear-gradient(90deg,#73d0ff,#7fd962)}
+.byte-row .v{font-family:monospace;font-size:11px;color:#73d0ff;width:50px;text-align:right}
+#toast.show{display:block;animation:slideIn .2s ease;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+#toast.ok{background:#7fd962;color:#0f1419}
+#toast.err{background:#ff6b6b;color:#fff}
+@keyframes slideIn{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
+</style>
+<script>
+function toast(m,k){var t=document.getElementById('toast');t.textContent=m;t.className='show '+(k||'ok');clearTimeout(window._t);window._t=setTimeout(()=>t.style.display='none',2500)}
+async function decomp(){
+  var txt=document.getElementById('mvText').value.trim();if(!txt)return;
+  var b=document.getElementById('bMv');b.disabled=true;var orig=b.innerHTML;b.innerHTML='<span class="spin"></span>Computing...';
+  try {
+    var r=await fetch('/multiview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:txt})});
+    var d=await r.json();
+    // Signature card
+    var s=d.signature;
+    var sig=[
+      ['n_bytes', s.n_bytes],
+      ['active bytes', s.n_active_bytes+'/256'],
+      ['active bigrams', s.n_active_bigrams],
+      ['bit_entropy', s.bit_entropy.toFixed(3)],
+      ['nibble_entropy', s.nibble_entropy.toFixed(3)],
+      ['byte_entropy', s.byte_entropy.toFixed(3)],
+      ['hex_entropy', s.hex_entropy.toFixed(3)],
+      ['MI(bit5,byte)', s.mi_bit5_byte.toFixed(3)],
+    ];
+    document.getElementById('sig').innerHTML = sig.map(([k,v])=>
+      '<div class="sig-cell"><div class="lbl">'+k+'</div><div class="val">'+v+'</div></div>').join('');
+    document.getElementById('sigCard').style.display='block';
+    // Bits
+    var b0=d.bits[0].count, b1=d.bits[1].count, tot=b0+b1;
+    var p0=(b0/tot*100).toFixed(1), p1=(b1/tot*100).toFixed(1);
+    document.getElementById('bitsOut').innerHTML=
+      '<div class="byte-row"><span class="ch">0</span><div class="bar"><div class="fill" style="width:'+p0+'%"></div></div><span class="v">'+b0+' ('+p0+'%)</span></div>'+
+      '<div class="byte-row"><span class="ch">1</span><div class="bar"><div class="fill" style="width:'+p1+'%"></div></div><span class="v">'+b1+' ('+p1+'%)</span></div>';
+    document.getElementById('bitsCard').style.display='block';
+    // Nibbles
+    var maxNib=Math.max.apply(null,d.nibbles.map(x=>x.count));
+    document.getElementById('nibOut').innerHTML=d.nibbles.map(n=>{
+      var intensity=maxNib>0?n.count/maxNib:0;
+      var bg='hsl('+(200+intensity*40)+',70%,'+(15+intensity*30)+'%)';
+      return '<div class="nib-cell" style="background:'+bg+'"><div class="h">'+n.nibble+'</div><div class="c">'+n.count+'</div></div>';
+    }).join('');
+    document.getElementById('nibCard').style.display='block';
+    // Top bytes
+    var maxB=d.top_bytes[0]?d.top_bytes[0].count:1;
+    document.getElementById('byteOut').innerHTML=d.top_bytes.map(b=>{
+      var pct=(b.count/maxB*100).toFixed(0);
+      return '<div class="byte-row"><span class="ch">'+(b.char==='·'?b.hex:b.char)+'</span><span class="hex">0x'+b.hex+'</span><div class="bar"><div class="fill" style="width:'+pct+'%"></div></div><span class="v">'+b.count+'</span></div>';
+    }).join('');
+    document.getElementById('byteCard').style.display='block';
+    toast('✓ Decomposed '+s.n_bytes+' bytes','ok');
+  } catch(e){toast('✗ '+e.message,'err');}
+  b.disabled=false; b.innerHTML=orig;
+}
+// Auto-run on load with default text
+setTimeout(decomp, 200);
+</script>"#),
             "/physics-ui" => ("⚛️", "physics", r#"
 <div id="toast" style="position:fixed;top:env(safe-area-inset-top,12px);left:14px;right:14px;z-index:1000;display:none;padding:12px;border-radius:10px;font-weight:600;font-size:14px;text-align:center"></div>
 
@@ -4962,7 +5074,7 @@ updThermo();
              <div class=\"topbar\">\
                <h1>{} IARA · {}</h1>\
                <div class=\"ver\">v0.6.1</div>\
-               <nav class=\"navbar\">{}{}{}{}{}{}{}{}</nav>\
+               <nav class=\"navbar\">{}{}{}{}{}{}{}{}{}</nav>\
              </div>\
              {}\
              </body></html>",
@@ -4974,6 +5086,7 @@ updThermo();
             nav_link("/domains-ui", "🌱 Domains"),
             nav_link("/neurons-ui", "🧬 Neurons"),
             nav_link("/physics-ui", "⚛️ Physics"),
+            nav_link("/scales-ui", "📊 Scales"),
             nav_link("/api-ui", "🔌 API"),
             content,
         );
