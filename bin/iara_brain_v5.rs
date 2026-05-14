@@ -5055,6 +5055,39 @@ updThermo();
         let g = brain.lock().unwrap();
         format!("{{\"n_experts\":{},\"n_routes\":{},\"weights_size\":{}}}",
             g.curator.n_experts, g.curator.n_routes, g.curator.weights.len())
+    } else if method == "POST" && path == "/multiview" {
+        // Decompose text into multi-resolution view (bit/nibble/byte/hex).
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let text = extract_json_str(&body_s, "text").unwrap_or_default();
+        let mut mv = blab::multi_view::MultiView::new();
+        mv.ingest(text.as_bytes());
+        let sig = mv.signature();
+        // Top 8 bytes
+        let mut byte_ranks: Vec<(usize, u64)> = mv.bytes.iter().enumerate()
+            .map(|(i, &c)| (i, c)).collect();
+        byte_ranks.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_bytes: Vec<String> = byte_ranks.iter().take(8).filter(|(_, c)| *c > 0).map(|(i, c)| {
+            let ch = if *i >= 0x20 && *i < 0x7F { format!("{}", *i as u8 as char) } else { format!("·") };
+            format!("{{\"byte\":{},\"hex\":\"{:02x}\",\"char\":{},\"count\":{}}}",
+                i, i, json_escape(&ch), c)
+        }).collect();
+        // Nibbles
+        let nibble_arr: Vec<String> = mv.nibbles.iter().enumerate()
+            .map(|(i, c)| format!("{{\"nibble\":\"{:x}\",\"count\":{}}}", i, c)).collect();
+        // Bits
+        let bits_arr = format!("[{{\"bit\":0,\"count\":{}}},{{\"bit\":1,\"count\":{}}}]",
+            mv.bits[0], mv.bits[1]);
+        format!("{{\
+            \"text\":{},\
+            \"signature\":{{\"n_bytes\":{},\"bit_entropy\":{:.3},\"nibble_entropy\":{:.3},\"byte_entropy\":{:.3},\"hex_entropy\":{:.3},\"mi_bit5_byte\":{:.3},\"n_active_bytes\":{},\"n_active_bigrams\":{}}},\
+            \"bits\":{},\
+            \"nibbles\":[{}],\
+            \"top_bytes\":[{}]\
+            }}",
+            json_escape(&text),
+            sig.n_bytes, sig.bit_entropy, sig.nibble_entropy, sig.byte_entropy,
+            sig.hex_entropy, sig.mi_bit5_byte, sig.n_active_bytes, sig.n_active_bigrams,
+            bits_arr, nibble_arr.join(","), top_bytes.join(","))
     } else if method == "POST" && path == "/spectrum" {
         // Compute wave-encoding spectrum for prompt, return top bins
         let body_s = String::from_utf8_lossy(&body).to_string();
