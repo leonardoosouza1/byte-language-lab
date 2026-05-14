@@ -1536,11 +1536,52 @@ impl Brain {
         println!("  Mycelium edges: {} (threshold 0.35)", self.forest.mycelium.len());
 
         // ── Init Curator (dual-brain fast router) ──
-        let centroids: Vec<[u64; 16]> = self.experts.iter().map(|e| e.centroid_hv).collect();
-        self.curator = blab::curator::Curator::new(self.experts.len());
-        self.curator.init_from_centroids(&centroids);
-        println!("  Curator initialized: {}-experts router (weights from centroids)",
-            self.experts.len());
+        let curator_path = "data/curator.bin";
+        if let Ok(c) = blab::curator::Curator::load(curator_path) {
+            self.curator = c;
+            println!("  Curator loaded: {}-experts (trained weights)", self.curator.n_experts);
+        } else {
+            let centroids: Vec<[u64; 16]> = self.experts.iter().map(|e| e.centroid_hv).collect();
+            self.curator = blab::curator::Curator::new(self.experts.len());
+            self.curator.init_from_centroids(&centroids);
+            println!("  Curator initialized: {}-experts router (init from centroids)",
+                self.experts.len());
+        }
+    }
+
+    /// Train curator on existing dialog_pairs using keyword-derived expert labels.
+    /// Returns (samples_used, final_loss).
+    fn train_curator(&mut self, n_epochs: usize, lr: f32) -> (usize, f32) {
+        // Build training samples: (hv, expert_label) from each dialog
+        let mut samples: Vec<([u64; 16], blab::curator::Outcome)> = Vec::new();
+        for (idx, (u, _)) in self.dialog_pairs.iter().enumerate() {
+            // Determine expert label via keyword match (same heuristic as observe)
+            let u_lc = String::from_utf8_lossy(u).to_lowercase();
+            let mut best_expert: usize = 0;
+            let mut best_score: usize = 0;
+            for (i, e) in self.experts.iter().enumerate() {
+                let score: usize = e.keywords.iter()
+                    .filter(|kw| u_lc.contains(*kw)).count();
+                if score > best_score {
+                    best_score = score;
+                    best_expert = i;
+                }
+            }
+            if best_score == 0 { continue; }  // skip unmatchable
+            // HV from dialog_hvs (already computed)
+            if idx >= self.dialog_hvs.len() { continue; }
+            let hv = self.dialog_hvs[idx];
+            samples.push((hv, blab::curator::Outcome {
+                expert_used: best_expert,
+                qwen_called: false,  // assume cached implies brain knew
+            }));
+            if samples.len() >= 5000 { break; }  // cap pra training rápido
+        }
+        // Convert para refs
+        let sample_refs: Vec<(&[u64; 16], blab::curator::Outcome)> = samples.iter()
+            .map(|(hv, oc)| (hv as &[u64; 16], oc.clone())).collect();
+        let loss = self.curator.train_batch(&sample_refs, n_epochs, lr);
+        (sample_refs.len(), loss)
     }
 
     /// Route via curator (fast path). Returns (expert_idx, confidence, need_qwen).
@@ -4741,6 +4782,24 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
             }
             None => "{\"error\":\"no trees\"}".to_string()
         }
+    } else if method == "POST" && path == "/train_curator" {
+        // Train curator on existing dialogs
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let epochs = extract_json_num(&body_s, "epochs").unwrap_or(5.0) as usize;
+        let lr = extract_json_num(&body_s, "lr").unwrap_or(0.01) as f32;
+        let t0 = std::time::Instant::now();
+        let (n, loss) = {
+            let mut g = brain.lock().unwrap();
+            g.train_curator(epochs, lr)
+        };
+        let dt = t0.elapsed().as_millis() as u64;
+        // Save trained weights
+        let saved = {
+            let g = brain.lock().unwrap();
+            g.curator.save("data/curator.bin").is_ok()
+        };
+        format!("{{\"trained\":true,\"samples\":{},\"epochs\":{},\"lr\":{:.4},\"final_loss\":{:.4},\"ms\":{},\"saved\":{}}}",
+            n, epochs, lr, loss, dt, saved)
     } else if method == "POST" && path == "/curator" {
         // Test curator routing for a prompt
         let body_s = String::from_utf8_lossy(&body).to_string();

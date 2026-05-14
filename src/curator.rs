@@ -182,6 +182,64 @@ pub struct Outcome {
     pub qwen_called: bool,
 }
 
+impl Curator {
+    /// Save weights binary to file.
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&(self.n_experts as u32).to_le_bytes())?;
+        f.write_all(&(self.weights.len() as u32).to_le_bytes())?;
+        for w in &self.weights {
+            f.write_all(&w.to_le_bytes())?;
+        }
+        f.write_all(&(self.bias.len() as u32).to_le_bytes())?;
+        for b in &self.bias {
+            f.write_all(&b.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Load weights binary from file.
+    pub fn load(path: &str) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut buf4 = [0u8; 4];
+        f.read_exact(&mut buf4)?;
+        let n_experts = u32::from_le_bytes(buf4) as usize;
+        f.read_exact(&mut buf4)?;
+        let n_weights = u32::from_le_bytes(buf4) as usize;
+        let mut weights = Vec::with_capacity(n_weights);
+        for _ in 0..n_weights {
+            f.read_exact(&mut buf4)?;
+            weights.push(f32::from_le_bytes(buf4));
+        }
+        f.read_exact(&mut buf4)?;
+        let n_bias = u32::from_le_bytes(buf4) as usize;
+        let mut bias = Vec::with_capacity(n_bias);
+        for _ in 0..n_bias {
+            f.read_exact(&mut buf4)?;
+            bias.push(f32::from_le_bytes(buf4));
+        }
+        Ok(Self { n_experts, weights, bias, n_routes: 0 })
+    }
+
+    /// Batch train: run N epochs over labeled (hv, expert, qwen_called) tuples.
+    pub fn train_batch(&mut self, samples: &[(&[u64; 16], Outcome)], n_epochs: usize, lr: f32) -> f32 {
+        let mut final_loss = 0.0f32;
+        for _ in 0..n_epochs {
+            let mut epoch_loss = 0.0f32;
+            for (hv, outcome) in samples {
+                let out = self.route(hv);
+                let expert_loss = -out.expert_probs[outcome.expert_used].max(1e-9).ln();
+                epoch_loss += expert_loss;
+                self.observe(hv, outcome, lr);
+            }
+            final_loss = epoch_loss / samples.len().max(1) as f32;
+        }
+        final_loss
+    }
+}
+
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
