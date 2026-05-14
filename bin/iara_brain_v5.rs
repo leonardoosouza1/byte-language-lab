@@ -3839,12 +3839,18 @@ fn handle_client(
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in full_prompt.as_bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
         h ^= (temp * 1000.0) as u64;
-        // Update persona BEFORE locking g for response logic
-        {
+        // Update persona + run CURATOR pré-decisão (locks brain mut)
+        let curator_out = {
             let mut g_mut = brain.lock().unwrap();
             g_mut.persona.update(&prompt);
-        }
+            // Curator: fast linear router decide PATH antes do heavy pipeline
+            let out = g_mut.curate(prompt.as_bytes());
+            out
+        };
         let g = brain.lock().unwrap();
+        // Adaptive temperature via thermo (high curator conf → low T)
+        let _adaptive_t = blab::thermo::adaptive_temperature(curator_out.confidence);
+        let _need_qwen_signal = curator_out.need_qwen;
         // 3-tier FUSION pipeline:
         //  conf >= 0.85 → brain instant (KG/dialog match alta confiança)
         //  conf >= 0.45 → brain + Qwen com RAG context (best of both)
@@ -3923,8 +3929,11 @@ fn handle_client(
             g_obs.curator_observe(prompt.as_bytes(), best_expert, qwen_called);
         }
 
-        format!("{{\"response\":{},\"prompt\":{},\"source\":{}}}",
-            json_escape(&s), json_escape(&prompt), json_escape(source))
+        // Include curator metrics in response for UI feedback
+        format!("{{\"response\":{},\"prompt\":{},\"source\":{},\"curator\":{{\"top_expert\":{},\"confidence\":{:.3},\"need_qwen\":{:.3}}},\"adaptive_T\":{:.3}}}",
+            json_escape(&s), json_escape(&prompt), json_escape(source),
+            curator_out.top_expert, curator_out.confidence, curator_out.need_qwen,
+            _adaptive_t)
     } else if method == "GET" && path == "/stats" {
         let g = brain.lock().unwrap();
         format!("{{\"bytes\":{},\"words\":{},\"phrases\":{},\"bigram_edges\":{},\"dialogs\":{},\"triples\":{}}}",
@@ -4760,6 +4769,45 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
             .collect();
         format!("{{\"prompt\":{},\"n_bins\":{},\"top_bins\":[{}]}}",
             json_escape(&prompt), spec.mag.len(), top10.join(","))
+    } else if method == "GET" && path == "/brain_status" {
+        // Comprehensive state — neurons + trees + curator + thermo + lyapunov
+        let g = brain.lock().unwrap();
+        let total_uni: u32 = g.unigram.iter().sum();
+        // Top 5 most active bytes
+        let mut byte_ranks: Vec<(u8, u32)> = (0..=255u8)
+            .map(|b| (b, g.unigram[b as usize])).collect();
+        byte_ranks.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_bytes: Vec<String> = byte_ranks.iter().take(5).map(|(b, c)| {
+            let ch = if *b >= 0x20 && *b < 0x7F { format!("{}", *b as char) } else { format!("0x{:02x}", b) };
+            format!("{{\"byte\":{},\"char\":{},\"count\":{},\"pct\":{:.2}}}",
+                b, json_escape(&ch), c, (*c as f32)/(total_uni.max(1) as f32)*100.0)
+        }).collect();
+        // Top 5 trees
+        let trees_info: Vec<String> = g.forest.trees.iter().take(10).map(|t| {
+            format!("{{\"name\":{},\"mass\":{:.2},\"n_dialogs\":{},\"n_branches\":{}}}",
+                json_escape(&t.name), t.mass, t.n_dialogs, t.branches.len())
+        }).collect();
+        // Curator state
+        let curator_state = format!("{{\"n_experts\":{},\"n_routes\":{},\"weights_size\":{}}}",
+            g.curator.n_experts, g.curator.n_routes, g.curator.weights.len());
+        format!("{{\
+            \"neurons\":{{\"total_tokens\":{},\"top_bytes\":[{}]}},\
+            \"trees\":{{\"n_trees\":{},\"n_branches\":{},\"n_mycelium\":{},\"list\":[{}]}},\
+            \"curator\":{},\
+            \"experts\":{},\
+            \"dialogs\":{},\
+            \"triples\":{}\
+            }}",
+            total_uni, top_bytes.join(","),
+            g.forest.n_trees(),
+            g.forest.trees.iter().map(|t| t.branches.len()).sum::<usize>(),
+            g.forest.mycelium.len(),
+            trees_info.join(","),
+            curator_state,
+            g.experts.len(),
+            g.dialog_pairs.len(),
+            g.triples.len(),
+        )
     } else if method == "POST" && path == "/thermo" {
         // Diagnostic: compute thermo metrics for a query/probabilities
         let body_s = String::from_utf8_lossy(&body).to_string();
