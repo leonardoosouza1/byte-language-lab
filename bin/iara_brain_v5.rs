@@ -1217,11 +1217,28 @@ impl Brain {
         self.ingest_words(&combined);
         self.ingest_phrases(&combined);
 
-        // 2. Add dialog pair direct (skip parse — we already have the split)
+        // 2. Add dialog pair OR replace if exact prompt match exists
+        // Resolves stale-dialog-wins issue: novo ingest com mesma user prompt
+        // SOBRESCREVE resposta antiga.
         if !user.is_empty() && !model.is_empty() && model.len() < 1500 {
-            self.dialog_pairs.push((user.to_vec(), model.to_vec()));
-            // Parallel HDC index — encode user prompt as 1024-bit HV
-            self.dialog_hvs.push(encode_prompt_hv(user));
+            let user_lc = user.to_ascii_lowercase();
+            // Try to find existing dialog with same user prompt (case-insensitive)
+            let replace_idx = self.dialog_pairs.iter().position(|(u, _)| {
+                u.len() == user.len() && u.to_ascii_lowercase() == user_lc
+            });
+            match replace_idx {
+                Some(idx) => {
+                    // Replace existing — new ingest wins
+                    self.dialog_pairs[idx].1 = model.to_vec();
+                    if idx < self.dialog_hvs.len() {
+                        self.dialog_hvs[idx] = encode_prompt_hv(user);
+                    }
+                }
+                None => {
+                    self.dialog_pairs.push((user.to_vec(), model.to_vec()));
+                    self.dialog_hvs.push(encode_prompt_hv(user));
+                }
+            }
         }
 
         // 3. Extract triples from THIS pair only, insert into KG
