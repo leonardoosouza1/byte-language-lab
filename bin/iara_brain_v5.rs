@@ -4748,6 +4748,28 @@ fetch('/neurons').then(r=>r.json()).then(d=>{
         let g = brain.lock().unwrap();
         format!("{{\"n_experts\":{},\"n_routes\":{},\"weights_size\":{}}}",
             g.curator.n_experts, g.curator.n_routes, g.curator.weights.len())
+    } else if method == "POST" && path == "/spectrum" {
+        // Compute wave-encoding spectrum for prompt, return top bins
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
+        let g = brain.lock().unwrap();
+        let spec = blab::wave_encoding::encode_spectrum(prompt.as_bytes(), &g.byte_freq);
+        drop(g);
+        let top10: Vec<String> = spec.mag.iter().enumerate().take(10)
+            .map(|(i, m)| format!("{{\"bin\":{},\"mag\":{:.4}}}", i, m))
+            .collect();
+        format!("{{\"prompt\":{},\"n_bins\":{},\"top_bins\":[{}]}}",
+            json_escape(&prompt), spec.mag.len(), top10.join(","))
+    } else if method == "POST" && path == "/thermo" {
+        // Diagnostic: compute thermo metrics for a query/probabilities
+        let body_s = String::from_utf8_lossy(&body).to_string();
+        let confidence = extract_json_num(&body_s, "confidence").unwrap_or(0.5) as f32;
+        let difficulty = extract_json_num(&body_s, "difficulty").unwrap_or(0.5) as f32;
+        let t = blab::thermo::adaptive_temperature(confidence);
+        let tau = blab::thermo::relaxation_tau_ms(difficulty);
+        let surprise = blab::thermo::surprise(confidence);
+        format!("{{\"adaptive_T\":{:.3},\"tau_ms\":{:.1},\"surprise\":{:.3}}}",
+            t, tau, surprise)
     } else if method == "GET" && path == "/moe" {
         let g = brain.lock().unwrap();
         let entries: Vec<String> = g.experts.iter().map(|e| {
