@@ -3875,6 +3875,46 @@ fn qwen_fallback(prompt: &str, max_tokens: usize) -> Option<String> {
     qwen_call(prompt, max_tokens, None)
 }
 
+/// Qwen3-4b labeler using chat template with reasoning disabled.
+///
+/// The chat template injects `<think>\n\n</think>\n\n` when thinking is off,
+/// avoiding the multi-token reasoning preamble. Output is the bare classification.
+fn qwen3_classify(user_msg: &str, max_tokens: usize) -> Option<String> {
+    let (port, _guard) = acquire_qwen_port()?;
+    let final_prompt = format!(
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        user_msg
+    );
+    let body = format!(
+        "{{\"model\":\"qwen3-4b\",\"prompt\":\"{}\",\"max_tokens\":{},\"temperature\":0.1,\"top_k\":1}}",
+        final_prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+        max_tokens
+    );
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok()?;
+    let req = format!(
+        "POST /api/generate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    use std::io::Write;
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 { break; }
+        let t = line.trim();
+        if let Some(v) = t.to_lowercase().strip_prefix("content-length: ") {
+            content_length = v.parse().unwrap_or(0);
+        }
+        if t.is_empty() { break; }
+    }
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf).ok()?;
+    let body_str = String::from_utf8_lossy(&buf).to_string();
+    extract_json_str(&body_str, "response").map(|s| s.trim().to_string())
+}
+
 fn handle_client(
     brain: &std::sync::Arc<Mutex<Brain>>,
     auto_state: &Mutex<AutoLearnState>,
@@ -5480,10 +5520,10 @@ updThermo();
         let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
         let topics_list = "1=Tecnologia, 2=Ciências (biologia/química/física), 3=História, 4=Filosofia, 5=Artes, 6=Geografia (estados/países/regiões/cidades), 7=Matemática, 8=Saúde (medicina/doenças), 9=Economia, 10=OOV-Cultura (gírias/internet)";
         let labeler_prompt = format!(
-            "Classifique em UMA categoria. Apenas número. Categorias: {} | Pergunta: {} | Resposta:",
+            "Classifique a pergunta em UMA das categorias abaixo. Responda APENAS o número (1-10), nada mais.\n\nCategorias: {}\n\nPergunta: {}",
             topics_list, prompt
         );
-        let qwen_resp = qwen_call(&labeler_prompt, 8, None).unwrap_or_default();
+        let qwen_resp = qwen3_classify(&labeler_prompt, 6).unwrap_or_default();
         // Parse: extract first digit 1-10 from Qwen response
         let mut expert_id: i32 = -1;
         let chars: Vec<char> = qwen_resp.chars().collect();
@@ -5529,10 +5569,10 @@ updThermo();
         let mut labeled: Vec<([u64; 16], blab::curator::Outcome)> = Vec::new();
         for p in &prompts {
             let labeler_prompt = format!(
-                "Classifique em UMA categoria. Apenas número. {} | P: {} | R:",
+                "Classifique a pergunta em UMA das categorias abaixo. Responda APENAS o número (1-10), nada mais.\n\nCategorias: {}\n\nPergunta: {}",
                 topics_list, p
             );
-            let qwen_resp = qwen_call(&labeler_prompt, 8, None).unwrap_or_default();
+            let qwen_resp = qwen3_classify(&labeler_prompt, 6).unwrap_or_default();
             let mut expert_id: i32 = -1;
             for c in qwen_resp.chars() {
                 if c.is_ascii_digit() {
