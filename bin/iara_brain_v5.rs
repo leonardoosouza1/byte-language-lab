@@ -3886,7 +3886,7 @@ fn qwen3_classify(user_msg: &str, max_tokens: usize) -> Option<String> {
         user_msg
     );
     let body = format!(
-        "{{\"model\":\"qwen3-4b\",\"prompt\":\"{}\",\"max_tokens\":{},\"temperature\":0.1,\"top_k\":1}}",
+        "{{\"model\":\"qwen3-4b-q4km\",\"prompt\":\"{}\",\"max_tokens\":{},\"temperature\":0.1,\"top_k\":1}}",
         final_prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
         max_tokens
     );
