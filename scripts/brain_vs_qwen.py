@@ -48,11 +48,13 @@ def post_json(url, payload, timeout=60):
 
 
 def ask_brain(q):
+    """Returns (response, source). source distinguishes brain-hi cache from
+    qwen-* delegation — measures how much the brain answers on its own."""
     try:
         d = post_json(f"{BRAIN}/chat", {"prompt": q})
-        return d.get("response", "")
+        return d.get("response", ""), d.get("source", "?")
     except Exception as e:
-        return f"<brain error: {e}>"
+        return f"<brain error: {e}>", "error"
 
 
 def ask_qwen(q):
@@ -81,18 +83,22 @@ def main():
 
     qs = QUESTIONS[:args.n]
     brain_hits = qwen_hits = 0
-    rows = []
+    src_count = {}
+    brain_solo_hits = 0   # correct AND answered without delegating to Qwen
 
     for q, kw in qs:
-        ba = ask_brain(q)
+        ba, src = ask_brain(q)
         qa = ask_qwen(q)
         bok = score(ba, kw)
         qok = score(qa, kw)
         brain_hits += bok
         qwen_hits += qok
-        rows.append((q, bok, qok, ba, qa))
+        src_count[src] = src_count.get(src, 0) + 1
+        solo = src.startswith("brain")  # brain-hi / brain-mid / brain-fallback
+        if bok and solo:
+            brain_solo_hits += 1
         mark = lambda x: "✓" if x else "✗"
-        print(f"  brain {mark(bok)}  qwen {mark(qok)}  {q}")
+        print(f"  brain {mark(bok)} [{src:<20}]  qwen {mark(qok)}  {q}")
         if args.verbose:
             print(f"      brain: {ba[:90]}")
             print(f"      qwen:  {qa[:90]}")
@@ -102,6 +108,8 @@ def main():
     print(f"═══ RESULTS ({n} questions) ═══")
     print(f"  Brain: {brain_hits}/{n} ({100*brain_hits/n:.0f}%)")
     print(f"  Qwen3: {qwen_hits}/{n} ({100*qwen_hits/n:.0f}%)")
+    print(f"  Brain SOLO (no Qwen delegation): {brain_solo_hits}/{n} ({100*brain_solo_hits/n:.0f}%)")
+    print(f"  source breakdown: {dict(sorted(src_count.items()))}")
     if qwen_hits > 0:
         ratio = 100 * brain_hits / qwen_hits
         print(f"  Brain is {ratio:.0f}% as smart as Qwen3 (target: ≥50%)")
