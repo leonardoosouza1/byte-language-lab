@@ -14,11 +14,20 @@ and a JSONL log for replay. Failures can be fed back into auto-learn.
 Usage:
   python3 auto_eval.py [--domains a,b,c] [--per N] [--rounds R] [--log path]
 """
-import argparse, json, re, sys, time, urllib.request
+import argparse, itertools, json, re, sys, threading, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 BRAIN = "http://127.0.0.1:3012"
-ENGINE = "http://127.0.0.1:3000"
+# Parallel Qwen engines — examiner + judge work spread across these.
+ENGINES = ["http://127.0.0.1:3000", "http://127.0.0.1:3002"]
 MODEL = "qwen3-4b"
+
+# Round-robin engine picker (thread-safe).
+_eng_lock = threading.Lock()
+_eng_cycle = itertools.cycle(range(len(ENGINES)))
+def next_engine():
+    with _eng_lock:
+        return ENGINES[next(_eng_cycle)]
 
 DOMAINS = [
     "história do Brasil", "ciência (física, química, biologia)",
@@ -35,12 +44,14 @@ def post(url, payload, timeout=90):
         return json.loads(r.read())
 
 
-def qwen(prompt, max_tokens=200, temp=0.5):
-    """Call Qwen3 with chat template, reasoning disabled."""
+def qwen(prompt, max_tokens=200, temp=0.5, engine=None):
+    """Call Qwen3 with chat template, reasoning disabled.
+    engine=None → round-robin across ENGINES (parallel load balancing)."""
     chat = (f"<|im_start|>user\n{prompt}<|im_end|>\n"
             f"<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    eng = engine or next_engine()
     try:
-        d = post(f"{ENGINE}/api/generate", {
+        d = post(f"{eng}/api/generate", {
             "model": MODEL, "prompt": chat,
             "max_tokens": max_tokens, "temperature": temp,
         })
@@ -76,7 +87,11 @@ def gen_questions(domain, n):
 
 
 def judge(question, brain_answer):
-    """Qwen3 as judge — grade the brain's answer. Returns (verdict, reason)."""
+    """Qwen3 as judge — grade the brain's answer. Returns (verdict, reason).
+
+    Robust parsing: Qwen3 won't reliably emit one exact token, so scan
+    tolerantly and check WRONG markers before RIGHT ones ('incorreta'
+    must not be misread as 'correta')."""
     prompt = (
         f"Você é um avaliador rigoroso. Pergunta: \"{question}\"\n"
         f"Resposta dada: \"{brain_answer}\"\n\n"
@@ -91,10 +106,13 @@ def judge(question, brain_answer):
     for line in raw.splitlines():
         lu = line.upper()
         if "VEREDITO" in lu:
-            if "CERTO" in lu:
-                verdict = "CERTO"
-            elif "PARCIAL" in lu:
+            v = lu.split(":", 1)[-1]
+            if "PARCIAL" in v:
                 verdict = "PARCIAL"
+            elif "INCORRET" in v or "ERRAD" in v:
+                verdict = "ERRADO"
+            elif "CERT" in v or "CORRET" in v:
+                verdict = "CERTO"
             else:
                 verdict = "ERRADO"
         elif "RAZAO" in lu or "RAZÃO" in lu:
@@ -120,36 +138,49 @@ def main():
     failures = []
     t0 = time.time()
 
+    workers = max(2, len(ENGINES) * 2)
     for rnd in range(1, args.rounds + 1):
         print(f"\n╔══ ROUND {rnd}/{args.rounds} ══╗")
-        for domain in domains:
-            qs = gen_questions(domain, args.per)
-            if not qs:
-                print(f"  [{domain}] — examiner produced 0 questions, skip")
-                continue
-            dom = {"CERTO": 0, "PARCIAL": 0, "ERRADO": 0}
-            print(f"\n  ▸ {domain}  ({len(qs)} questions)")
-            for q in qs:
-                ans, src = ask_brain(q)
-                verdict, reason = judge(q, ans)
-                dom[verdict] += 1
-                grand[verdict] += 1
-                mark = {"CERTO": "✓", "PARCIAL": "~", "ERRADO": "✗"}[verdict]
-                print(f"    {mark} [{src:<12}] {q[:62]}")
-                if verdict != "CERTO":
-                    print(f"        → {ans[:80]}")
-                    print(f"        judge: {reason[:80]}")
-                    failures.append({"domain": domain, "q": q, "answer": ans,
-                                     "src": src, "verdict": verdict, "reason": reason})
-                logf.write(json.dumps({
-                    "round": rnd, "domain": domain, "q": q, "answer": ans,
-                    "src": src, "verdict": verdict, "reason": reason,
-                }, ensure_ascii=False) + "\n")
-                logf.flush()
-            tot = sum(dom.values())
-            sc = (dom["CERTO"] + 0.5 * dom["PARCIAL"])
-            print(f"    domain score: {sc:.1f}/{tot}  "
-                  f"(✓{dom['CERTO']} ~{dom['PARCIAL']} ✗{dom['ERRADO']})")
+        # Phase 1: generate all questions, in parallel across engines.
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            gen_futs = {ex.submit(gen_questions, d, args.per): d for d in domains}
+            dom_qs = {}
+            for fut, d in gen_futs.items():
+                try:
+                    dom_qs[d] = fut.result(timeout=180)
+                except Exception:
+                    dom_qs[d] = []
+        all_q = [(d, q) for d in domains for q in dom_qs.get(d, [])]
+        print(f"  generated {len(all_q)} questions across {len(domains)} domains")
+
+        # Phase 2: brain answers (serialized — brain holds a Mutex) but the
+        # judge calls fan out across engines.
+        def eval_one(item):
+            domain, q = item
+            ans, src = ask_brain(q)
+            verdict, reason = judge(q, ans)  # judge() → qwen() round-robins engines
+            return {"round": rnd, "domain": domain, "q": q, "answer": ans,
+                    "src": src, "verdict": verdict, "reason": reason}
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(eval_one, all_q))
+
+        per_dom = {}
+        for r in results:
+            d = r["domain"]
+            per_dom.setdefault(d, {"CERTO": 0, "PARCIAL": 0, "ERRADO": 0})
+            per_dom[d][r["verdict"]] += 1
+            grand[r["verdict"]] += 1
+            mark = {"CERTO": "✓", "PARCIAL": "~", "ERRADO": "✗"}[r["verdict"]]
+            print(f"    {mark} [{r['src']:<20}] {r['q'][:58]}")
+            if r["verdict"] != "CERTO":
+                failures.append(r)
+            logf.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logf.flush()
+        for d, c in per_dom.items():
+            tot = sum(c.values())
+            sc = c["CERTO"] + 0.5 * c["PARCIAL"]
+            print(f"  ▸ {d}: {sc:.1f}/{tot} (✓{c['CERTO']} ~{c['PARCIAL']} ✗{c['ERRADO']})")
 
     logf.close()
     total = sum(grand.values())

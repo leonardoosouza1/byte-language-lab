@@ -1,0 +1,205 @@
+{
+  "_comment": "HARD held-out — 50 factual PT-BR questions, harder long-tail than heldout.json. NEVER used for teaching. Measures real cauda-longa coverage.",
+  "questions": [
+    {
+      "q": "Qual é a capital do Cazaquistão?",
+      "ref": "Astana"
+    },
+    {
+      "q": "Quem escreveu Grande Sertão: Veredas?",
+      "ref": "Guimarães Rosa"
+    },
+    {
+      "q": "Qual elemento químico tem número atômico 79?",
+      "ref": "Ouro"
+    },
+    {
+      "q": "Qual é o menor país do mundo em área?",
+      "ref": "Vaticano"
+    },
+    {
+      "q": "Quem foi o primeiro ser humano a orbitar a Terra?",
+      "ref": "Yuri Gagarin"
+    },
+    {
+      "q": "Qual rio corta a cidade de Budapeste?",
+      "ref": "Rio Danúbio"
+    },
+    {
+      "q": "Qual é o ponto mais profundo dos oceanos?",
+      "ref": "Fossa das Marianas"
+    },
+    {
+      "q": "Qual é o nome do processo de divisão celular que origina gametas?",
+      "ref": "Meiose"
+    },
+    {
+      "q": "Quem escreveu Cem Anos de Solidão?",
+      "ref": "Gabriel García Márquez"
+    },
+    {
+      "q": "Qual é a capital da Mongólia?",
+      "ref": "Ulan Bator (Ulaanbaatar)"
+    },
+    {
+      "q": "Qual gás nobre é usado em letreiros luminosos vermelhos?",
+      "ref": "Neônio (nêon, neon)"
+    },
+    {
+      "q": "Quem foi o último imperador romano do Ocidente?",
+      "ref": "Rômulo Augústulo"
+    },
+    {
+      "q": "Qual é a unidade de resistência elétrica?",
+      "ref": "Ohm"
+    },
+    {
+      "q": "Qual é a maior lua de Júpiter?",
+      "ref": "Ganimedes"
+    },
+    {
+      "q": "Quem formulou o princípio da incerteza na física quântica?",
+      "ref": "Heisenberg"
+    },
+    {
+      "q": "Qual é a capital da Nova Zelândia?",
+      "ref": "Wellington"
+    },
+    {
+      "q": "Que civilização pré-colombiana construiu Machu Picchu?",
+      "ref": "Inca"
+    },
+    {
+      "q": "Quem escreveu a obra política O Príncipe?",
+      "ref": "Maquiavel (Maquiavel, Machiavelli)"
+    },
+    {
+      "q": "Qual é a fórmula química da amônia?",
+      "ref": "NH3"
+    },
+    {
+      "q": "Em que país fica a cidade arqueológica de Petra?",
+      "ref": "Jordânia"
+    },
+    {
+      "q": "Qual é o nome científico da espécie humana?",
+      "ref": "Homo sapiens"
+    },
+    {
+      "q": "Quem descobriu a penicilina?",
+      "ref": "Alexander Fleming"
+    },
+    {
+      "q": "Em que planeta fica o Monte Olimpo, a maior montanha do sistema solar?",
+      "ref": "Marte"
+    },
+    {
+      "q": "Qual é a capital da Finlândia?",
+      "ref": "Helsinque (Helsinki)"
+    },
+    {
+      "q": "Quem compôs As Quatro Estações?",
+      "ref": "Vivaldi"
+    },
+    {
+      "q": "Qual é o maior órgão do corpo humano?",
+      "ref": "Pele"
+    },
+    {
+      "q": "Qual é o rio mais longo da Ásia?",
+      "ref": "Yangtzé"
+    },
+    {
+      "q": "Quem escreveu A Divina Comédia?",
+      "ref": "Dante Alighieri"
+    },
+    {
+      "q": "Quem propôs a primeira versão da tabela periódica dos elementos?",
+      "ref": "Mendeleiev"
+    },
+    {
+      "q": "Qual é a partícula subatômica de carga elétrica negativa?",
+      "ref": "Elétron"
+    },
+    {
+      "q": "Qual é o nome do processo de transformação da lagarta em borboleta?",
+      "ref": "Metamorfose"
+    },
+    {
+      "q": "Quem escreveu o romance Dom Quixote?",
+      "ref": "Miguel de Cervantes"
+    },
+    {
+      "q": "Qual é a montanha mais alta do continente africano?",
+      "ref": "Kilimanjaro"
+    },
+    {
+      "q": "Qual é a capital da Suécia?",
+      "ref": "Estocolmo"
+    },
+    {
+      "q": "Quem é considerado o pai da genética?",
+      "ref": "Gregor Mendel"
+    },
+    {
+      "q": "Qual é a galáxia espiral mais próxima da Via Láctea?",
+      "ref": "Andrômeda"
+    },
+    {
+      "q": "Qual é a unidade de medida de frequência?",
+      "ref": "Hertz"
+    },
+    {
+      "q": "Quem foi o primeiro presidente dos Estados Unidos?",
+      "ref": "George Washington"
+    },
+    {
+      "q": "Qual é a capital da Tailândia?",
+      "ref": "Bangkok"
+    },
+    {
+      "q": "Qual cientista formulou as leis do eletromagnetismo em equações?",
+      "ref": "Maxwell"
+    },
+    {
+      "q": "Qual é o maior planeta rochoso do sistema solar?",
+      "ref": "Terra"
+    },
+    {
+      "q": "Quem liderou a Revolução Cubana de 1959?",
+      "ref": "Fidel Castro"
+    },
+    {
+      "q": "Qual é a capital da Coreia do Sul?",
+      "ref": "Seul"
+    },
+    {
+      "q": "Em que ano começou a Revolução Francesa?",
+      "ref": "1789"
+    },
+    {
+      "q": "Qual é o maior felino selvagem do mundo?",
+      "ref": "Tigre"
+    },
+    {
+      "q": "Qual é o osso da coxa, o mais longo do corpo humano?",
+      "ref": "Fêmur"
+    },
+    {
+      "q": "Quem pintou o quadro A Noite Estrelada?",
+      "ref": "Van Gogh"
+    },
+    {
+      "q": "Qual é a capital da Argélia?",
+      "ref": "Argel"
+    },
+    {
+      "q": "Qual teoria explica a origem do universo a partir de uma grande expansão?",
+      "ref": "Big Bang"
+    },
+    {
+      "q": "Quem escreveu a peça teatral A Megera Domada?",
+      "ref": "Shakespeare"
+    }
+  ]
+}
