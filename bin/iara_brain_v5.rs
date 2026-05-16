@@ -1435,6 +1435,101 @@ impl Brain {
         }
     }
 
+    /// Bitwise-majority HV centroid over a set of dialog indices.
+    /// A bit is set iff >50% of the indexed dialogs have it set.
+    fn centroid_hv(&self, indices: &[usize]) -> [u64; 16] {
+        let mut bit_counts = [0u32; 1024];
+        let mut n = 0u32;
+        for &idx in indices {
+            if idx >= self.dialog_hvs.len() { continue; }
+            let hv = &self.dialog_hvs[idx];
+            for word_i in 0..16 {
+                let w = hv[word_i];
+                for bit in 0..64 {
+                    if (w >> bit) & 1 == 1 { bit_counts[word_i * 64 + bit] += 1; }
+                }
+            }
+            n += 1;
+        }
+        if n == 0 { return [0u64; 16]; }
+        let mut out = [0u64; 16];
+        for word_i in 0..16 {
+            let mut w = 0u64;
+            for bit in 0..64 {
+                if bit_counts[word_i * 64 + bit] * 2 > n { w |= 1u64 << bit; }
+            }
+            out[word_i] = w;
+        }
+        out
+    }
+
+    /// Rebuild mycelium as a SEMANTIC graph: edges between expert-trees that
+    /// share content vocabulary (Jaccard over ≥5-letter words in their
+    /// dialogs). Replaces the old 3D-proximity mycelium, which connected
+    /// geometrically-near but topically-unrelated trees. This lets retrieval
+    /// hop "Ciências → História" when a fact lives in a related domain.
+    fn build_mycelium_cooccurrence(&mut self) {
+        self.forest.mycelium.clear();
+        let mut word_sets: Vec<std::collections::HashSet<String>> = Vec::new();
+        for expert in &self.experts {
+            let mut set = std::collections::HashSet::new();
+            for &idx in &expert.dialog_indices {
+                if idx >= self.dialog_pairs.len() { continue; }
+                let (u, m) = &self.dialog_pairs[idx];
+                for txt in [u, m] {
+                    let s = String::from_utf8_lossy(txt).to_lowercase();
+                    for w in s.split(|c: char| !c.is_alphabetic()) {
+                        if w.chars().count() >= 5 { set.insert(w.to_string()); }
+                    }
+                }
+            }
+            word_sets.push(set);
+        }
+        for i in 0..word_sets.len() {
+            for j in (i + 1)..word_sets.len() {
+                let inter = word_sets[i].intersection(&word_sets[j]).count();
+                if inter == 0 { continue; }
+                let union = word_sets[i].len() + word_sets[j].len() - inter;
+                let jac = inter as f32 / union.max(1) as f32;
+                if jac >= 0.03 {
+                    self.forest.add_mycelium(i, j, jac);
+                }
+            }
+        }
+    }
+
+    /// Forest retrieval — gravity-route the query to a tree, pick branches by
+    /// centroid similarity, search their dialog sub-clusters; expand via
+    /// mycelium 1-hop when weak. The mycelium hop is the long-tail reach: an
+    /// answer may live in a topically-related domain.
+    fn retrieve_via_forest(&self, prompt: &[u8], min_sim: f32) -> Option<(Vec<u8>, f32)> {
+        if self.forest.n_trees() == 0 || self.dialog_hvs.is_empty() { return None; }
+        let query = encode_prompt_hv(prompt);
+        let initial = blab::gravity_forest::Forest::hv_to_position(&query);
+        let tree_idx = self.forest.nearest_tree(initial)?;
+        let mut tree_set: Vec<usize> = vec![tree_idx];
+        for (nbr, _w) in self.forest.mycelium_neighbors(tree_idx).into_iter().take(3) {
+            tree_set.push(nbr);
+        }
+        let mut best: Option<(Vec<u8>, f32)> = None;
+        for &ti in &tree_set {
+            let tree = match self.forest.trees.get(ti) { Some(t) => t, None => continue };
+            for branch in &tree.branches {
+                // skip branches whose centroid is clearly off-topic
+                if hv_similarity(&query, &branch.centroid) < 0.42 { continue; }
+                for &didx in &branch.sub_indices {
+                    if didx >= self.dialog_hvs.len() { continue; }
+                    let sim = hv_similarity(&query, &self.dialog_hvs[didx]);
+                    if sim >= min_sim
+                        && best.as_ref().map(|(_, s)| sim > *s).unwrap_or(true) {
+                        best = Some((self.dialog_pairs[didx].1.clone(), sim));
+                    }
+                }
+            }
+        }
+        best
+    }
+
     /// MoE Fase 1: build 10 static experts via keyword-based domain assignment.
     /// Each expert's centroid = mean HV of dialogs whose prompt contains keywords.
     /// Called after rebuild_dialog_hvs in load().
@@ -1535,7 +1630,10 @@ impl Brain {
         println!("  Gravity forest: {} trees planted in 3D terrain ({}³ grid)",
             self.forest.n_trees(), blab::gravity_forest::GRID);
 
-        // Grow branches per tree — split dialogs into 4 chunks per expert
+        // Grow branches per tree — split dialogs into 4 chunks per expert.
+        // Two passes so centroid_hv (&self) and grow_branch (&mut forest)
+        // don't overlap-borrow self inside one loop.
+        let mut branch_specs: Vec<(usize, String, Vec<usize>, u64)> = Vec::new();
         for (tree_idx, expert) in self.experts.iter().enumerate() {
             if expert.dialog_indices.len() < 8 { continue; }
             let chunk_size = (expert.dialog_indices.len() / 4).max(2);
@@ -1546,15 +1644,19 @@ impl Brain {
                 let sub: Vec<usize> = expert.dialog_indices[start..end].to_vec();
                 let label = format!("{}.{}", expert.name, branch_i);
                 let seed = (tree_idx as u64) * 1000 + branch_i as u64 + 7;
-                self.forest.grow_branch(tree_idx, label, sub, seed);
+                branch_specs.push((tree_idx, label, sub, seed));
             }
         }
+        for (tree_idx, label, sub, seed) in branch_specs {
+            let centroid = self.centroid_hv(&sub);
+            self.forest.grow_branch(tree_idx, label, sub, seed, centroid);
+        }
         let total_branches: usize = self.forest.trees.iter().map(|t| t.branches.len()).sum();
-        println!("  Branches grown: {} total B-spline curves", total_branches);
+        println!("  Branches grown: {} (each with HV centroid)", total_branches);
 
-        // Build mycelium from tree proximity
-        self.forest.auto_build_mycelium(0.35);
-        println!("  Mycelium edges: {} (threshold 0.35)", self.forest.mycelium.len());
+        // Build mycelium as a semantic co-occurrence graph (not 3D proximity)
+        self.build_mycelium_cooccurrence();
+        println!("  Mycelium edges: {} (semantic co-occurrence)", self.forest.mycelium.len());
 
         // ── Init Curator (dual-brain fast router) ──
         let curator_path = "data/curator.bin";
@@ -2575,17 +2677,22 @@ impl Brain {
             // Match if entity word in prompt
             if words.iter().any(|w| w.len() >= 4 && e_lc.contains(w)) {
                 let v_short: String = v.chars().take(80).collect();
+                // Skip poisoned triples — a garbled hint makes Qwen echo the
+                // garbage instead of answering (unicode-escape / reasoning leak).
+                if looks_like_leaked_reasoning(&v_short) { continue; }
                 parts.push(format!("{} {} = {}", e, r, v_short));
                 found_triples += 1;
             }
         }
 
-        // 2. Top dialog match (1 only, for hint)
+        // 2. Top dialog match (1 only, for hint) — only if clean.
         let candidates = self.retrieve_dialog(prompt, 1);
         if let Some((resp, sim)) = candidates.first() {
             if *sim > 0.3 {
                 let s = String::from_utf8_lossy(resp).chars().take(120).collect::<String>();
-                parts.push(format!("Hint: {}", s));
+                if !looks_like_leaked_reasoning(&s) {
+                    parts.push(format!("Hint: {}", s));
+                }
             }
         }
 
@@ -2603,6 +2710,16 @@ impl Brain {
 
         // TIER 3.4: MoE routing — top-2 expert dialog subset (faster than full HDC)
         if let Some((resp, sim, _expert_name)) = self.retrieve_dialog_moe(prompt, 1, 0.6) {
+            let conf = (0.5 + (sim - 0.6) * 1.0).min(0.92).max(0.5);
+            if conf >= 0.65 {
+                return (Some(resp), conf);
+            }
+        }
+
+        // TIER 3.45: Forest retrieval — gravity tree → branch (2-level index)
+        // → dialog, with mycelium 1-hop expansion into related domains.
+        // Reaches long-tail answers that flat top-3 MoE would miss.
+        if let Some((resp, sim)) = self.retrieve_via_forest(prompt, 0.6) {
             let conf = (0.5 + (sim - 0.6) * 1.0).min(0.92).max(0.5);
             if conf >= 0.65 {
                 return (Some(resp), conf);
@@ -3827,6 +3944,138 @@ fn qwen_pool() -> &'static Vec<(u16, Mutex<()>)> {
     })
 }
 
+// ── ENGINE SUPERVISOR (A-LEAN: brain owns the engine subprocess) ──────────
+// One launch command brings up both: the brain spawns + supervises the
+// iara-engine process. Single lifecycle, single artifact logically.
+static ENGINE_CHILD: std::sync::OnceLock<Mutex<Option<std::process::Child>>> =
+    std::sync::OnceLock::new();
+
+/// GET /health on a Qwen engine port — true if it answers with a status line.
+fn engine_health(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let mut s = match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+        Ok(s) => s, Err(_) => return false,
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(4)));
+    if s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    buf.contains("\"status\"")
+}
+
+/// Engine's currently-loaded model name (empty/"none" if unloaded).
+fn engine_model(port: u16) -> String {
+    use std::io::{Read, Write};
+    let mut s = match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+        Ok(s) => s, Err(_) => return String::new(),
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(4)));
+    let _ = s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    // crude: find "model":"..."
+    if let Some(i) = buf.find("\"model\"") {
+        let rest = &buf[i + 7..];
+        if let Some(a) = rest.find('"') {
+            if let Some(b) = rest[a + 1..].find('"') {
+                return rest[a + 1..a + 1 + b].to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Spawn + supervise the iara-engine subprocess so a single `serve` command
+/// brings up the whole stack. Skipped if the engine is already up, or if
+/// IARA_NO_ENGINE_SPAWN=1. Engine is killed on brain Ctrl-C.
+fn supervise_engine() {
+    if std::env::var("IARA_NO_ENGINE_SPAWN").as_deref() == Ok("1") {
+        println!("▸ Engine supervisor desativado (IARA_NO_ENGINE_SPAWN=1)");
+        return;
+    }
+    let port = qwen_pool()[0].0;
+    if engine_health(port) {
+        println!("▸ Engine já ativo em :{} — supervisor não spawna", port);
+        return;
+    }
+    let lab = std::env::var("IARA_LLM_LAB")
+        .unwrap_or_else(|_| "/home/leonardo/projects/LLM/llm-lab".into());
+    let bin = std::env::var("IARA_ENGINE_BIN")
+        .unwrap_or_else(|_| format!("{}/target/release/iara-engine", lab));
+    let models = std::env::var("IARA_ENGINE_MODELS")
+        .unwrap_or_else(|_| format!("{}/models", lab));
+    if !std::path::Path::new(&bin).exists() {
+        eprintln!("⚠ engine bin ausente: {} — brain segue, escapes vão falhar", bin);
+        return;
+    }
+    let model = std::env::var("IARA_ENGINE_MODEL").unwrap_or_else(|_| "qwen3-4b".into());
+    let ld = format!("{}/vendor/llama-cpp/lib:/opt/rocm-7.2.1/lib", lab);
+    println!("▸ Supervisor: subindo engine ({}) em :{}", bin, port);
+    let child = std::process::Command::new(&bin)
+        .arg(&models)
+        .env("IARA_HTTP_PORT", port.to_string())
+        .env("IARA_WS_DISABLE", "1")
+        .env("LD_LIBRARY_PATH", ld)
+        .env("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+        .env("ROCR_VISIBLE_DEVICES", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match child {
+        Ok(c) => {
+            ENGINE_CHILD.get_or_init(|| Mutex::new(None))
+                .lock().unwrap().replace(c);
+        }
+        Err(e) => { eprintln!("⚠ falha ao spawnar engine: {}", e); return; }
+    }
+    // wait for /health
+    let mut up = false;
+    for _ in 0..60 {
+        if engine_health(port) { up = true; break; }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    if !up { eprintln!("⚠ engine não respondeu /health a tempo"); return; }
+    // load model if none
+    let cur = engine_model(port);
+    if cur.is_empty() || cur == "none" {
+        println!("▸ Supervisor: carregando modelo '{}' no engine", model);
+        use std::io::Write;
+        if let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{}", port)) {
+            let body = format!("{{\"name\":\"{}\"}}", model);
+            let req = format!("POST /api/load-model HTTP/1.1\r\nHost: localhost\r\n\
+                Content-Type: application/json\r\nContent-Length: {}\r\n\
+                Connection: close\r\n\r\n{}", body.len(), body);
+            let _ = s.write_all(req.as_bytes());
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+        }
+        // wait until model_loading=false
+        for _ in 0..90 {
+            let m = engine_model(port);
+            if !m.is_empty() && m != "none" { break; }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+    println!("▸ Supervisor: engine pronto em :{} (modelo: {})", port, engine_model(port));
+}
+
+/// Kill the supervised engine subprocess, if any. (Kept for an eventual
+/// /shutdown endpoint; engine is normally reused across brain restarts.)
+#[allow(dead_code)]
+fn kill_supervised_engine() {
+    if let Some(lock) = ENGINE_CHILD.get() {
+        if let Some(mut child) = lock.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            println!("▸ Supervisor: engine encerrado");
+        }
+    }
+}
+
 /// Pega próxima porta livre (round-robin) e segura o lock dela.
 /// Retorna (port, guard). Guard mantém serialização da porta específica.
 fn acquire_qwen_port() -> Option<(u16, std::sync::MutexGuard<'static, ()>)> {
@@ -4026,6 +4275,7 @@ fn handle_client(
         format!("{{\"response\":{},\"prompt\":{},\"source\":\"iara-native\",\"ms\":{}}}",
             json_escape(&s), json_escape(&prompt), dt_ms)
     } else if method == "POST" && (path == "/chat" || path == "/gen") {
+        let t0 = std::time::Instant::now();  // e2e trace latency
         // Parse simple JSON {"prompt":"...","max":N,"temp":F}
         let body_s = String::from_utf8_lossy(&body).to_string();
         let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
@@ -4079,7 +4329,9 @@ fn handle_client(
         //  conf  < 0.45 → Qwen com brain hints + RAG (Qwen liderança)
         let (bytes, source) = if !starts_narrative && path != "/gen" {
             let (brain_resp, conf) = g.respond_with_confidence(prompt.as_bytes());
-            let rag = g.build_rag_context(prompt.as_bytes());
+            // No RAG context to Qwen escapes: the brain's degraded dialog hints
+            // confuse Qwen3 ("Contexto: Hint: <a question>" → Qwen answers two
+            // questions). A clean escape (pure question) is far more reliable.
             drop(g);
 
             // Quality check: detecta resposta degenerada (loop, repetição) → escalate
@@ -4089,6 +4341,10 @@ fn handle_client(
             });
             let degenerate = brain_resp.as_ref().map(|b| {
                 let s = String::from_utf8_lossy(b);
+                // Code legitimately repeats tokens (`}`, `;`, CSS props, tags) —
+                // dedup_repeats then misfires and flags valid cached code as a
+                // loop. Skip the degenerate check when the response is code.
+                if looks_like_code(&s) { return false; }
                 let cleaned = brain_resp_clean.as_ref().map(|x| x.len()).unwrap_or(s.len());
                 // Se dedup reduziu mais de 40%, era loop
                 s.len() > 0 && cleaned * 100 / s.len().max(1) < 60
@@ -4105,19 +4361,32 @@ fn handle_client(
             if degenerate || leaked_reasoning {
                 // Brain response looping/repeating OR leaked reasoning → clean Qwen.
                 let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    if rag.is_empty() { None } else { Some(&rag) });
+                    None);
                 let tag = if leaked_reasoning { "qwen-reasoning-escape" } else { "qwen-degen-escape" };
                 match qwen_resp {
                     Some(r) if r.trim().len() > 20 => (r.into_bytes(), tag),
                     _ => (brain_resp_clean.unwrap_or_default().into_bytes(), "brain-deduped"),
                 }
-            } else if conf >= 0.65 && brain_resp.is_some() {
-                // High confidence → brain instant (lowered 0.85→0.65 para cache real)
+            } else if conf >= 0.65 && brain_resp.is_some()
+                && answer_addresses_question(&prompt, &String::from_utf8_lossy(brain_resp.as_ref().unwrap())) {
+                // High confidence + answer mentions the question's key term → brain instant.
+                // The key-term check catches HDC similarity collisions: "maior deserto do
+                // mundo" hashes close to a cached "maior lago do mundo" dialog; without
+                // this guard the brain returns the lake answer.
                 (brain_resp.unwrap(), "brain-hi")
+            } else if conf >= 0.65 && brain_resp.is_some() {
+                // High HDC similarity but answer misses the question's key term →
+                // cache collision. Escalate to a clean Qwen answer.
+                let qwen_resp = qwen3_chat(&prompt, max as usize,
+                    None);
+                match qwen_resp {
+                    Some(r) if r.trim().len() > 20 => (r.into_bytes(), "qwen-collision-escape"),
+                    _ => (brain_resp.unwrap(), "brain-hi-risky"),
+                }
             } else if conf >= 0.30 && brain_resp.is_some() {
                 // Mid confidence → try Qwen with RAG, blend or pick best
                 let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    if rag.is_empty() { None } else { Some(&rag) });
+                    None);
                 match qwen_resp {
                     Some(r) if r.trim().len() > 20 => {
                         // Qwen produced — use Qwen (richer)
@@ -4128,7 +4397,7 @@ fn handle_client(
             } else {
                 // Low confidence → Qwen primary com brain RAG
                 let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    if rag.is_empty() { None } else { Some(&rag) });
+                    None);
                 match qwen_resp {
                     Some(r) if !r.trim().is_empty() => (r.into_bytes(), "qwen-primary"),
                     _ => {
@@ -4156,6 +4425,8 @@ fn handle_client(
             // Dedup tokens repetidos consecutivamente (palavra ou frase curta)
             // Detecta loops como "X, Y, X, Y, X, Y..." e trunca
             t = dedup_repeats(&t);
+            // Repair any stray unicode escape before it reaches the user.
+            t = repair_unicode_escapes(&t);
             t.trim().to_string()
         };
 
@@ -4194,9 +4465,30 @@ fn handle_client(
             g_obs.curator_observe(prompt.as_bytes(), best_expert, qwen_called);
         }
 
+        // ── E2E TRACE (A-LEAN: one structured line per request) ──
+        // trace_id = FNV hash of the prompt — correlates this request's
+        // journey: brain routing → tier → escape?(engine) → answer.
+        {
+            let escaped = source.starts_with("qwen-");
+            let line = format!(
+                "{{\"trace_id\":\"{:016x}\",\"ts\":{},\"latency_ms\":{},\
+                 \"prompt\":{},\"source\":{},\"escaped\":{},\"engine_port\":{},\
+                 \"curator_conf\":{:.3},\"answer_len\":{}}}\n",
+                h, wal::now_ts(), t0.elapsed().as_millis(),
+                json_escape(&prompt.chars().take(120).collect::<String>()),
+                json_escape(source), escaped,
+                if escaped { qwen_pool()[0].0 } else { 0 },
+                curator_out.confidence, s.len());
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                .open("data/e2e_trace.jsonl") {
+                use std::io::Write;
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+
         // Include curator metrics in response for UI feedback
-        format!("{{\"response\":{},\"prompt\":{},\"source\":{},\"curator\":{{\"top_expert\":{},\"confidence\":{:.3},\"need_qwen\":{:.3}}},\"adaptive_T\":{:.3}}}",
-            json_escape(&s), json_escape(&prompt), json_escape(source),
+        format!("{{\"response\":{},\"prompt\":{},\"source\":{},\"trace_id\":\"{:016x}\",\"curator\":{{\"top_expert\":{},\"confidence\":{:.3},\"need_qwen\":{:.3}}},\"adaptive_T\":{:.3}}}",
+            json_escape(&s), json_escape(&prompt), json_escape(source), h,
             curator_out.top_expert, curator_out.confidence, curator_out.need_qwen,
             _adaptive_t)
     } else if method == "GET" && path == "/stats" {
@@ -4208,6 +4500,18 @@ fn handle_client(
                 g.bigram.iter().filter(|&&c| c > 0).count(),
                 g.dialog_pairs.len(),
                 g.triples.len())
+    } else if method == "GET" && path == "/trace_e2e" {
+        // End-to-end trace: last requests, each with trace_id + routing path.
+        match fs::read_to_string("data/e2e_trace.jsonl") {
+            Ok(text) => {
+                let lines: Vec<&str> = text.lines()
+                    .filter(|l| !l.trim().is_empty()).collect();
+                let tail: Vec<&str> = lines.iter().rev().take(60).rev().cloned().collect();
+                format!("{{\"count\":{},\"recent\":[{}]}}",
+                    lines.len(), tail.join(","))
+            }
+            _ => "{\"count\":0,\"recent\":[]}".to_string()
+        }
     } else if method == "POST" && path == "/learn" {
         // Ingest auto_learn.txt em runtime — brain absorve novos pares
         let path_learn = "data/auto_learn.txt";
@@ -4235,6 +4539,94 @@ fn handle_client(
                     json_escape(&hist_path))
             }
             _ => "{\"learned\":false,\"reason\":\"no auto_learn.txt or empty\"}".to_string()
+        }
+    } else if method == "POST" && path == "/learn_triples" {
+        // Bulk-import a distilled knowledge graph: data/kg_triples.txt with
+        // one "entity|relation|value" per line. Grows the long-tail KG store.
+        let path_kg = "data/kg_triples.txt";
+        match fs::read_to_string(path_kg) {
+            Ok(text) if !text.is_empty() => {
+                let mut g = brain.lock().unwrap();
+                let before = g.triples.len();
+                let mut imported = 0usize;
+                let mut bad = 0usize;
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') { continue; }
+                    let parts: Vec<&str> = line.splitn(3, '|').collect();
+                    if parts.len() != 3 { bad += 1; continue; }
+                    let e = parts[0].trim().to_string();
+                    let r = parts[1].trim().to_string();
+                    let v = parts[2].trim().to_string();
+                    if e.is_empty() || r.is_empty() || v.len() < 2 || v.len() > 250 {
+                        bad += 1; continue;
+                    }
+                    if looks_like_leaked_reasoning(&v) || looks_like_leaked_reasoning(&e) {
+                        bad += 1; continue;
+                    }
+                    {
+                        let entry = g.triples.entry((e.clone(), r.clone()))
+                            .or_insert_with(|| v.clone());
+                        // longer (more informative) value wins, within bounds
+                        if v.len() > entry.len() && v.len() < 250 { *entry = v.clone(); }
+                    }
+                    g.reverse_triples.entry(v).or_insert_with(Vec::new)
+                        .push((e, r));
+                    imported += 1;
+                }
+                let after = g.triples.len();
+                drop(g);
+                let hist = format!("data/kg_triples_history_{}.txt",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0));
+                let _ = fs::rename(path_kg, &hist);
+                format!("{{\"learned\":true,\"lines\":{},\"new_triples\":{},\"rejected\":{}}}",
+                    imported, after - before, bad)
+            }
+            _ => "{\"learned\":false,\"reason\":\"no kg_triples.txt or empty\"}".to_string()
+        }
+    } else if method == "POST" && path == "/learn_code" {
+        // Bulk-import a code corpus: data/code_corpus.txt, entries separated by
+        // "===PAIR===", each "<request>\n---CODE---\n<code>". Code is too long
+        // for the 1500-byte dialog cap, so this path allows up to 8000 bytes.
+        let path_code = "data/code_corpus.txt";
+        match fs::read_to_string(path_code) {
+            Ok(text) if !text.is_empty() => {
+                let mut g = brain.lock().unwrap();
+                let before = g.dialog_pairs.len();
+                let mut imported = 0usize;
+                let mut bad = 0usize;
+                for chunk in text.split("===PAIR===") {
+                    let chunk = chunk.trim();
+                    if chunk.is_empty() { continue; }
+                    let parts: Vec<&str> = chunk.splitn(2, "---CODE---").collect();
+                    if parts.len() != 2 { bad += 1; continue; }
+                    let req = parts[0].trim();
+                    let code = parts[1].trim();
+                    if req.len() < 6 || code.len() < 10 || code.len() > 8000 {
+                        bad += 1; continue;
+                    }
+                    if looks_like_leaked_reasoning(req) {
+                        bad += 1; continue;
+                    }
+                    g.dialog_pairs.push((req.as_bytes().to_vec(),
+                                         code.as_bytes().to_vec()));
+                    imported += 1;
+                }
+                let after = g.dialog_pairs.len();
+                // new pairs → HV index + experts must be rebuilt
+                g.dialog_hvs.clear();
+                g.rebuild_dialog_hvs();
+                g.build_static_experts();
+                drop(g);
+                let hist = format!("data/code_corpus_history_{}.txt",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0));
+                let _ = fs::rename(path_code, &hist);
+                format!("{{\"learned\":true,\"new_pairs\":{},\"rejected\":{},\"total_dialogs\":{}}}",
+                    imported, bad, after)
+            }
+            _ => "{\"learned\":false,\"reason\":\"no code_corpus.txt or empty\"}".to_string()
         }
     } else if method == "GET" && path == "/persona" {
         // Return user persona stats (built from chat history)
@@ -6067,6 +6459,44 @@ updThermo();
             }
             Err(e) => format!("{{\"saved\":false,\"error\":{}}}", json_escape(&e.to_string()))
         }
+    } else if method == "POST" && path == "/purge_noise" {
+        // Remove noisy dialog pairs: leaked reasoning, unicode-escape pollution,
+        // exact duplicates, and degenerate/too-short entries. Self-cleaning so the
+        // brain shrinks back toward signal after a noisy auto-learn batch.
+        let mut g = brain.lock().unwrap();
+        let before = g.dialog_pairs.len();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut removed_reason = 0usize;
+        let mut removed_dup = 0usize;
+        let mut removed_short = 0usize;
+        g.dialog_pairs.retain(|(u, m)| {
+            let us = String::from_utf8_lossy(u);
+            let ms = String::from_utf8_lossy(m);
+            if looks_like_leaked_reasoning(&us) || looks_like_leaked_reasoning(&ms) {
+                removed_reason += 1;
+                return false;
+            }
+            if m.len() < 12 || u.len() < 4 {
+                removed_short += 1;
+                return false;
+            }
+            // Dedup by (lowercased user prompt) — keep first occurrence.
+            let key = u.to_ascii_lowercase();
+            if !seen.insert(key) {
+                removed_dup += 1;
+                return false;
+            }
+            true
+        });
+        let after = g.dialog_pairs.len();
+        // dialog_pairs shrank → HV index + expert subsets now hold stale indices.
+        g.dialog_hvs.clear();
+        g.rebuild_dialog_hvs();
+        g.build_static_experts();
+        drop(g);
+        format!("{{\"purged\":true,\"before\":{},\"after\":{},\"removed_reasoning\":{},\
+                 \"removed_dup\":{},\"removed_short\":{}}}",
+            before, after, removed_reason, removed_dup, removed_short)
     } else if method == "GET" && path == "/loop" {
         // Unified loop status: curiosity + autolearn + checkpoint
         use std::sync::atomic::Ordering;
@@ -6144,7 +6574,115 @@ fn looks_like_leaked_reasoning(s: &str) -> bool {
        || lc.contains("parece ser um erro de digit") {
         return true;
     }
+
+    // Meta-comment dodge: a cached answer that quotes the question back and
+    // refuses to answer ("A pergunta '...' está relacionada a...", "...parece
+    // ter um erro", "Nome do Processo pelo qual..."). Useless as a response —
+    // purge it and escape at runtime, same as reasoning leaks.
+    if lc.starts_with("a pergunta ") || lc.starts_with("nome do processo ")
+       || lc.starts_with("explicação:") || lc.starts_with("explicacao:") {
+        return true;
+    }
+    const DODGE: &[&str] = &[
+        "está relacionada a uma", "esta relacionada a uma",
+        "parece ter um erro", "parece estar incompleta",
+        "não está clara", "nao esta clara", "não é clara", "nao e clara",
+        "refere-se a uma pergunta", "parece estar mal formulada",
+        "parece haver um erro", "não faz sentido", "nao faz sentido",
+    ];
+    if DODGE.iter().any(|d| lc.contains(d)) {
+        return true;
+    }
     false
+}
+
+/// Verifica se a resposta de fato endereça a pergunta — guard contra
+/// colisões de similaridade HDC.
+///
+/// O encoding byte-level HDC casa "qual o maior deserto do mundo" com um
+/// dialog cacheado de "qual o maior lago do mundo" (estrutura quase idêntica,
+/// difere só no substantivo-chave). Esta função extrai os termos de conteúdo
+/// longos da pergunta e exige que ao menos um apareça na resposta.
+///
+/// Perguntas sem termo longo (ex: matemática "3/4 + 5/6") passam direto —
+/// não dá pra checar overlap lexical nesses casos.
+fn answer_addresses_question(question: &str, answer: &str) -> bool {
+    const STOP: &[&str] = &[
+        "qual", "quais", "quem", "como", "onde", "quando", "porque", "porquê",
+        "que", "para", "pela", "pelo", "sobre", "nome", "termos", "mundo",
+        "principais", "primeiro", "primeira", "maior", "menor", "entre",
+        "função", "funções", "valor", "exemplo", "tipos", "criar",
+        "esse", "essa", "isso", "qual", "tem", "uma", "seu", "sua",
+        "pode", "deve", "anos", "cite", "diga", "fale", "liste", "será",
+    ];
+    let q_lc = question.to_lowercase();
+    let a_lc = answer.to_lowercase();
+    // Termos de conteúdo: ≥4 letras, não-stopword, alfabéticos.
+    // ≥4 (não ≥5) pra capturar nomes próprios curtos ("mona","lisa","paris").
+    let key_terms: Vec<&str> = q_lc
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| w.chars().count() >= 4 && !STOP.contains(w))
+        .collect();
+    if key_terms.is_empty() {
+        return true; // sem termo discriminante — não dá pra checar
+    }
+    // Pelo menos um termo-chave deve aparecer. Stemming leve via raiz de 4
+    // letras: "pintou"→"pint" casa "pintada"; evita falso-escape por flexão.
+    key_terms.iter().any(|t| {
+        let root: String = t.chars().take(4).collect();
+        a_lc.contains(t) || a_lc.contains(&root)
+    })
+}
+
+/// Repair literal unicode escapes that leaked into cached text — turns
+/// "estau00e7u00f5es" back into "estações". Scoped to the latin-1 accented
+/// range (U+00C0..U+00FF) so it never mangles ordinary text. Last-line
+/// safety net so a stray escape never reaches the user.
+/// True if the text looks like source code (markdown fence, code keywords,
+/// or high brace/semicolon density). Code repeats tokens legitimately, so the
+/// loop/degenerate detector must not fire on it.
+fn looks_like_code(s: &str) -> bool {
+    if s.contains("```") { return true; }
+    let lc = s.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "function ", "const ", "let ", "<!doctype", "<html", "<div", "<body",
+        "def ", "class ", "import ", "return ", "</", "=>", "addeventlistener",
+        "console.log", "document.", "{\n", "()", "px;", "margin:", "padding:",
+    ];
+    let hits = MARKERS.iter().filter(|m| lc.contains(*m)).count();
+    if hits >= 2 { return true; }
+    let code_chars = s.chars().filter(|&c| c == '{' || c == '}' || c == ';').count();
+    s.len() > 40 && code_chars * 100 / s.len().max(1) > 4
+}
+
+fn repair_unicode_escapes(s: &str) -> String {
+    if !s.contains("u00") {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // pattern: 'u' '0' '0' hex hex  with hex high nibble in c..f
+        if i + 5 <= bytes.len() && bytes[i] == b'u' && bytes[i+1] == b'0'
+            && bytes[i+2] == b'0' {
+            let h = (bytes[i+3] as char).to_ascii_lowercase();
+            let l = (bytes[i+4] as char).to_ascii_lowercase();
+            if matches!(h, 'c'..='f') && l.is_ascii_hexdigit() {
+                let code = u32::from_str_radix(&s[i+1..i+5], 16).unwrap_or(0);
+                if let Some(ch) = char::from_u32(code) {
+                    out.push(ch);
+                    i += 5;
+                    continue;
+                }
+            }
+        }
+        // advance one UTF-8 char
+        let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&s[i..i+ch_len]);
+        i += ch_len;
+    }
+    out
 }
 
 /// Detecta repetições em texto de resposta e trunca antes do loop.
@@ -6218,8 +6756,41 @@ fn extract_json_str(body: &str, key: &str) -> Option<String> {
     let mut iter = after[1..].chars().peekable();
     while let Some(c) = iter.next() {
         if c == '\\' {
-            if let Some(&nx) = iter.peek() { iter.next();
-                match nx { 'n'=>s.push('\n'),'t'=>s.push('\t'),'"'=>s.push('"'),'\\'=>s.push('\\'),o=>s.push(o) }
+            if let Some(nx) = iter.next() {
+                match nx {
+                    'n' => s.push('\n'),
+                    't' => s.push('\t'),
+                    'r' => s.push('\r'),
+                    'b' => s.push('\u{0008}'),
+                    'f' => s.push('\u{000C}'),
+                    '/' => s.push('/'),
+                    '"' => s.push('"'),
+                    '\\' => s.push('\\'),
+                    // \uXXXX — Python's json.dumps escapes every non-ASCII char
+                    // this way. Decoding it is mandatory or accented prompts
+                    // arrive as literal "u00e9" garbage and poison the brain.
+                    'u' => {
+                        let hex: String = (0..4).filter_map(|_| iter.next()).collect();
+                        if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                            if (0xD800..0xDC00).contains(&cp) {
+                                // high surrogate — consume the paired \uXXXX low
+                                let lo = if iter.peek() == Some(&'\\') {
+                                    iter.next();
+                                    if iter.peek() == Some(&'u') { iter.next(); }
+                                    let h2: String = (0..4).filter_map(|_| iter.next()).collect();
+                                    u32::from_str_radix(&h2, 16).ok()
+                                } else { None };
+                                if let Some(lo) = lo {
+                                    let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    if let Some(ch) = char::from_u32(c) { s.push(ch); }
+                                }
+                            } else if let Some(ch) = char::from_u32(cp) {
+                                s.push(ch);
+                            }
+                        }
+                    }
+                    o => s.push(o),
+                }
             }
         } else if c == '"' { break; } else { s.push(c); }
     }
@@ -6421,6 +6992,9 @@ fn essence_test(brain: &Brain) {
 }
 
 fn serve(brain: Brain) -> std::io::Result<()> {
+    // A-LEAN: brain owns the engine. One `serve` command brings up the whole
+    // stack. A leaked engine across brain restarts is fine — it gets reused.
+    supervise_engine();
     // Bind 0.0.0.0 → LAN accessible (celular, outros devices na mesma rede).
     // Use 127.0.0.1 só se IARA_BIND_LOCAL=1.
     let bind_addr = if std::env::var("IARA_BIND_LOCAL").ok().as_deref() == Some("1") {

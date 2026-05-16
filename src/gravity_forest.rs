@@ -54,6 +54,10 @@ pub struct Branch {
     pub control_points: [Vec3; 4],
     /// Sub-topic signature (subset of dialogs)
     pub sub_indices: Vec<usize>,
+    /// Bitwise-majority HV centroid of this branch's dialogs (1024-bit).
+    /// Lets retrieval pick the right branch before scanning sub_indices —
+    /// a 2-level index (tree → branch → dialog) instead of a flat scan.
+    pub centroid: [u64; 16],
 }
 
 impl Branch {
@@ -139,7 +143,10 @@ impl Forest {
 
     /// Grow a B-spline branch on tree `tree_idx`. Control points are randomly
     /// distributed around the tree position (deterministic via seed).
-    pub fn grow_branch(&mut self, tree_idx: usize, label: String, sub_indices: Vec<usize>, seed: u64) {
+    /// `centroid` is the HV centroid of the branch's dialogs (computed by the
+    /// caller, which owns the dialog HVs) — used for 2-level retrieval.
+    pub fn grow_branch(&mut self, tree_idx: usize, label: String, sub_indices: Vec<usize>,
+                       seed: u64, centroid: [u64; 16]) {
         if tree_idx >= self.trees.len() { return; }
         let pos = self.trees[tree_idx].position;
         let mut state = seed;
@@ -162,7 +169,7 @@ impl Forest {
             );
         }
         self.trees[tree_idx].branches.push(Branch {
-            label, control_points: cps, sub_indices,
+            label, control_points: cps, sub_indices, centroid,
         });
     }
 
@@ -438,6 +445,7 @@ mod tests {
                 Vec3::new(0.0, 1.0, 0.0),
             ],
             sub_indices: vec![],
+            centroid: [0u64; 16],
         };
         // B-spline cubic eval at t=0.5 should be inside convex hull
         let mid = b.eval(0.5);
