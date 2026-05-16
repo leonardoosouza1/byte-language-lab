@@ -3780,6 +3780,22 @@ impl Brain {
         if std::path::Path::new("data/byte_tension_entropy_qwen.bin").exists() {
             brain.load_qwen_tension_entropy("data/byte_tension_entropy_qwen.bin").ok();
         }
+        // Purge poisoned dialog pairs from older checkpoints: leaked English
+        // reasoning preambles + unicode-escape-literal corruption (estau00e7u00f5es).
+        // These came from the legacy qwen_call path before qwen3_chat existed.
+        {
+            let before = brain.dialog_pairs.len();
+            brain.dialog_pairs.retain(|(u, m)| {
+                let us = String::from_utf8_lossy(u);
+                let ms = String::from_utf8_lossy(m);
+                !looks_like_leaked_reasoning(&us) && !looks_like_leaked_reasoning(&ms)
+            });
+            let purged = before - brain.dialog_pairs.len();
+            if purged > 0 {
+                println!("  🧹 purged {} poisoned dialog pairs (reasoning/unicode leak)", purged);
+            }
+        }
+
         // Rebuild HDC dialog index (not serialized — derive from dialog_pairs)
         brain.rebuild_dialog_hvs();
         println!("  HDC dialog index built: {} HVs", brain.dialog_hvs.len());
@@ -3892,6 +3908,52 @@ fn qwen3_classify(user_msg: &str, max_tokens: usize) -> Option<String> {
     );
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok()?;
+    let req = format!(
+        "POST /api/generate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    use std::io::Write;
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 { break; }
+        let t = line.trim();
+        if let Some(v) = t.to_lowercase().strip_prefix("content-length: ") {
+            content_length = v.parse().unwrap_or(0);
+        }
+        if t.is_empty() { break; }
+    }
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf).ok()?;
+    let body_str = String::from_utf8_lossy(&buf).to_string();
+    extract_json_str(&body_str, "response").map(|s| s.trim().to_string())
+}
+
+/// Qwen3-4b answer generation with chat template + reasoning disabled.
+///
+/// Same `<think>\n\n</think>\n\n` trick as qwen3_classify, but tuned for free-form
+/// answers (higher max_tokens, temperature 0.4). This is the brain's fallback when
+/// confidence is low — replaces the legacy `qwen_call` whose `USER:/MODEL:` format
+/// made Qwen3 emit an English `<think>` reasoning preamble that leaked into replies.
+fn qwen3_chat(user_msg: &str, max_tokens: usize, context: Option<&str>) -> Option<String> {
+    let (port, _guard) = acquire_qwen_port()?;
+    let user_block = match context {
+        Some(ctx) if !ctx.is_empty() => format!("Contexto: {}\n\n{}", ctx, user_msg),
+        _ => user_msg.to_string(),
+    };
+    let final_prompt = format!(
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        user_block
+    );
+    let body = format!(
+        "{{\"model\":\"qwen3-4b-q4km\",\"prompt\":\"{}\",\"max_tokens\":{},\"temperature\":0.4}}",
+        final_prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+        max_tokens
+    );
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok()?;
     let req = format!(
         "POST /api/generate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body
@@ -4032,12 +4094,21 @@ fn handle_client(
                 s.len() > 0 && cleaned * 100 / s.len().max(1) < 60
             }).unwrap_or(false);
 
-            if degenerate {
-                // Brain response was looping/repeating → call Qwen direto
-                let qwen_resp = qwen_call(&prompt, max as usize,
+            // Quality check: detect leaked English reasoning preamble. Old qwen_call
+            // (USER:/MODEL: format) made Qwen3 emit "<think> Okay, the user is asking..."
+            // and those got cached as dialog_pairs in the WAL. Any brain_resp that
+            // looks like reasoning is rejected → fall through to a clean qwen3_chat.
+            let leaked_reasoning = brain_resp.as_ref().map(|b| {
+                looks_like_leaked_reasoning(&String::from_utf8_lossy(b))
+            }).unwrap_or(false);
+
+            if degenerate || leaked_reasoning {
+                // Brain response looping/repeating OR leaked reasoning → clean Qwen.
+                let qwen_resp = qwen3_chat(&prompt, max as usize,
                     if rag.is_empty() { None } else { Some(&rag) });
+                let tag = if leaked_reasoning { "qwen-reasoning-escape" } else { "qwen-degen-escape" };
                 match qwen_resp {
-                    Some(r) if r.trim().len() > 20 => (r.into_bytes(), "qwen-degen-escape"),
+                    Some(r) if r.trim().len() > 20 => (r.into_bytes(), tag),
                     _ => (brain_resp_clean.unwrap_or_default().into_bytes(), "brain-deduped"),
                 }
             } else if conf >= 0.65 && brain_resp.is_some() {
@@ -4045,7 +4116,7 @@ fn handle_client(
                 (brain_resp.unwrap(), "brain-hi")
             } else if conf >= 0.30 && brain_resp.is_some() {
                 // Mid confidence → try Qwen with RAG, blend or pick best
-                let qwen_resp = qwen_call(&prompt, max as usize,
+                let qwen_resp = qwen3_chat(&prompt, max as usize,
                     if rag.is_empty() { None } else { Some(&rag) });
                 match qwen_resp {
                     Some(r) if r.trim().len() > 20 => {
@@ -4056,7 +4127,7 @@ fn handle_client(
                 }
             } else {
                 // Low confidence → Qwen primary com brain RAG
-                let qwen_resp = qwen_call(&prompt, max as usize,
+                let qwen_resp = qwen3_chat(&prompt, max as usize,
                     if rag.is_empty() { None } else { Some(&rag) });
                 match qwen_resp {
                     Some(r) if !r.trim().is_empty() => (r.into_bytes(), "qwen-primary"),
@@ -4089,7 +4160,8 @@ fn handle_client(
         };
 
         // AUTO-LEARN: se Qwen respondeu, append WAL binário (replaces auto_learn.txt)
-        if source.starts_with("qwen-") && s.len() > 20 {
+        // Guard: nunca persistir resposta com reasoning EN vazado (envenenaria o WAL).
+        if source.starts_with("qwen-") && s.len() > 20 && !looks_like_leaked_reasoning(&s) {
             if let Ok(mut f) = wal::open_for_append(WAL_PATH) {
                 let _ = wal::append(&mut f, &wal::Record {
                     rtype: wal::TYPE_DIALOG,
@@ -6034,6 +6106,45 @@ updThermo();
     );
     stream.write_all(resp.as_bytes())?;
     Ok(())
+}
+
+/// Detecta resposta que vazou reasoning em inglês do Qwen3.
+///
+/// Quando o `qwen_call` antigo (formato USER:/MODEL:) era usado, o Qwen3
+/// gerava um preâmbulo de raciocínio tipo "Okay, the user is asking...".
+/// Esses textos foram cacheados como dialog_pairs no WAL. Esta função
+/// detecta o padrão pra que o respond path os rejeite e gere resposta limpa.
+fn looks_like_leaked_reasoning(s: &str) -> bool {
+    let lc = s.trim_start().to_lowercase();
+    // Marcadores de reasoning EN no início da resposta.
+    const MARKERS: &[&str] = &[
+        "okay, the user", "okay, so the user", "okay, let me", "okay, i need",
+        "the user is asking", "the user wants", "let me think", "let me recall",
+        "i need to explain", "i need to answer", "first, i", "first, let me",
+        "alright, the user", "so the user is", "the question is asking",
+    ];
+    for m in MARKERS {
+        if lc.starts_with(m) { return true; }
+    }
+    // Reasoning EN no meio: alta densidade de palavras inglesas de raciocínio.
+    let en_signals = ["the user", "let me", "i think", "i should", "i know that",
+                      "first,", "next,", "in portuguese"];
+    let hits = en_signals.iter().filter(|w| lc.contains(*w)).count();
+    if hits >= 2 { return true; }
+
+    // Unicode-escape pollution: respostas antigas vazaram escapes literais
+    // não-decodificados ("estau00e7u00f5es" em vez de "estações"). A resposta
+    // costuma ser meta-comentário ("parece digitação incorreta"). Detecta o
+    // padrão u00XX literal e o meta-comentário sobre typo.
+    if lc.contains("u00e7") || lc.contains("u00e3") || lc.contains("u00ed")
+       || lc.contains("u00e1") || lc.contains("u00f5") || lc.contains("u00e9") {
+        return true;
+    }
+    if lc.contains("digitação incorreta") || lc.contains("digit, incorreta")
+       || lc.contains("parece ser um erro de digit") {
+        return true;
+    }
+    false
 }
 
 /// Detecta repetições em texto de resposta e trunca antes do loop.
