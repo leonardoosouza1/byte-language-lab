@@ -2700,12 +2700,76 @@ impl Brain {
     }
 
     /// Returns (response, confidence) — confidence in [0,1].
+    /// N1 — analogical mutation generation. A code request that NEAR-matches a
+    /// cached code pair → retrieve it and TRANSFORM: substitute the words that
+    /// differ between query and cached query (identifiers + a small operator
+    /// map). Produces NEW code from a cached pattern — no LLM, no GPU, µs.
+    /// Returns None on exact match (let brain-hi serve raw) or non-code.
+    fn try_code_mutation(&self, prompt: &[u8]) -> Option<(Vec<u8>, f32)> {
+        let p_lc = String::from_utf8_lossy(prompt).to_lowercase();
+        const CODE_HINTS: &[&str] = &["função", "funcao", "classe", "javascript",
+            "código", "codigo", " html", " css", "react", "componente", " js "];
+        if !CODE_HINTS.iter().any(|h| p_lc.contains(h)) { return None; }
+        if self.dialog_pairs.is_empty() { return None; }
+
+        let split = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.chars().count() >= 3)
+                .map(|w| w.to_string()).collect()
+        };
+        let qw = split(&p_lc);
+        let qset: std::collections::HashSet<&String> = qw.iter().collect();
+
+        // nearest cached CODE dialog by query-word overlap (matches what the
+        // dialog retriever finds — an HV search picks a different neighbour).
+        let mut best_idx = usize::MAX;
+        let mut best_overlap = 0usize;
+        for (i, (u, m)) in self.dialog_pairs.iter().enumerate() {
+            let ans = String::from_utf8_lossy(m);
+            if !looks_like_code(&ans) { continue; }
+            let us = String::from_utf8_lossy(u).to_lowercase();
+            let overlap = split(&us).iter().filter(|w| qset.contains(*w)).count();
+            if overlap > best_overlap { best_overlap = overlap; best_idx = i; }
+        }
+        if best_idx == usize::MAX || best_overlap < 3 { return None; }
+        let (cached_u, cached_m) = &self.dialog_pairs[best_idx];
+        let answer = String::from_utf8_lossy(cached_m).to_string();
+
+        // word diff: which words the query added vs the cached query
+        let cached_q = String::from_utf8_lossy(cached_u).to_lowercase();
+        let cw = split(&cached_q);
+        let new_words: Vec<String> = qw.iter().filter(|w| !cw.contains(w)).cloned().collect();
+        let old_words: Vec<String> = cw.iter().filter(|w| !qw.contains(w)).cloned().collect();
+
+        // Only mutate the PROVABLY-CORRECT case: an operator swap. Find a verb
+        // pair (cached_verb, query_verb) both mapping to operators — then a
+        // rename + operator substitution yields a fully correct new function.
+        // Identifier-only diffs are skipped (rename can't fix logic).
+        let old_op = old_words.iter().find(|w| code_op(w).is_some())?;
+        let new_op = new_words.iter().find(|w| code_op(w).is_some())?;
+        if old_op == new_op { return None; }
+
+        let mut out = subst_word(&answer, old_op, new_op);     // function name
+        out = out.replace(&cap(old_op), &cap(new_op));         // camelCase
+        // operator swap — comment-safe (a blind replace corrupts `//`)
+        out = swap_op_safe(&out, code_op(old_op).unwrap(), code_op(new_op).unwrap());
+        if out == answer { return None; }
+        LAST_WAS_MUTATION.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some((out.into_bytes(), 0.72))
+    }
+
     fn respond_with_confidence(&self, prompt: &[u8]) -> (Option<Vec<u8>>, f32) {
+        LAST_WAS_MUTATION.store(false, std::sync::atomic::Ordering::Relaxed);
         let prompt_s = String::from_utf8_lossy(prompt).to_string();
 
         // TIER 4: KG compose (template + triple — most exact, highest confidence)
         if let Some(composed) = self.compose_answer(&prompt_s) {
             return (Some(composed.into_bytes()), 0.95);
+        }
+
+        // TIER 3.9: N1 — analogical mutation for near code variants
+        if let Some((mutated, conf)) = self.try_code_mutation(prompt) {
+            return (Some(mutated), conf);
         }
 
         // TIER 3.4: MoE routing — top-2 expert dialog subset (faster than full HDC)
@@ -4329,6 +4393,8 @@ fn handle_client(
         //  conf  < 0.45 → Qwen com brain hints + RAG (Qwen liderança)
         let (bytes, source) = if !starts_narrative && path != "/gen" {
             let (brain_resp, conf) = g.respond_with_confidence(prompt.as_bytes());
+            // N1: did respond_with_confidence answer via analogical mutation?
+            let was_mutation = LAST_WAS_MUTATION.load(std::sync::atomic::Ordering::Relaxed);
             // No RAG context to Qwen escapes: the brain's degraded dialog hints
             // confuse Qwen3 ("Contexto: Hint: <a question>" → Qwen answers two
             // questions). A clean escape (pure question) is far more reliable.
@@ -4373,7 +4439,7 @@ fn handle_client(
                 // The key-term check catches HDC similarity collisions: "maior deserto do
                 // mundo" hashes close to a cached "maior lago do mundo" dialog; without
                 // this guard the brain returns the lake answer.
-                (brain_resp.unwrap(), "brain-hi")
+                (brain_resp.unwrap(), if was_mutation { "brain-mutated" } else { "brain-hi" })
             } else if conf >= 0.65 && brain_resp.is_some() {
                 // High HDC similarity but answer misses the question's key term →
                 // cache collision. Escalate to a clean Qwen answer.
@@ -6653,6 +6719,78 @@ fn looks_like_code(s: &str) -> bool {
     if hits >= 2 { return true; }
     let code_chars = s.chars().filter(|&c| c == '{' || c == '}' || c == ';').count();
     s.len() > 40 && code_chars * 100 / s.len().max(1) > 4
+}
+
+// ── N1: analogical mutation generation helpers ────────────────────────────
+/// Set by try_code_mutation when it produces a mutated answer — lets the
+/// respond path tag the source "brain-mutated" instead of "brain-hi".
+static LAST_WAS_MUTATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Capitalize the first char (for camelCase identifier substitution).
+fn cap(w: &str) -> String {
+    let mut c = w.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Map a PT code verb to its operator — drives operator swap in mutation
+/// ("soma" cached, "multiplica" asked → swap `+` for `*`).
+fn code_op(w: &str) -> Option<&'static str> {
+    match w {
+        "soma" | "somar" | "adiciona" | "adicionar" | "adicao" => Some("+"),
+        "subtrai" | "subtrair" | "subtracao" | "diferenca" => Some("-"),
+        "multiplica" | "multiplicar" | "multiplicacao" | "produto" => Some("*"),
+        "divide" | "dividir" | "divisao" => Some("/"),
+        "resto" | "modulo" | "módulo" => Some("%"),
+        _ => None,
+    }
+}
+
+/// Swap an operator only in code (not inside `//` comments or after `//` on a
+/// line) — a blind `replace` would turn `//` into `%%`. First occurrence per
+/// line, in the code portion only.
+fn swap_op_safe(code: &str, old_op: &str, new_op: &str) -> String {
+    code.lines().map(|line| {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+            return line.to_string();
+        }
+        let (code_part, comment) = match line.find("//") {
+            Some(i) => (&line[..i], &line[i..]),
+            None => (line, ""),
+        };
+        format!("{}{}", code_part.replacen(old_op, new_op, 1), comment)
+    }).collect::<Vec<_>>().join("\n")
+}
+
+/// Whole-word, case-insensitive substitution (word boundary = non-identifier
+/// char). "soma"→"multiplica" hits `function soma` but not `somatorio`.
+fn subst_word(text: &str, old: &str, new: &str) -> String {
+    if old.is_empty() { return text.to_string(); }
+    let bytes = text.as_bytes();
+    let ob = old.as_bytes();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + ob.len() <= bytes.len()
+            && bytes[i..i + ob.len()].eq_ignore_ascii_case(ob) {
+            let before_ok = i == 0 || !is_id(bytes[i - 1]);
+            let after_ok = i + ob.len() == bytes.len() || !is_id(bytes[i + ob.len()]);
+            if before_ok && after_ok {
+                out.push_str(new);
+                i += ob.len();
+                continue;
+            }
+        }
+        let cl = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + cl]);
+        i += cl;
+    }
+    out
 }
 
 fn repair_unicode_escapes(s: &str) -> String {
