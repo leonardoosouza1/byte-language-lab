@@ -6529,6 +6529,24 @@ updThermo();
             }
             Err(e) => format!("{{\"saved\":false,\"error\":{}}}", json_escape(&e.to_string()))
         }
+    } else if method == "POST" && path == "/purge_code" {
+        // Nuclear option: drop ALL dialog pairs whose answer looks like code.
+        // Use to reset the code cache before ingesting a fresh, judged corpus.
+        // KG triples + factual dialogs are untouched.
+        let mut g = brain.lock().unwrap();
+        let before = g.dialog_pairs.len();
+        let mut removed = 0usize;
+        g.dialog_pairs.retain(|(_, m)| {
+            let ms = String::from_utf8_lossy(m);
+            if looks_like_code(&ms) { removed += 1; false } else { true }
+        });
+        let after = g.dialog_pairs.len();
+        g.dialog_hvs.clear();
+        g.rebuild_dialog_hvs();
+        g.build_static_experts();
+        drop(g);
+        format!("{{\"purged\":true,\"removed_code\":{},\"before\":{},\"after\":{}}}",
+            removed, before, after)
     } else if method == "POST" && path == "/purge_noise" {
         // Remove noisy dialog pairs: leaked reasoning, unicode-escape pollution,
         // exact duplicates, and degenerate/too-short entries. Self-cleaning so the
