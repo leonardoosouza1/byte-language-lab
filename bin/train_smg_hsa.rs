@@ -36,9 +36,9 @@ const VOCAB:           usize = 256;
 const LR_MAX:          f32   = 0.006;   // 2× original (linear scaling pra batch 4×)
 const LR_MIN:          f32   = 0.0002;
 const LR_WARMUP:       usize = 4;
-const BATCH:           usize = 256;     // 4× saturação GPU (batch maior = mais paralelismo)
+const BATCH:           usize = 256;     // sweet spot: compute-saturated, async pipeline win
 const N_EPOCHS:        usize = 50;
-const STEPS_PER_EPOCH: usize = 500;     // mais data por epoch
+const STEPS_PER_EPOCH: usize = 500;     // 500 × 256 ≈ 12 MB texto/epoch
 const VAL_STEPS:       usize = 50;      // steps de validação por avaliação
 const SEED:            u64   = 42;
 const TEMPERATURE:     f32   = 0.8;     // temperatura de sampling (< 1 = mais focado)
@@ -229,9 +229,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("{}", "─".repeat(62));
 
+    // ---- ASYNC PIPELINE: CPU prep worker overlaps GPU compute ----
+    // While the GPU trains epoch N, a CPU worker shuffles + clones the pairs
+    // for epoch N+1. Bounded channel keeps memory in check (max 2 epochs in
+    // flight). User idea: "1 worker GPU, 1 worker CPU, ambos contribuem".
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(Vec<u32>, u32)>>(2);
+    let n_epochs = N_EPOCHS;
+    let producer = std::thread::spawn(move || {
+        let mut rng_seed = SEED;
+        for ep in 0..n_epochs {
+            rng_seed = rng_seed.wrapping_add(ep as u64 * 0x9e3779b97f4a7c15);
+            shuffle(&mut train_pairs, rng_seed);
+            let epoch_pairs: Vec<_> = train_pairs
+                .iter()
+                .take(STEPS_PER_EPOCH * BATCH)
+                .cloned()
+                .collect();
+            if tx.send(epoch_pairs).is_err() { break; }
+        }
+    });
+
     // ---- Loop de treino ----
     let total_t0 = Instant::now();
-    let mut rng_seed = SEED;
 
     for ep in 0..N_EPOCHS {
         // Cosine LR schedule — aplicado antes de cada época
@@ -239,17 +258,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hsa.set_lr(lr);
 
         let t0 = Instant::now();
-
-        // Embaralha treino a cada época (LCG com seed diferente)
-        rng_seed = rng_seed.wrapping_add(ep as u64 * 0x9e3779b97f4a7c15);
-        shuffle(&mut train_pairs, rng_seed);
-
-        // Selecciona STEPS_PER_EPOCH batches desta época
-        let epoch_pairs: Vec<_> = train_pairs
-            .iter()
-            .take(STEPS_PER_EPOCH * BATCH)
-            .cloned()
-            .collect();
+        let epoch_pairs = match rx.recv() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
 
         // Treina (forward + backward + SGD por batch)
         let train_loss = hsa.train_epoch(&epoch_pairs, BATCH);

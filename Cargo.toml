@@ -285,6 +285,11 @@ path = "bin/iara_brain_v5.rs"
 name = "train_cpu_k64"
 path = "bin/train_cpu_k64.rs"
 
+[[bin]]
+name = "test_two_dispatchers"
+path = "bin/test_two_dispatchers.rs"
+required-features = ["gpu-aql"]
+
 [dependencies]
 # Mantém dependências mínimas — todo código é nosso, validável byte a byte.
 # Apenas RNG (reprodutível, sem cripto).
