@@ -307,22 +307,61 @@ TYPESCRIPT = [
 ]
 
 
+def is_balanced(code: str) -> bool:
+    """Reject truncated code where braces/parens/brackets don't balance.
+    The previous v3 ran with max_tokens=1000 — many code blocks were cut
+    mid-function and the brain confidently returned broken snippets."""
+    pairs = [("{", "}"), ("(", ")"), ("[", "]")]
+    in_str = False
+    quote = None
+    depths = {p: 0 for p, _ in pairs}
+    i = 0
+    while i < len(code):
+        c = code[i]
+        # crude string skip (single/double/backtick)
+        if in_str:
+            if c == "\\" and i + 1 < len(code):
+                i += 2; continue
+            if c == quote:
+                in_str = False
+        elif c in '"\'`':
+            in_str = True; quote = c
+        elif c == "/" and i + 1 < len(code) and code[i + 1] == "/":
+            # line comment — skip to newline
+            while i < len(code) and code[i] != "\n":
+                i += 1
+        else:
+            for o, cl in pairs:
+                if c == o:
+                    depths[o] += 1
+                elif c == cl:
+                    depths[o] -= 1
+                    if depths[o] < 0:
+                        return False
+        i += 1
+    return all(v == 0 for v in depths.values())
+
+
 def gen_pair(request, kind="js"):
     if kind == "html":
         instr = (f"Escreva {request}. Responda APENAS o código HTML/CSS dentro de "
-                 f"um bloco ``` . Sem explicação em prosa.")
+                 f"um bloco ``` , completo e bem fechado. Sem explicação em prosa.")
     elif kind == "css":
         instr = (f"Escreva {request}. Responda APENAS o código CSS dentro de "
-                 f"um bloco ``` . Sem explicação em prosa.")
+                 f"um bloco ``` , completo. Sem explicação em prosa.")
     else:
         instr = (f"Escreva {request}. Responda APENAS o código dentro de um "
-                 f"bloco ``` . Inclua um comentário curto e um exemplo de uso "
-                 f"quando apropriado. Sem explicação em prosa.")
-    raw = qwen(instr, max_tokens=1000)
+                 f"bloco ``` , completo e funcional (todas as chaves fechadas). "
+                 f"Inclua um comentário curto. Sem explicação em prosa.")
+    # higher cap; previous max_tokens=1000 truncated many functions.
+    raw = qwen(instr, max_tokens=1800)
     if raw.startswith("<err"):
         return None
     code = extract_code(raw)
     if len(code) < 15 or len(code) > 7800:
+        return None
+    # reject truncated code — broken braces = brain returns broken snippet
+    if kind in ("js",) and not is_balanced(code):
         return None
     return code
 

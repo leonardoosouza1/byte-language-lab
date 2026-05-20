@@ -4489,8 +4489,12 @@ fn handle_client(
                 t = t.replace(marker, "");
             }
             // Dedup tokens repetidos consecutivamente (palavra ou frase curta)
-            // Detecta loops como "X, Y, X, Y, X, Y..." e trunca
-            t = dedup_repeats(&t);
+            // Detecta loops como "X, Y, X, Y, X, Y..." e trunca. Code repeats
+            // structural tokens ({, }, ;, function, etc.) — skip dedup on code
+            // outputs or valid cached code gets truncated mid-block.
+            if !looks_like_code(&t) {
+                t = dedup_repeats(&t);
+            }
             // Repair any stray unicode escape before it reaches the user.
             t = repair_unicode_escapes(&t);
             t.trim().to_string()
@@ -6535,6 +6539,7 @@ updThermo();
         let mut removed_reason = 0usize;
         let mut removed_dup = 0usize;
         let mut removed_short = 0usize;
+        let mut removed_broken_code = 0usize;
         g.dialog_pairs.retain(|(u, m)| {
             let us = String::from_utf8_lossy(u);
             let ms = String::from_utf8_lossy(m);
@@ -6544,6 +6549,12 @@ updThermo();
             }
             if m.len() < 12 || u.len() < 4 {
                 removed_short += 1;
+                return false;
+            }
+            // Truncated code from distill: looks like code but braces don't
+            // balance — brain confidently returns the broken snippet.
+            if looks_like_code(&ms) && !braces_balanced(&ms) {
+                removed_broken_code += 1;
                 return false;
             }
             // Dedup by (lowercased user prompt) — keep first occurrence.
@@ -6561,8 +6572,8 @@ updThermo();
         g.build_static_experts();
         drop(g);
         format!("{{\"purged\":true,\"before\":{},\"after\":{},\"removed_reasoning\":{},\
-                 \"removed_dup\":{},\"removed_short\":{}}}",
-            before, after, removed_reason, removed_dup, removed_short)
+                 \"removed_dup\":{},\"removed_short\":{},\"removed_broken_code\":{}}}",
+            before, after, removed_reason, removed_dup, removed_short, removed_broken_code)
     } else if method == "GET" && path == "/loop" {
         // Unified loop status: curiosity + autolearn + checkpoint
         use std::sync::atomic::Ordering;
@@ -6719,6 +6730,40 @@ fn looks_like_code(s: &str) -> bool {
     if hits >= 2 { return true; }
     let code_chars = s.chars().filter(|&c| c == '{' || c == '}' || c == ';').count();
     s.len() > 40 && code_chars * 100 / s.len().max(1) > 4
+}
+
+/// Reject code where braces, parens, or brackets don't balance — distill v3
+/// at max_tokens=1000 truncated many JS bodies mid-function; brain returned
+/// the broken snippet with confidence. State machine skips strings + `//`.
+fn braces_balanced(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let (mut curly, mut paren, mut brack) = (0i32, 0i32, 0i32);
+    let mut in_str = false;
+    let mut quote: u8 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() { i += 2; continue; }
+            if c == quote { in_str = false; }
+        } else if c == b'"' || c == b'\'' || c == b'`' {
+            in_str = true; quote = c;
+        } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+        } else {
+            match c {
+                b'{' => curly += 1,
+                b'}' => { curly -= 1; if curly < 0 { return false; } }
+                b'(' => paren += 1,
+                b')' => { paren -= 1; if paren < 0 { return false; } }
+                b'[' => brack += 1,
+                b']' => { brack -= 1; if brack < 0 { return false; } }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    curly == 0 && paren == 0 && brack == 0
 }
 
 // ── N1: analogical mutation generation helpers ────────────────────────────
