@@ -93,6 +93,60 @@ CSS_SNIPPETS = [
     "código CSS para uma barra de navegação fixa no topo",
     "código CSS reset básico para um projeto",
 ]
+# v2 — classes, React, hooks, API (templates de código completos)
+CLASSES = [
+    "uma classe JavaScript Pessoa com nome, idade e um método apresentar",
+    "uma classe JavaScript Retangulo com largura, altura e métodos de área e perímetro",
+    "uma classe JavaScript ContaBancaria com saldo, depositar e sacar",
+    "uma classe JavaScript Pilha (stack) com push, pop e peek",
+    "uma classe JavaScript Fila (queue) com enqueue e dequeue",
+    "uma classe JavaScript Animal e uma classe Cachorro que herda dela",
+    "uma classe JavaScript Carrinho de compras com adicionar item e total",
+    "uma classe JavaScript Temporizador com start, stop e reset",
+    "uma classe JavaScript EventEmitter simples com on e emit",
+    "uma classe JavaScript Validador com métodos de validar email e senha",
+    "uma classe JavaScript LinkedList com append e toArray",
+    "uma classe JavaScript Usuario com construtor e getters/setters",
+]
+REACT = [
+    "um componente React funcional que exibe um título",
+    "um componente React de contador com useState",
+    "um componente React de lista que recebe itens via props",
+    "um componente React de formulário de login controlado",
+    "um componente React que busca dados de uma API com useEffect",
+    "um componente React de botão reutilizável com props",
+    "um componente React de card de produto",
+    "um componente React de barra de navegação",
+    "uma página React simples com header, conteúdo e footer",
+    "um componente React de modal com abrir e fechar",
+    "um componente React de toggle de tema claro/escuro",
+    "um componente React de campo de busca com filtro",
+    "um componente React de tabela que renderiza um array de objetos",
+    "um componente React de paginação",
+    "uma landing page em React com seção hero e call-to-action",
+]
+HOOKS = [
+    "um hook React useState de exemplo comentado",
+    "um hook React customizado useLocalStorage",
+    "um hook React customizado useFetch para requisições",
+    "um hook React customizado useToggle",
+    "um hook React customizado useDebounce",
+    "um hook React customizado useWindowSize",
+    "um exemplo de useEffect com cleanup",
+    "um hook React customizado usePrevious",
+]
+API = [
+    "uma rota Express GET que retorna uma lista em JSON",
+    "uma rota Express POST que recebe e valida um corpo JSON",
+    "um servidor Express básico com uma rota de health check",
+    "um wrapper de fetch para chamadas a uma API REST",
+    "uma função Node.js que lê um arquivo JSON e retorna o conteúdo",
+    "um middleware Express de log de requisições",
+    "um middleware Express de tratamento de erros",
+    "uma função que faz POST a uma API com async/await e trata erro",
+    "um CRUD em memória de tarefas com Express",
+    "uma função que conecta e consulta um banco com async/await",
+]
 
 
 def post(url, payload, timeout=120):
@@ -150,7 +204,11 @@ def main():
     ap.add_argument("--out", default="data/code_corpus.txt")
     args = ap.parse_args()
 
-    tasks = ([(t, "template") for t in TEMPLATES]
+    tasks = ([(f"crie {c}", "js") for c in CLASSES]
+             + [(f"crie {r}", "js") for r in REACT]
+             + [(f"escreva {h}", "js") for h in HOOKS]
+             + [(f"crie {a}", "js") for a in API]
+             + [(t, "template") for t in TEMPLATES]
              + [(f"crie {f}", "js") for f in JS_FUNCS]
              + [(c, "css") for c in CSS_SNIPPETS])
 

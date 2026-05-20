@@ -31,14 +31,14 @@ use blab::{
 };
 
 // ---- Hiperparâmetros ----
-const WINDOW:          usize = 48;
+const WINDOW:          usize = 96;
 const VOCAB:           usize = 256;
-const LR_MAX:          f32   = 0.003;   // LR máxima (pico do cosine schedule)
-const LR_MIN:          f32   = 0.0002;  // LR mínima (fim do decay)
-const LR_WARMUP:       usize = 4;       // épocas de warmup linear LR_MIN→LR_MAX
-const BATCH:           usize = 64;
-const N_EPOCHS:        usize = 50;      // mais épocas com decay para convergência fina
-const STEPS_PER_EPOCH: usize = 200;     // ~200 × 64 × 48 ≈ 600 KB de texto por época
+const LR_MAX:          f32   = 0.006;   // 2× original (linear scaling pra batch 4×)
+const LR_MIN:          f32   = 0.0002;
+const LR_WARMUP:       usize = 4;
+const BATCH:           usize = 256;     // 4× saturação GPU (batch maior = mais paralelismo)
+const N_EPOCHS:        usize = 50;
+const STEPS_PER_EPOCH: usize = 500;     // mais data por epoch
 const VAL_STEPS:       usize = 50;      // steps de validação por avaliação
 const SEED:            u64   = 42;
 const TEMPERATURE:     f32   = 0.8;     // temperatura de sampling (< 1 = mais focado)
