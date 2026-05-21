@@ -2,6 +2,8 @@
 class Calculator {
   constructor() { this.display = '0'; this.acc = null; this.op = null; }
   somar(a, b) { return a + b; }
+  subtrair(a, b) { return a - b; }
+  multiplicar(a, b) { return a * b; }
   dividir(a, b) { return a / b; }
   compute() {
     const b = parseFloat(this.display);
@@ -16,14 +18,10 @@ class Calculator {
 }
 
 // DOM wiring (pattern from brain memory):
-/* function addDebounceListener(input, callback, delay) {
-  input.addEventListener('input', function() {
-    const timer = setTimeout(() => {
-      callback();
-    }, delay);
-    // Limpa o timer se o evento ocorrer novamente antes do delay
-    input.removeEventListener('input', arguments.callee);
-     */
+/* function addDays(date, days) {
+  // Adiciona dias a uma data
+  date.setDate(date.getDate() + days);
+} */
 if (typeof document !== 'undefined') {
   const calc = new Calculator();
   const out = document.getElementById('display');

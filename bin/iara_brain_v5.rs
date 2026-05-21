@@ -2758,6 +2758,36 @@ impl Brain {
         Some((out.into_bytes(), 0.72))
     }
 
+    /// Code-aware retrieval. For a code-ish query, search ONLY cached answers
+    /// that ARE code (looks_like_code) by word overlap. Beats HDC byte-level
+    /// collisions where "subtrai dois números" (code) hashes near a math
+    /// dialog ("subtrair 5 de ambos os lados") — the latter isn't code, so
+    /// it's filtered out. Returns the best code match on strong overlap.
+    fn try_code_retrieval(&self, prompt: &[u8]) -> Option<(Vec<u8>, f32)> {
+        let p_lc = String::from_utf8_lossy(prompt).to_lowercase();
+        const CODE_HINTS: &[&str] = &["função", "funcao", "classe", "javascript",
+            "código", "codigo", " html", " css", "react", "componente", " js ",
+            "express", "hook", "typescript", "rota"];
+        if !CODE_HINTS.iter().any(|h| p_lc.contains(h)) { return None; }
+        if self.dialog_pairs.is_empty() { return None; }
+        let split = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.chars().count() >= 3).map(|w| w.to_string()).collect()
+        };
+        let qset: std::collections::HashSet<String> = split(&p_lc).into_iter().collect();
+        let mut best_idx = usize::MAX;
+        let mut best = 0usize;
+        for (i, (u, m)) in self.dialog_pairs.iter().enumerate() {
+            let ans = String::from_utf8_lossy(m);
+            if !looks_like_code(&ans) { continue; }   // code answers only
+            let us = String::from_utf8_lossy(u).to_lowercase();
+            let ov = split(&us).iter().filter(|w| qset.contains(*w)).count();
+            if ov > best { best = ov; best_idx = i; }
+        }
+        if best_idx == usize::MAX || best < 4 { return None; }
+        Some((self.dialog_pairs[best_idx].1.clone(), 0.8))
+    }
+
     fn respond_with_confidence(&self, prompt: &[u8]) -> (Option<Vec<u8>>, f32) {
         LAST_WAS_MUTATION.store(false, std::sync::atomic::Ordering::Relaxed);
         let prompt_s = String::from_utf8_lossy(prompt).to_string();
@@ -2770,6 +2800,12 @@ impl Brain {
         // TIER 3.9: N1 — analogical mutation for near code variants
         if let Some((mutated, conf)) = self.try_code_mutation(prompt) {
             return (Some(mutated), conf);
+        }
+
+        // TIER 3.8: code-aware retrieval — code query → code answer only,
+        // bypassing HDC collisions with non-code (math/fact) dialogs.
+        if let Some((resp, conf)) = self.try_code_retrieval(prompt) {
+            return (Some(resp), conf);
         }
 
         // TIER 3.4: MoE routing — top-2 expert dialog subset (faster than full HDC)

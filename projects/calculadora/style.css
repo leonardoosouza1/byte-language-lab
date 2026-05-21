@@ -1,6 +1,36 @@
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
+.fade-in {
+  animation: fadeIn 1s ease-out forwards;
+}
 
+<div class="fade-in">Este é um elemento que vai fazer fade in.</div>
 
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fadeIn 1s ease-out forwards;
+}
+
+<div class="fade-in">Este é um elemento que vai fazer fade in.</div>
 
 #display { grid-column: 1/-1; text-align: right; font-size: 2rem; padding: 1rem; background: #111; color: #0f0; }
 .calc { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; max-width: 320px; margin: 2rem auto; }
