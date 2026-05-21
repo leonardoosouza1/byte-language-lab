@@ -23,6 +23,9 @@ pub mod nn_ops;
 /// Byte-transformer forward pass composed from the kernels above.
 pub mod transformer;
 
+/// Trainable byte LM — forward+backward+SGD on GPU GEMM, gradient-checked.
+pub mod byte_lm;
+
 /// Handle para device/queue da GPU. Construído uma vez por processo.
 pub struct GpuContext {
     /// Device wgpu (Vulkan no Linux+RDNA2).
