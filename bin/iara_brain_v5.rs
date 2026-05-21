@@ -4345,6 +4345,10 @@ fn handle_client(
         let prompt = extract_json_str(&body_s, "prompt").unwrap_or_default();
         let max = extract_json_num(&body_s, "max").unwrap_or(120.0) as usize;
         let temp = extract_json_num(&body_s, "temp").unwrap_or(0.7) as f32;
+        // no_escape: answer ONLY from the brain's own memory (cache/KG/forest/
+        // mutation) — never call the Qwen teacher at runtime. The model
+        // generates from its own data, or returns its best brain candidate.
+        let no_escape = extract_json_num(&body_s, "no_escape").unwrap_or(0.0) > 0.5;
         // Style autodetect: capital-led narrative ("Era uma vez", "A casa", "O menino", "Naquele")
         // vs short Q-style ("qual", "o que", "quem") which is chat.
         let p_trim = prompt.trim();
@@ -4426,8 +4430,8 @@ fn handle_client(
 
             if degenerate || leaked_reasoning {
                 // Brain response looping/repeating OR leaked reasoning → clean Qwen.
-                let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    None);
+                let qwen_resp = if no_escape { None } else {
+                    qwen3_chat(&prompt, max as usize, None) };
                 let tag = if leaked_reasoning { "qwen-reasoning-escape" } else { "qwen-degen-escape" };
                 match qwen_resp {
                     Some(r) if r.trim().len() > 20 => (r.into_bytes(), tag),
@@ -4443,16 +4447,16 @@ fn handle_client(
             } else if conf >= 0.65 && brain_resp.is_some() {
                 // High HDC similarity but answer misses the question's key term →
                 // cache collision. Escalate to a clean Qwen answer.
-                let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    None);
+                let qwen_resp = if no_escape { None } else {
+                    qwen3_chat(&prompt, max as usize, None) };
                 match qwen_resp {
                     Some(r) if r.trim().len() > 20 => (r.into_bytes(), "qwen-collision-escape"),
                     _ => (brain_resp.unwrap(), "brain-hi-risky"),
                 }
             } else if conf >= 0.30 && brain_resp.is_some() {
                 // Mid confidence → try Qwen with RAG, blend or pick best
-                let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    None);
+                let qwen_resp = if no_escape { None } else {
+                    qwen3_chat(&prompt, max as usize, None) };
                 match qwen_resp {
                     Some(r) if r.trim().len() > 20 => {
                         // Qwen produced — use Qwen (richer)
@@ -4462,8 +4466,8 @@ fn handle_client(
                 }
             } else {
                 // Low confidence → Qwen primary com brain RAG
-                let qwen_resp = qwen3_chat(&prompt, max as usize,
-                    None);
+                let qwen_resp = if no_escape { None } else {
+                    qwen3_chat(&prompt, max as usize, None) };
                 match qwen_resp {
                     Some(r) if !r.trim().is_empty() => (r.into_bytes(), "qwen-primary"),
                     _ => {
