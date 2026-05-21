@@ -26,6 +26,9 @@ pub mod transformer;
 /// Trainable byte LM — forward+backward+SGD on GPU GEMM, gradient-checked.
 pub mod byte_lm;
 
+/// Windowed (context-aware) byte LM — trains on real code, generates bytes.
+pub mod byte_win_lm;
+
 /// Handle para device/queue da GPU. Construído uma vez por processo.
 pub struct GpuContext {
     /// Device wgpu (Vulkan no Linux+RDNA2).

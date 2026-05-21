@@ -290,6 +290,10 @@ name = "test_two_dispatchers"
 path = "bin/test_two_dispatchers.rs"
 required-features = ["gpu-aql"]
 
+[[bin]]
+name = "train_byte_lm"
+path = "bin/train_byte_lm.rs"
+
 [dependencies]
 # Mantém dependências mínimas — todo código é nosso, validável byte a byte.
 # Apenas RNG (reprodutível, sem cripto).
