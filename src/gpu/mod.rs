@@ -17,6 +17,9 @@ use std::sync::Arc;
 /// Tiled GEMM — foundational kernel for the byte-transformer student.
 pub mod gemm;
 
+/// Transformer row/elementwise ops: softmax, RMSNorm, SiLU/GELU.
+pub mod nn_ops;
+
 /// Handle para device/queue da GPU. Construído uma vez por processo.
 pub struct GpuContext {
     /// Device wgpu (Vulkan no Linux+RDNA2).
