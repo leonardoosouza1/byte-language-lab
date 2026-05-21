@@ -18,7 +18,8 @@ struct Dims { rows: u32, cols: u32, eps: f32, op: u32 };
 
 var<workgroup> red: array<f32, 256>;
 
-// op 0 = softmax (row), op 1 = rmsnorm (row, * wgt)
+// op 0 = softmax (row), op 1 = rmsnorm (row, * wgt), op 2 = causal softmax
+// (row r attends only to cols j <= r — attention causal mask)
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -26,13 +27,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let tid = lid.x;
     if (row >= d.rows) { return; }
     let base = row * d.cols;
+    // causal: a column j is valid only if j <= row
+    let limit = select(d.cols, row + 1u, d.op == 2u);
 
-    if (d.op == 0u) {
+    if (d.op == 0u || d.op == 2u) {
         // ---- softmax: max, then exp-sum, then normalize ----
         var local_max: f32 = -3.0e38;
         var i: u32 = tid;
         loop {
-            if (i >= d.cols) { break; }
+            if (i >= limit) { break; }
             local_max = max(local_max, inp[base + i]);
             i = i + 256u;
         }
@@ -180,6 +183,12 @@ fn read_back(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, src: &wgpu::Buffe
 /// Row-wise softmax over the last dim of an [rows, cols] row-major matrix.
 pub fn softmax(ctx: &GpuContext, inp: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     run_row(ctx, inp, &[0.0], rows, cols, 0.0, 0)
+}
+
+/// Causal row-wise softmax: row r attends only to cols j <= r (attention mask).
+/// Cols j > r get probability 0. Input/output [rows, cols], rows==cols typical.
+pub fn causal_softmax(ctx: &GpuContext, inp: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    run_row(ctx, inp, &[0.0], rows, cols, 0.0, 2)
 }
 
 /// Row-wise RMSNorm: out[r,c] = x/sqrt(mean(x^2)+eps) * weight[c].
