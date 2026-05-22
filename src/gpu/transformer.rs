@@ -637,6 +637,24 @@ impl ModelDev {
         ctx.queue.submit(Some(enc.finish()));
         ctx.download(&logits)
     }
+
+    /// Greedy generation using the device-resident forward (8x faster per step
+    /// than the per-op path). Weights upload once (in `new`); each step is one
+    /// submit + one logits readback.
+    pub fn generate(&self, ctx: &GpuContext, prompt: &[u8], n: usize) -> Vec<u8> {
+        let v = self.cfg.vocab;
+        let mw = self.cfg.max_seq;
+        let mut seq = prompt.to_vec();
+        for _ in 0..n {
+            let w = &seq[seq.len().saturating_sub(mw)..];
+            let logits = self.forward(ctx, w);
+            let last = (w.len() - 1) * v;
+            let nb = (0..v).max_by(|&a, &b|
+                logits[last + a].partial_cmp(&logits[last + b]).unwrap()).unwrap();
+            seq.push(nb as u8);
+        }
+        seq[prompt.len()..].to_vec()
+    }
 }
 
 // ---- backward helpers (CPU, row-wise; small relative to GEMMs) ----
@@ -764,6 +782,24 @@ mod tests {
         // diverges. Breaking the unigram floor (needs grad clipping + higher
         // LR) is proven separately by transformer_beats_unigram_floor.
         assert!(l.is_finite() && l < l0 * 0.5, "transformer training failed: {l0} -> {l}");
+    }
+
+    /// Device-resident generation must produce the same bytes as the per-op
+    /// generation (greedy is deterministic) — and runs faster.
+    #[test]
+    fn device_generate_matches() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
+        let mut model = Model::init(cfg, 7);
+        let data = b"fn add(a,b){a+b}";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        for _ in 0..1200 { model.train_step_clip(&ctx, &toks, &tgts, 0.3, 1.0); }
+        let prompt = b"fn ad";
+        let cpu_gen = model.generate(&ctx, prompt, 8);
+        let dev = ModelDev::new(&ctx, &model);
+        let dev_gen = dev.generate(&ctx, prompt, 8);
+        assert_eq!(cpu_gen, dev_gen, "device generation must match per-op");
     }
 
     /// Device-resident forward must match the per-op CPU forward (parity) and
