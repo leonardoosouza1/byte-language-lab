@@ -27,15 +27,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let tid = lid.x;
     if (row >= d.rows) { return; }
     let base = row * d.cols;
-    // causal: a column j is valid only if j <= row
+    // causal valid range [lo, hi): hi = row+1 (op 2) or cols (op 0). For BATCHED
+    // attention the eps slot carries a block size (>0): each row attends only
+    // within its own block [b*blk, row], so B sequences share one super-tensor
+    // without crossing the block-diagonal. blk==0 => single sequence.
     let limit = select(d.cols, row + 1u, d.op == 2u);
+    let blk = bitcast<u32>(d.eps);
+    var lo: u32 = 0u;
+    let hi: u32 = limit;
+    if (d.op == 2u && blk > 0u) { lo = (row / blk) * blk; }
 
     if (d.op == 0u || d.op == 2u) {
         // ---- softmax: max, then exp-sum, then normalize ----
         var local_max: f32 = -3.0e38;
-        var i: u32 = tid;
+        var i: u32 = lo + tid;
         loop {
-            if (i >= limit) { break; }
+            if (i >= hi) { break; }
             local_max = max(local_max, inp[base + i]);
             i = i + 256u;
         }
@@ -51,13 +58,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let row_max = red[0];
         workgroupBarrier();
 
-        // sum only over valid (unmasked) columns — for causal (op 2) the future
-        // columns j > row must NOT enter the sum: their raw scores are unbounded
-        // and exp() of them overflows once attention weights grow.
+        // sum only over valid (unmasked) columns — masked cols carry unbounded
+        // raw scores whose exp() would overflow once attention weights grow.
         var local_sum: f32 = 0.0;
-        i = tid;
+        i = lo + tid;
         loop {
-            if (i >= limit) { break; }
+            if (i >= hi) { break; }
             local_sum = local_sum + exp(inp[base + i] - row_max);
             i = i + 256u;
         }
@@ -73,11 +79,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let row_sum = red[0];
         workgroupBarrier();
 
-        // write probs for valid cols, zero the masked tail (j > row).
+        // write probs for valid cols, zero everything outside [lo, hi).
         i = tid;
         loop {
             if (i >= d.cols) { break; }
-            if (i < limit) { out[base + i] = exp(inp[base + i] - row_max) / row_sum; }
+            if (i >= lo && i < hi) { out[base + i] = exp(inp[base + i] - row_max) / row_sum; }
             else { out[base + i] = 0.0; }
             i = i + 256u;
         }

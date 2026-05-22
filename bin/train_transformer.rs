@@ -58,6 +58,7 @@ fn main() {
     let lr: f32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0.1);
     let clip: f32 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let opt = args.get(8).cloned().unwrap_or_else(|| "adam".into());
+    let batch: usize = args.get(9).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     println!("corpus {path}: {} bytes", bytes.len());
@@ -89,7 +90,7 @@ fn main() {
     let mut dev = ModelDev::new(&ctx, &model);
     let mut rng = Lcg(0x1234_5678_9abc_def0);
 
-    println!("optimizer={opt} lr={lr} clip={clip}");
+    println!("optimizer={opt} lr={lr} clip={clip} batch={batch}");
     let t0 = Instant::now();
     let mut step = 0u64;
     let mut tokens_seen = 0u64;
@@ -98,17 +99,29 @@ fn main() {
     let report_every = std::time::Duration::from_secs(5);
 
     let warmup = 300u64;   // linear lr warmup — without it Adam blows up early (bc2≈1e-3)
+    let mut bt = vec![0u8; batch * max_seq];   // batched tokens/targets scratch
+    let mut bg = vec![0u8; batch * max_seq];
     while t0.elapsed().as_secs() < budget {
-        let start = rng.next_usize(train.len() - max_seq - 1);
-        let toks = &train[start..start + max_seq];
-        let tgts = &train[start + 1..start + max_seq + 1];
         let wlr = if opt == "sgd" { lr }
                   else { lr * ((step + 1) as f32 / warmup as f32).min(1.0) };
-        let l = if opt == "sgd" { dev.train_step_clip(&ctx, toks, tgts, wlr, clip) }
-                else { dev.train_step_adam(&ctx, toks, tgts, wlr, clip) };
+        let l = if batch == 1 {
+            let start = rng.next_usize(train.len() - max_seq - 1);
+            let toks = &train[start..start + max_seq];
+            let tgts = &train[start + 1..start + max_seq + 1];
+            if opt == "sgd" { dev.train_step_clip(&ctx, toks, tgts, wlr, clip) }
+            else { dev.train_step_adam(&ctx, toks, tgts, wlr, clip) }
+        } else {
+            // gather B random windows into one block-diagonal batch
+            for b in 0..batch {
+                let start = rng.next_usize(train.len() - max_seq - 1);
+                bt[b * max_seq..(b + 1) * max_seq].copy_from_slice(&train[start..start + max_seq]);
+                bg[b * max_seq..(b + 1) * max_seq].copy_from_slice(&train[start + 1..start + max_seq + 1]);
+            }
+            dev.train_step_adam_batch(&ctx, &bt, &bg, wlr, clip, max_seq)
+        };
         loss_ema = if step == 0 { l } else { 0.99 * loss_ema + 0.01 * l };
         step += 1;
-        tokens_seen += max_seq as u64;
+        tokens_seen += (batch * max_seq) as u64;
 
         if last_report.elapsed() >= report_every {
             let secs = t0.elapsed().as_secs_f64();

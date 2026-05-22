@@ -679,16 +679,22 @@ impl ModelDev {
 
     /// Forward that keeps every activation as a device Tensor (for backward).
     /// Records into `enc`; the caller submits. Returns caches + xf + x_final.
+    /// `block`=0 → one causal sequence; `block`=L → `tokens` is B sequences of
+    /// length L concatenated, attention masked block-diagonally (per sequence).
     fn forward_train_dev(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
-                         tokens: &[u8]) -> (Vec<LayerCacheDev>, Tensor, Tensor, Tensor) {
+                         tokens: &[u8], block: usize) -> (Vec<LayerCacheDev>, Tensor, Tensor, Tensor) {
         let d = self.cfg.d_model;
         let ff = self.cfg.d_ff;
         let v = self.cfg.vocab;
         let seq = tokens.len();
+        // position index resets per block (each block is its own sequence).
+        let pos_of = |i: usize| if block == 0 { i } else { i % block };
+        let blk_arg = f32::from_bits(block as u32);   // carried in the softmax eps slot
         let mut x0 = vec![0.0f32; seq * d];
         for (i, &t) in tokens.iter().enumerate() {
+            let p = pos_of(i);
             for j in 0..d {
-                x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[i * d + j];
+                x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[p * d + j];
             }
         }
         let mut x = ctx.upload(&x0, seq, d);
@@ -707,7 +713,7 @@ impl ModelDev {
             device::gemm_rec(ctx, enc, &xn, &l.wk, &k);
             device::gemm_rec(ctx, enc, &xn, &l.wv, &vv);
             device::gemm_nt_rec(ctx, enc, &q, &k, &scores);
-            device::row_rec(ctx, enc, &scores, &self.pos, &probs, 0.0, 2);
+            device::row_rec(ctx, enc, &scores, &self.pos, &probs, blk_arg, 2);
             device::gemm_rec(ctx, enc, &probs, &vv, &attn);
             device::gemm_rec(ctx, enc, &attn, &l.wo, &ao);
             device::add_rec(ctx, enc, &x, &ao, &xmid);
@@ -739,7 +745,7 @@ impl ModelDev {
 
         // --- forward (one submit, download only logits) ---
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        let (caches, xf, x_final, logits_t) = self.forward_train_dev(ctx, &mut enc, tokens);
+        let (caches, xf, x_final, logits_t) = self.forward_train_dev(ctx, &mut enc, tokens, 0);
         ctx.queue.submit(Some(enc.finish()));
         let logits = ctx.download(&logits_t);
 
@@ -840,12 +846,28 @@ impl ModelDev {
         });
     }
 
+    /// One Adam step on a single causal sequence.
+    pub fn train_step_adam(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
+                           lr: f32, max_norm: f32) -> f32 {
+        self.train_step_adam_blk(ctx, tokens, targets, lr, max_norm, 0)
+    }
+
+    /// One Adam step on a BATCH of B sequences of length `block`, concatenated
+    /// (tokens/targets are B*block long). Attention is masked block-diagonally
+    /// so the sequences don't cross — this amortizes the fixed per-step overhead
+    /// (submits, embed/pos reupload) over B× more tokens at a fixed context.
+    pub fn train_step_adam_batch(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
+                                 lr: f32, max_norm: f32, block: usize) -> f32 {
+        self.train_step_adam_blk(ctx, tokens, targets, lr, max_norm, block)
+    }
+
     /// One Adam training step, fully on GPU (Adam update via `adam_rec`), with
     /// optional on-device global-norm clip. Transformers need Adam — plain SGD
     /// stalls at the unigram entropy on a real corpus (measured). embed/pos use
-    /// a host-side Adam (they live on the host for the scatter gather).
-    pub fn train_step_adam(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
-                           lr: f32, max_norm: f32) -> f32 {
+    /// a host-side Adam (they live on the host for the scatter gather). `block`=0
+    /// → one sequence; `block`=L → B batched sequences of length L.
+    fn train_step_adam_blk(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
+                           lr: f32, max_norm: f32, block: usize) -> f32 {
         // eps 1e-5 (not the textbook 1e-8): rarely-updated byte embeddings let
         // the 2nd moment decay to ~0, so a later gradient spike makes g/sqrt(v)
         // explode → NaN. A larger eps floors the denominator and stays stable.
@@ -855,10 +877,11 @@ impl ModelDev {
         let d = self.cfg.d_model;
         let v = self.cfg.vocab;
         let seq = tokens.len();
+        let pos_of = |i: usize| if block == 0 { i } else { i % block };
 
         // --- forward (one submit, download only logits) ---
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        let (caches, xf, x_final, logits_t) = self.forward_train_dev(ctx, &mut enc, tokens);
+        let (caches, xf, x_final, logits_t) = self.forward_train_dev(ctx, &mut enc, tokens, block);
         ctx.queue.submit(Some(enc.finish()));
         let logits = ctx.download(&logits_t);
 
@@ -899,9 +922,10 @@ impl ModelDev {
         let mut d_pos = vec![0.0f32; self.pos_host.len()];
         for (i, &t) in tokens.iter().enumerate() {
             let base = (t as usize) * d;
+            let pbase = pos_of(i) * d;   // batched: positions repeat per block
             for j in 0..d {
                 d_embed[base + j] += dx[i * d + j];
-                d_pos[i * d + j] += dx[i * d + j];
+                d_pos[pbase + j] += dx[i * d + j];
             }
         }
         for &x in d_embed.iter() { sumsq += (x as f64) * (x as f64); }
@@ -1205,7 +1229,7 @@ mod tests {
         let dev = ModelDev::new(&ctx, &model);
         let d = cfg.d_model; let v = cfg.vocab; let seq = toks.len();
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        let (caches, xf, x_final, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &toks);
+        let (caches, xf, x_final, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &toks, 0);
         ctx.queue.submit(Some(enc.finish()));
         let logits = ctx.download(&logits_t);
         let mut dlogits = vec![0.0f32; seq * v];
@@ -1242,6 +1266,68 @@ mod tests {
         }
     }
 
+    /// Batched (block-diagonal) forward parity: each block's logits in a B-way
+    /// batched forward must equal a standalone single-sequence forward of that
+    /// block. Proves the block-diagonal attention mask + per-block positions
+    /// keep the sequences independent (no cross-block leakage).
+    #[test]
+    fn batched_forward_matches_single() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 8, n_predict: 1 };
+        let model = Model::init(cfg, 3);
+        let dev = ModelDev::new(&ctx, &model);
+        let v = cfg.vocab; let l = 8usize;
+        let sa: Vec<u8> = b"abcdefgh".to_vec();
+        let sb: Vec<u8> = b"ZYXWVUTS".to_vec();
+        // standalone forwards
+        let la = dev.forward(&ctx, &sa);
+        let lb = dev.forward(&ctx, &sb);
+        // batched forward: concat, block = l
+        let mut batch = sa.clone(); batch.extend_from_slice(&sb);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let (_c, _xf, _xfin, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &batch, l);
+        ctx.queue.submit(Some(enc.finish()));
+        let lbatch = ctx.download(&logits_t);
+        let rel = |a: &[f32], b: &[f32]| a.iter().zip(b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-3))
+            .fold(0.0f32, f32::max);
+        let ea = rel(&lbatch[0..l * v], &la);
+        let eb = rel(&lbatch[l * v..2 * l * v], &lb);
+        eprintln!("batched-vs-single rel: block0={ea:.2e} block1={eb:.2e}");
+        assert!(ea < 1e-4 && eb < 1e-4, "batched forward leaks across blocks: {ea}, {eb}");
+    }
+
+    /// Batched Adam training must still beat the unigram floor (block-diagonal
+    /// backward is correct end-to-end). Same bar as the single-sequence break.
+    #[test]
+    fn batched_train_breaks_floor() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 16, n_predict: 1 };
+        let model = Model::init(cfg, 9);
+        // 4 blocks of length 16 from a repeating pattern (deterministic next byte)
+        let block = 16usize;
+        let pat = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
+        let mut toks = Vec::new(); let mut tgts = Vec::new();
+        for b in 0..4 {
+            let s = b * 5;
+            toks.extend_from_slice(&pat[s..s + block]);
+            tgts.extend_from_slice(&pat[s + 1..s + block + 1]);
+        }
+        let mut cnt = [0u32; 256];
+        for &t in &tgts { cnt[t as usize] += 1; }
+        let n = tgts.len() as f32;
+        let floor: f32 = tgts.iter().map(|&t| -((cnt[t as usize] as f32 / n).ln())).sum::<f32>() / n;
+        let mut dev = ModelDev::new(&ctx, &model);
+        let mut lr;
+        let mut last = 0.0;
+        for step in 0..1500u32 {
+            lr = 0.001 * ((step + 1) as f32 / 200.0).min(1.0);   // warmup
+            last = dev.train_step_adam_batch(&ctx, &toks, &tgts, lr, 1.0, block);
+        }
+        eprintln!("batched adam loss -> {last:.3} (floor {floor:.3})");
+        assert!(last.is_finite() && last < floor, "batched train didn't beat floor: {last} >= {floor}");
+    }
+
     /// On-device grad-clip norm parity: the GPU sumsq reduction (packed accum)
     /// must equal the host sum-of-squares of the same weight grads. Proves the
     /// readback-cutting path (19 downloads -> 3) doesn't change the clip factor.
@@ -1256,7 +1342,7 @@ mod tests {
         let dev = ModelDev::new(&ctx, &model);
         let v = cfg.vocab; let seq = toks.len();
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        let (caches, xf, x_final, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &toks);
+        let (caches, xf, x_final, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &toks, 0);
         ctx.queue.submit(Some(enc.finish()));
         let logits = ctx.download(&logits_t);
         let mut dlogits = vec![0.0f32; seq * v];
