@@ -294,6 +294,10 @@ required-features = ["gpu-aql"]
 name = "train_byte_lm"
 path = "bin/train_byte_lm.rs"
 
+[[bin]]
+name = "train_transformer"
+path = "bin/train_transformer.rs"
+
 [dependencies]
 # Mantém dependências mínimas — todo código é nosso, validável byte a byte.
 # Apenas RNG (reprodutível, sem cripto).

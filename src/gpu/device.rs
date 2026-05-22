@@ -580,6 +580,57 @@ pub fn sgd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
 }
 
+/// Adam update — transformers don't train under plain SGD (ill-conditioned by
+/// LayerNorm + attention); the per-parameter adaptive step is what makes them
+/// converge. m/v are persistent moment buffers; bc1/bc2 are the bias-correction
+/// denominators (1-β^t) passed from the host step counter.
+const WGSL_ADAM: &str = r#"
+struct D { n: u32, _p: u32, lr: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32, wd: f32, _q: u32, _r: u32, _s: u32 };
+@group(0) @binding(0) var<storage, read_write> w: array<f32>;
+@group(0) @binding(1) var<storage, read>       g: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m: array<f32>;
+@group(0) @binding(3) var<storage, read_write> v: array<f32>;
+@group(0) @binding(4) var<uniform>             d: D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= d.n) { return; }
+    let gi = g[i];
+    let mi = d.b1 * m[i] + (1.0 - d.b1) * gi;
+    let vi = d.b2 * v[i] + (1.0 - d.b2) * gi * gi;
+    m[i] = mi; v[i] = vi;
+    let mh = mi / d.bc1;
+    let vh = vi / d.bc2;
+    // decoupled weight decay (AdamW): caps unbounded weight growth that would
+    // otherwise overflow the forward and NaN out.
+    w[i] = w[i] - d.lr * (mh / (sqrt(vh) + d.eps) + d.wd * w[i]);
+}
+"#;
+
+/// Record one AdamW step `w <- adamw(w, g, m, v)` into `enc`. `bc1 = 1-β1^t`,
+/// `bc2 = 1-β2^t` (host-computed from the step counter); `wd` = weight decay.
+#[allow(clippy::too_many_arguments)]
+pub fn adam_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                w: &Tensor, g: &Tensor, m: &Tensor, v: &Tensor,
+                lr: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32, wd: f32) {
+    let n = w.rows * w.cols;
+    let dims = [n as u32, 0u32, lr.to_bits(), b1.to_bits(), b2.to_bits(),
+                eps.to_bits(), bc1.to_bits(), bc2.to_bits(), wd.to_bits(), 0, 0, 0];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("adam.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("adam", WGSL_ADAM);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: w.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: g.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: m.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: v.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
 // shared helper: elementwise op with two read inputs + one output.
 fn elem2(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, key: &'static str, wgsl: &str,
          a: &Tensor, b: &Tensor, out: &Tensor, dims: &[u32]) {

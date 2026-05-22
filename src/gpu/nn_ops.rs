@@ -51,10 +51,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let row_max = red[0];
         workgroupBarrier();
 
+        // sum only over valid (unmasked) columns — for causal (op 2) the future
+        // columns j > row must NOT enter the sum: their raw scores are unbounded
+        // and exp() of them overflows once attention weights grow.
         var local_sum: f32 = 0.0;
         i = tid;
         loop {
-            if (i >= d.cols) { break; }
+            if (i >= limit) { break; }
             local_sum = local_sum + exp(inp[base + i] - row_max);
             i = i + 256u;
         }
@@ -70,10 +73,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let row_sum = red[0];
         workgroupBarrier();
 
+        // write probs for valid cols, zero the masked tail (j > row).
         i = tid;
         loop {
             if (i >= d.cols) { break; }
-            out[base + i] = exp(inp[base + i] - row_max) / row_sum;
+            if (i < limit) { out[base + i] = exp(inp[base + i] - row_max) / row_sum; }
+            else { out[base + i] = 0.0; }
             i = i + 256u;
         }
     } else {
@@ -247,6 +252,34 @@ mod tests {
             }
             let err = gpu.iter().zip(&cpu).map(|(g, c)| (g - c).abs()).fold(0.0f32, f32::max);
             assert!(err < 1e-4, "softmax {rows}x{cols} err {err}");
+        }
+    }
+
+    /// Causal softmax must mask future columns (j > row) to exactly 0 and never
+    /// let their (possibly huge) raw scores enter the row sum. Regression for a
+    /// bug where the sum/normalize loops iterated all cols → exp(future) blew up
+    /// to NaN once attention weights grew during training.
+    #[test]
+    fn causal_softmax_masks_future() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let (rows, cols) = (5usize, 5usize);
+        // future cells (j > r) carry enormous scores; if they leaked into the
+        // softmax, exp() would overflow and the row would be NaN/inf.
+        let mut inp = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                inp[r * cols + c] = if c > r { 1.0e5 } else { (r + c) as f32 * 0.1 };
+            }
+        }
+        let out = causal_softmax(&ctx, &inp, rows, cols);
+        for r in 0..rows {
+            let row = &out[r * cols..(r + 1) * cols];
+            assert!(row.iter().all(|x| x.is_finite()), "row {r} has non-finite: {row:?}");
+            for (c, &p) in row.iter().enumerate() {
+                if c > r { assert_eq!(p, 0.0, "future cell ({r},{c}) not masked: {p}"); }
+            }
+            let s: f32 = row.iter().sum();
+            assert!((s - 1.0).abs() < 1e-4, "row {r} sum {s} != 1");
         }
     }
 

@@ -563,6 +563,25 @@ pub struct ModelDev {
     norm_f: Tensor,
     eps: f32,
     scale: f32,
+    /// Adam optimizer state, lazily created on the first `train_step_adam`.
+    opt: Option<AdamState>,
+}
+
+/// Persistent first/second-moment buffers for one weight tensor.
+struct AdamMV { m: Tensor, v: Tensor }
+
+/// Per-layer Adam moments (mirror LayerDev's trainable weights).
+struct LayerAdam { wq: AdamMV, wk: AdamMV, wv: AdamMV, wo: AdamMV,
+                   w1: AdamMV, w2: AdamMV, n1: AdamMV, n2: AdamMV }
+
+/// Whole-model Adam state. Device weights keep device moments; embed/pos are
+/// host-resident (scatter update) so their moments live on the host too.
+struct AdamState {
+    layers: Vec<LayerAdam>,
+    norm_f: AdamMV,
+    m_embed: Vec<f32>, v_embed: Vec<f32>,
+    m_pos: Vec<f32>, v_pos: Vec<f32>,
+    t: u64,
 }
 
 impl ModelDev {
@@ -586,6 +605,7 @@ impl ModelDev {
             embed_host: m.embed.clone(), pos_host: m.pos.clone(),
             layers, norm_f: ctx.upload(&m.norm_f, 1, d), eps: m.eps,
             scale: 1.0 / (d as f32).sqrt(),
+            opt: None,
         }
     }
 
@@ -792,6 +812,151 @@ impl ModelDev {
         // embed/pos: host update + re-upload (keeps device + host copies in sync)
         for i in 0..self.embed_host.len() { self.embed_host[i] -= lr * f * d_embed[i]; }
         for i in 0..self.pos_host.len() { self.pos_host[i] -= lr * f * d_pos[i]; }
+        self.embed = ctx.upload(&self.embed_host, v, d);
+        self.pos = ctx.upload(&self.pos_host, self.cfg.max_seq, d);
+        loss
+    }
+
+    /// Lazily allocate zeroed Adam moment buffers (device for weights, host for
+    /// embed/pos). Called on the first `train_step_adam`.
+    fn ensure_opt(&mut self, ctx: &GpuContext) {
+        if self.opt.is_some() { return; }
+        let d = self.cfg.d_model;
+        let ff = self.cfg.d_ff;
+        let v = self.cfg.vocab;
+        let zmv = |r: usize, c: usize| AdamMV {
+            m: ctx.upload(&vec![0.0; r * c], r, c),
+            v: ctx.upload(&vec![0.0; r * c], r, c),
+        };
+        let layers = (0..self.layers.len()).map(|_| LayerAdam {
+            wq: zmv(d, d), wk: zmv(d, d), wv: zmv(d, d), wo: zmv(d, d),
+            w1: zmv(d, ff), w2: zmv(ff, d), n1: zmv(1, d), n2: zmv(1, d),
+        }).collect();
+        self.opt = Some(AdamState {
+            layers, norm_f: zmv(1, d),
+            m_embed: vec![0.0; v * d], v_embed: vec![0.0; v * d],
+            m_pos: vec![0.0; self.cfg.max_seq * d], v_pos: vec![0.0; self.cfg.max_seq * d],
+            t: 0,
+        });
+    }
+
+    /// One Adam training step, fully on GPU (Adam update via `adam_rec`), with
+    /// optional on-device global-norm clip. Transformers need Adam — plain SGD
+    /// stalls at the unigram entropy on a real corpus (measured). embed/pos use
+    /// a host-side Adam (they live on the host for the scatter gather).
+    pub fn train_step_adam(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
+                           lr: f32, max_norm: f32) -> f32 {
+        // eps 1e-5 (not the textbook 1e-8): rarely-updated byte embeddings let
+        // the 2nd moment decay to ~0, so a later gradient spike makes g/sqrt(v)
+        // explode → NaN. A larger eps floors the denominator and stays stable.
+        const B1: f32 = 0.9; const B2: f32 = 0.999; const EPS: f32 = 1e-5;
+        const WD: f32 = 0.01;   // decoupled weight decay (AdamW) — keeps weights bounded
+        self.ensure_opt(ctx);
+        let d = self.cfg.d_model;
+        let v = self.cfg.vocab;
+        let seq = tokens.len();
+
+        // --- forward (one submit, download only logits) ---
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let (caches, xf, x_final, logits_t) = self.forward_train_dev(ctx, &mut enc, tokens);
+        ctx.queue.submit(Some(enc.finish()));
+        let logits = ctx.download(&logits_t);
+
+        // --- loss + dlogits (host, small) ---
+        let mut loss = 0.0;
+        let mut dlogits = vec![0.0f32; seq * v];
+        for i in 0..seq {
+            let row = &logits[i * v..(i + 1) * v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|z| (z - mx).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            loss += -(row[targets[i] as usize] - mx - sum.ln());
+            for j in 0..v { dlogits[i * v + j] = exps[j] / sum / seq as f32; }
+            dlogits[i * v + targets[i] as usize] -= 1.0 / seq as f32;
+        }
+        loss /= seq as f32;
+        let dlogits_t = ctx.upload(&dlogits, seq, v);
+
+        // --- backward + on-device clip-norm reduction (one encoder) ---
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let g = self.backward_dev(ctx, &mut enc, &caches, &xf, &x_final, &dlogits_t, tokens);
+        let n_slots = self.layers.len() * 8 + 1;
+        let accum = ctx.alloc(1, n_slots);
+        let mut slot = 0u32;
+        for l in &g.layers {
+            for t in [&l.dwq, &l.dwk, &l.dwv, &l.dwo, &l.dw1, &l.dw2, &l.dn1, &l.dn2] {
+                device::sumsq_rec(ctx, &mut enc, t, &accum, slot); slot += 1;
+            }
+        }
+        device::sumsq_rec(ctx, &mut enc, &g.d_norm_f, &accum, slot);
+        ctx.queue.submit(Some(enc.finish()));
+
+        // --- global-norm clip factor (3 readbacks) ---
+        let dx = ctx.download(&g.dx);
+        let d_embed_head = ctx.download(&g.d_embed_head);
+        let mut sumsq: f64 = ctx.download(&accum).iter().map(|&x| x as f64).sum();
+        let mut d_embed = d_embed_head.clone();
+        let mut d_pos = vec![0.0f32; self.pos_host.len()];
+        for (i, &t) in tokens.iter().enumerate() {
+            let base = (t as usize) * d;
+            for j in 0..d {
+                d_embed[base + j] += dx[i * d + j];
+                d_pos[i * d + j] += dx[i * d + j];
+            }
+        }
+        for &x in d_embed.iter() { sumsq += (x as f64) * (x as f64); }
+        for &x in d_pos.iter() { sumsq += (x as f64) * (x as f64); }
+        let gn = sumsq.sqrt() as f32;
+        let f = if gn.is_finite() && gn > max_norm && gn > 0.0 { max_norm / gn } else { 1.0 };
+
+        // --- Adam update ---
+        let t = { let o = self.opt.as_mut().unwrap(); o.t += 1; o.t };
+        let bc1 = 1.0 - B1.powi(t as i32);
+        let bc2 = 1.0 - B2.powi(t as i32);
+        let opt = self.opt.as_ref().unwrap();
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        // clip is applied by scaling each grad in-place before Adam consumes it.
+        if f != 1.0 {
+            for lg in &g.layers {
+                for t in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw2, &lg.dn1, &lg.dn2] {
+                    device::scale_rec(ctx, &mut enc, t, f);
+                }
+            }
+            device::scale_rec(ctx, &mut enc, &g.d_norm_f, f);
+        }
+        let am = |e: &mut wgpu::CommandEncoder, w: &Tensor, gr: &Tensor, s: &AdamMV| {
+            device::adam_rec(ctx, e, w, gr, &s.m, &s.v, lr, B1, B2, EPS, bc1, bc2, WD);
+        };
+        for (li, l) in self.layers.iter().enumerate() {
+            let a = &opt.layers[li];
+            am(&mut enc, &l.wq, &g.layers[li].dwq, &a.wq);
+            am(&mut enc, &l.wk, &g.layers[li].dwk, &a.wk);
+            am(&mut enc, &l.wv, &g.layers[li].dwv, &a.wv);
+            am(&mut enc, &l.wo, &g.layers[li].dwo, &a.wo);
+            am(&mut enc, &l.w1, &g.layers[li].dw1, &a.w1);
+            am(&mut enc, &l.w2, &g.layers[li].dw2, &a.w2);
+            am(&mut enc, &l.norm1, &g.layers[li].dn1, &a.n1);
+            am(&mut enc, &l.norm2, &g.layers[li].dn2, &a.n2);
+        }
+        am(&mut enc, &self.norm_f, &g.d_norm_f, &opt.norm_f);
+        ctx.queue.submit(Some(enc.finish()));
+
+        // embed/pos: host Adam (grads already clipped via f), then re-upload.
+        let o = self.opt.as_mut().unwrap();
+        for i in 0..self.embed_host.len() {
+            let gi = d_embed[i] * f;
+            o.m_embed[i] = B1 * o.m_embed[i] + (1.0 - B1) * gi;
+            o.v_embed[i] = B2 * o.v_embed[i] + (1.0 - B2) * gi * gi;
+            let mh = o.m_embed[i] / bc1; let vh = o.v_embed[i] / bc2;
+            self.embed_host[i] -= lr * (mh / (vh.sqrt() + EPS) + WD * self.embed_host[i]);
+        }
+        for i in 0..self.pos_host.len() {
+            let gi = d_pos[i] * f;
+            o.m_pos[i] = B1 * o.m_pos[i] + (1.0 - B1) * gi;
+            o.v_pos[i] = B2 * o.v_pos[i] + (1.0 - B2) * gi * gi;
+            let mh = o.m_pos[i] / bc1; let vh = o.v_pos[i] / bc2;
+            self.pos_host[i] -= lr * (mh / (vh.sqrt() + EPS) + WD * self.pos_host[i]);
+        }
         self.embed = ctx.upload(&self.embed_host, v, d);
         self.pos = ctx.upload(&self.pos_host, self.cfg.max_seq, d);
         loss
