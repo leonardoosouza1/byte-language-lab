@@ -317,22 +317,22 @@ pub fn silu_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     elem2(ctx, enc, "silu_bwd", WGSL_SILU_BWD, dha, h, out, &[n as u32, 0]);
 }
 
-/// out = a * scalar.
+/// In-place scale: t *= scalar. (single binding so the same buffer is never
+/// both read and read_write in one dispatch — wgpu forbids that aliasing.)
 const WGSL_SCALE: &str = r#"
 struct D { n: u32, s: f32 };
-@group(0) @binding(0) var<storage, read>       a: array<f32>;
-@group(0) @binding(1) var<storage, read_write> o: array<f32>;
-@group(0) @binding(2) var<uniform>             d: D;
+@group(0) @binding(0) var<storage, read_write> w: array<f32>;
+@group(0) @binding(1) var<uniform>             d: D;
 @compute @workgroup_size(256,1,1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= d.n) { return; }
-    o[i] = a[i] * d.s;
+    w[i] = w[i] * d.s;
 }
 "#;
 
-pub fn scale_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
-                 a: &Tensor, out: &Tensor, s: f32) {
-    let n = a.rows * a.cols;
+/// Record in-place `t *= s` into `enc`.
+pub fn scale_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, t: &Tensor, s: f32) {
+    let n = t.rows * t.cols;
     let dims = [n as u32, s.to_bits()];
     let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("scale.dims"), contents: bytemuck::cast_slice(&dims),
@@ -340,9 +340,8 @@ pub fn scale_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     let pipeline = ctx.pipeline("scale", WGSL_SCALE);
     let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: a.buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: out.buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: dim_buf.as_entire_binding() }]});
+            wgpu::BindGroupEntry { binding: 0, resource: t.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: dim_buf.as_entire_binding() }]});
     let mut pass = enc.begin_compute_pass(&Default::default());
     pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
@@ -508,6 +507,38 @@ pub fn rms_w_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     pass.dispatch_workgroups((cols as u32).div_ceil(256), 1, 1);
 }
 
+/// In-place SGD: w -= lr · g.
+const WGSL_SGD: &str = r#"
+struct D { n: u32, lr: f32 };
+@group(0) @binding(0) var<storage, read_write> w: array<f32>;
+@group(0) @binding(1) var<storage, read>       g: array<f32>;
+@group(0) @binding(2) var<uniform>             d: D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= d.n) { return; }
+    w[i] = w[i] - d.lr * g[i];
+}
+"#;
+
+/// Record `w -= lr · g` into `enc` (both device tensors, same length).
+pub fn sgd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+               w: &Tensor, g: &Tensor, lr: f32) {
+    let n = w.rows * w.cols;
+    let dims = [n as u32, lr.to_bits()];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sgd.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("sgd", WGSL_SGD);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: w.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: g.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
 // shared helper: elementwise op with two read inputs + one output.
 fn elem2(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, key: &'static str, wgsl: &str,
          a: &Tensor, b: &Tensor, out: &Tensor, dims: &[u32]) {
@@ -573,13 +604,13 @@ mod tests {
         silu_bwd_rec(&ctx,&mut e,&tda,&thh,&to); ctx.queue.submit(Some(e.finish()));
         let g_silu = ctx.download(&to);
 
-        // --- scale ---
+        // --- scale (in place) ---
         let aa = mk(&mut s, rows*cols);
         let ref_sc: Vec<f32> = aa.iter().map(|x| x*0.125).collect();
-        let (taa, tsc) = (ctx.upload(&aa,rows,cols), ctx.alloc(rows,cols));
+        let taa = ctx.upload(&aa,rows,cols);
         let mut e = ctx.device.create_command_encoder(&Default::default());
-        scale_rec(&ctx,&mut e,&taa,&tsc,0.125); ctx.queue.submit(Some(e.finish()));
-        let g_sc = ctx.download(&tsc);
+        scale_rec(&ctx,&mut e,&taa,0.125); ctx.queue.submit(Some(e.finish()));
+        let g_sc = ctx.download(&taa);
 
         // --- causal softmax bwd (rows==cols square) ---
         let n = 20usize;

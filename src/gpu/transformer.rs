@@ -551,8 +551,10 @@ struct LayerDev {
     norm1: Tensor, norm2: Tensor, w1: Tensor, w2: Tensor,
 }
 
-/// GPU-resident copy of a Model for fast forward. wq is PRE-SCALED by
-/// 1/sqrt(d) at upload so the attention scale needs no extra kernel.
+/// GPU-resident copy of a Model. Weights are stored UNSCALED; the attention
+/// 1/sqrt(d) scale is applied to q in the forward (scale_rec) so the same
+/// representation drives forward AND the training backward without a grad
+/// scale mismatch.
 pub struct ModelDev {
     pub cfg: Config,
     embed: Tensor, pos: Tensor,
@@ -560,25 +562,22 @@ pub struct ModelDev {
     layers: Vec<LayerDev>,
     norm_f: Tensor,
     eps: f32,
+    scale: f32,
 }
 
 impl ModelDev {
     pub fn new(ctx: &GpuContext, m: &Model) -> Self {
         let d = m.cfg.d_model;
         let ff = m.cfg.d_ff;
-        let scale = 1.0 / (d as f32).sqrt();
-        let layers = m.layers.iter().map(|l| {
-            let wq_scaled: Vec<f32> = l.wq.iter().map(|&x| x * scale).collect();
-            LayerDev {
-                wq: ctx.upload(&wq_scaled, d, d),
-                wk: ctx.upload(&l.wk, d, d),
-                wv: ctx.upload(&l.wv, d, d),
-                wo: ctx.upload(&l.wo, d, d),
-                norm1: ctx.upload(&l.norm1, 1, d),
-                norm2: ctx.upload(&l.norm2, 1, d),
-                w1: ctx.upload(&l.w1, d, ff),
-                w2: ctx.upload(&l.w2, ff, d),
-            }
+        let layers = m.layers.iter().map(|l| LayerDev {
+            wq: ctx.upload(&l.wq, d, d),
+            wk: ctx.upload(&l.wk, d, d),
+            wv: ctx.upload(&l.wv, d, d),
+            wo: ctx.upload(&l.wo, d, d),
+            norm1: ctx.upload(&l.norm1, 1, d),
+            norm2: ctx.upload(&l.norm2, 1, d),
+            w1: ctx.upload(&l.w1, d, ff),
+            w2: ctx.upload(&l.w2, ff, d),
         }).collect();
         ModelDev {
             cfg: m.cfg,
@@ -586,6 +585,7 @@ impl ModelDev {
             pos: ctx.upload(&m.pos, m.cfg.max_seq, d),
             embed_host: m.embed.clone(), pos_host: m.pos.clone(),
             layers, norm_f: ctx.upload(&m.norm_f, 1, d), eps: m.eps,
+            scale: 1.0 / (d as f32).sqrt(),
         }
     }
 
@@ -616,7 +616,8 @@ impl ModelDev {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         for l in &self.layers {
             device::row_rec(ctx, &mut enc, &x, &l.norm1, &xn, self.eps, 1);     // rmsnorm
-            device::gemm_rec(ctx, &mut enc, &xn, &l.wq, &q);                    // q (pre-scaled)
+            device::gemm_rec(ctx, &mut enc, &xn, &l.wq, &q);
+            device::scale_rec(ctx, &mut enc, &q, self.scale);                 // q *= 1/sqrt(d)
             device::gemm_rec(ctx, &mut enc, &xn, &l.wk, &k);
             device::gemm_rec(ctx, &mut enc, &xn, &l.wv, &vv);
             device::gemm_nt_rec(ctx, &mut enc, &q, &k, &scores);               // q·kᵀ
@@ -655,6 +656,240 @@ impl ModelDev {
         }
         seq[prompt.len()..].to_vec()
     }
+
+    /// Forward that keeps every activation as a device Tensor (for backward).
+    /// Records into `enc`; the caller submits. Returns caches + xf + x_final.
+    fn forward_train_dev(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                         tokens: &[u8]) -> (Vec<LayerCacheDev>, Tensor, Tensor, Tensor) {
+        let d = self.cfg.d_model;
+        let ff = self.cfg.d_ff;
+        let v = self.cfg.vocab;
+        let seq = tokens.len();
+        let mut x0 = vec![0.0f32; seq * d];
+        for (i, &t) in tokens.iter().enumerate() {
+            for j in 0..d {
+                x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[i * d + j];
+            }
+        }
+        let mut x = ctx.upload(&x0, seq, d);
+        let mut caches = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            let xn = ctx.alloc(seq, d);
+            let q = ctx.alloc(seq, d); let k = ctx.alloc(seq, d); let vv = ctx.alloc(seq, d);
+            let scores = ctx.alloc(seq, seq); let probs = ctx.alloc(seq, seq);
+            let attn = ctx.alloc(seq, d); let ao = ctx.alloc(seq, d);
+            let xmid = ctx.alloc(seq, d); let xn2 = ctx.alloc(seq, d);
+            let h = ctx.alloc(seq, ff); let ha = ctx.alloc(seq, ff); let ffn = ctx.alloc(seq, d);
+            let xout = ctx.alloc(seq, d);
+            device::row_rec(ctx, enc, &x, &l.norm1, &xn, self.eps, 1);
+            device::gemm_rec(ctx, enc, &xn, &l.wq, &q);
+            device::scale_rec(ctx, enc, &q, self.scale);
+            device::gemm_rec(ctx, enc, &xn, &l.wk, &k);
+            device::gemm_rec(ctx, enc, &xn, &l.wv, &vv);
+            device::gemm_nt_rec(ctx, enc, &q, &k, &scores);
+            device::row_rec(ctx, enc, &scores, &self.pos, &probs, 0.0, 2);
+            device::gemm_rec(ctx, enc, &probs, &vv, &attn);
+            device::gemm_rec(ctx, enc, &attn, &l.wo, &ao);
+            device::add_rec(ctx, enc, &x, &ao, &xmid);
+            device::row_rec(ctx, enc, &xmid, &l.norm2, &xn2, self.eps, 1);
+            device::gemm_rec(ctx, enc, &xn2, &l.w1, &h);
+            device::elem_rec(ctx, enc, &h, &ha, 0);
+            device::gemm_rec(ctx, enc, &ha, &l.w2, &ffn);
+            device::add_rec(ctx, enc, &xmid, &ffn, &xout);
+            caches.push(LayerCacheDev { x_in: x, xn, q, k, v: vv, probs, attn, x_mid: xmid, xn2, h, ha });
+            x = xout;
+        }
+        let x_final = x;   // pre-final-norm
+        let xf = ctx.alloc(seq, d);
+        device::row_rec(ctx, enc, &x_final, &self.norm_f, &xf, self.eps, 1);
+        let logits = ctx.alloc(seq, v);
+        device::gemm_nt_rec(ctx, enc, &xf, &self.embed, &logits);
+        (caches, xf, x_final, logits)
+    }
+
+    /// One device-resident SGD step with global-norm grad clipping. Returns the
+    /// mean cross-entropy loss before the update. The matmul weights + norm_f
+    /// are updated on device; embed/pos use a small host scatter of dx (the
+    /// only data-dependent piece). Mirrors Model::train_step_clip exactly.
+    pub fn train_step_clip(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
+                           lr: f32, max_norm: f32) -> f32 {
+        let d = self.cfg.d_model;
+        let v = self.cfg.vocab;
+        let seq = tokens.len();
+
+        // --- forward (one submit, download only logits) ---
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let (caches, xf, x_final, logits_t) = self.forward_train_dev(ctx, &mut enc, tokens);
+        ctx.queue.submit(Some(enc.finish()));
+        let logits = ctx.download(&logits_t);
+
+        // --- loss + dlogits (host, small) ---
+        let mut loss = 0.0;
+        let mut dlogits = vec![0.0f32; seq * v];
+        for i in 0..seq {
+            let row = &logits[i * v..(i + 1) * v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|z| (z - mx).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            loss += -(row[targets[i] as usize] - mx - sum.ln());
+            for j in 0..v { dlogits[i * v + j] = exps[j] / sum / seq as f32; }
+            dlogits[i * v + targets[i] as usize] -= 1.0 / seq as f32;
+        }
+        loss /= seq as f32;
+        let dlogits_t = ctx.upload(&dlogits, seq, v);
+
+        // --- backward (record all grads in one encoder) ---
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let g = self.backward_dev(ctx, &mut enc, &caches, &xf, &x_final, &dlogits_t, tokens);
+        ctx.queue.submit(Some(enc.finish()));
+
+        // --- global-norm clip factor (download grads' norm pieces) ---
+        // matmul-weight + norm grads dominate; include dx for embed/pos.
+        let dx = ctx.download(&g.dx);
+        let d_embed_head = ctx.download(&g.d_embed_head);
+        let mut sumsq = 0.0f64;
+        let mut acc = |t: &Tensor| { for x in ctx.download(t) { sumsq += (x as f64) * (x as f64); } };
+        for l in &g.layers {
+            acc(&l.dwq); acc(&l.dwk); acc(&l.dwv); acc(&l.dwo);
+            acc(&l.dw1); acc(&l.dw2); acc(&l.dn1); acc(&l.dn2);
+        }
+        acc(&g.d_norm_f);
+        // embed+pos grads via host scatter of dx (+ tied head)
+        let mut d_embed = d_embed_head.clone();
+        let mut d_pos = vec![0.0f32; self.pos_host.len()];
+        for (i, &t) in tokens.iter().enumerate() {
+            let base = (t as usize) * d;
+            for j in 0..d {
+                d_embed[base + j] += dx[i * d + j];
+                d_pos[i * d + j] += dx[i * d + j];
+            }
+        }
+        for &x in d_embed.iter() { sumsq += (x as f64) * (x as f64); }
+        for &x in d_pos.iter() { sumsq += (x as f64) * (x as f64); }
+        let gn = (sumsq.sqrt()) as f32;
+        let f = if gn.is_finite() && gn > max_norm && gn > 0.0 { max_norm / gn } else { 1.0 };
+
+        // --- apply SGD (device weights on device; embed/pos on host then re-upload) ---
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for (li, l) in self.layers.iter().enumerate() {
+            device::sgd_rec(ctx, &mut enc, &l.wq, &g.layers[li].dwq, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.wk, &g.layers[li].dwk, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.wv, &g.layers[li].dwv, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.wo, &g.layers[li].dwo, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.w1, &g.layers[li].dw1, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.w2, &g.layers[li].dw2, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.norm1, &g.layers[li].dn1, lr * f);
+            device::sgd_rec(ctx, &mut enc, &l.norm2, &g.layers[li].dn2, lr * f);
+        }
+        device::sgd_rec(ctx, &mut enc, &self.norm_f, &g.d_norm_f, lr * f);
+        ctx.queue.submit(Some(enc.finish()));
+        // embed/pos: host update + re-upload (keeps device + host copies in sync)
+        for i in 0..self.embed_host.len() { self.embed_host[i] -= lr * f * d_embed[i]; }
+        for i in 0..self.pos_host.len() { self.pos_host[i] -= lr * f * d_pos[i]; }
+        self.embed = ctx.upload(&self.embed_host, v, d);
+        self.pos = ctx.upload(&self.pos_host, self.cfg.max_seq, d);
+        loss
+    }
+
+    /// Records the full backward into `enc`, returning device grad tensors.
+    fn backward_dev(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                    caches: &[LayerCacheDev], xf: &Tensor, x_final: &Tensor,
+                    dlogits: &Tensor, _tokens: &[u8]) -> GradsDev {
+        let d = self.cfg.d_model;
+        let ff = self.cfg.d_ff;
+        let v = self.cfg.vocab;
+        let seq = caches[0].x_in.rows;
+        let inv_scratch = ctx.alloc(seq, 1);
+
+        // lm_head (tied): d_embed_head = dlogitsᵀ·xf ; dxf = dlogits·embed
+        let d_embed_head = ctx.alloc(v, d);
+        device::gemm_tn_rec(ctx, enc, dlogits, xf, &d_embed_head);
+        let dxf = ctx.alloc(seq, d);
+        device::gemm_rec(ctx, enc, dlogits, &self.embed, &dxf);
+        // norm_f backward
+        let mut dx = ctx.alloc(seq, d);
+        device::rms_in_bwd_rec(ctx, enc, &dxf, x_final, &self.norm_f, &dx, self.eps);
+        let d_norm_f = ctx.alloc(1, d);
+        device::rms_w_bwd_rec(ctx, enc, &dxf, x_final, &inv_scratch, &d_norm_f, self.eps);
+
+        let mut layer_grads = Vec::with_capacity(self.layers.len());
+        for li in (0..self.layers.len()).rev() {
+            let l = &self.layers[li];
+            let c = &caches[li];
+            // ---- FFN ----
+            let dw2 = ctx.alloc(ff, d);
+            device::gemm_tn_rec(ctx, enc, &c.ha, &dx, &dw2);          // haᵀ·dffn
+            let dha = ctx.alloc(seq, ff);
+            device::gemm_nt_rec(ctx, enc, &dx, &l.w2, &dha);          // dffn·w2ᵀ
+            let dh = ctx.alloc(seq, ff);
+            device::silu_bwd_rec(ctx, enc, &dha, &c.h, &dh);
+            let dw1 = ctx.alloc(d, ff);
+            device::gemm_tn_rec(ctx, enc, &c.xn2, &dh, &dw1);         // xn2ᵀ·dh
+            let dxn2 = ctx.alloc(seq, d);
+            device::gemm_nt_rec(ctx, enc, &dh, &l.w1, &dxn2);         // dh·w1ᵀ
+            let dn2 = ctx.alloc(1, d);
+            device::rms_w_bwd_rec(ctx, enc, &dxn2, &c.x_mid, &inv_scratch, &dn2, self.eps);
+            let dxn2_in = ctx.alloc(seq, d);
+            device::rms_in_bwd_rec(ctx, enc, &dxn2, &c.x_mid, &l.norm2, &dxn2_in, self.eps);
+            let dx1 = ctx.alloc(seq, d);
+            device::add_rec(ctx, enc, &dx, &dxn2_in, &dx1);          // dx += dx_from_norm2
+            // ---- Attention ----
+            let dwo = ctx.alloc(d, d);
+            device::gemm_tn_rec(ctx, enc, &c.attn, &dx1, &dwo);      // attnᵀ·dao
+            let dattn = ctx.alloc(seq, d);
+            device::gemm_nt_rec(ctx, enc, &dx1, &l.wo, &dattn);      // dao·woᵀ
+            let dv = ctx.alloc(seq, d);
+            device::gemm_tn_rec(ctx, enc, &c.probs, &dattn, &dv);    // probsᵀ·dattn
+            let dprobs = ctx.alloc(seq, seq);
+            device::gemm_nt_rec(ctx, enc, &dattn, &c.v, &dprobs);    // dattn·vᵀ
+            let dscores = ctx.alloc(seq, seq);
+            device::csm_bwd_rec(ctx, enc, &dprobs, &c.probs, &dscores);
+            let dq = ctx.alloc(seq, d);
+            device::gemm_rec(ctx, enc, &dscores, &c.k, &dq);         // dscores·k
+            device::scale_rec(ctx, enc, &dq, self.scale);            // *scale
+            let dk = ctx.alloc(seq, d);
+            device::gemm_tn_rec(ctx, enc, &dscores, &c.q, &dk);      // dscoresᵀ·q (q scaled)
+            let dwq = ctx.alloc(d, d); let dwk = ctx.alloc(d, d); let dwv = ctx.alloc(d, d);
+            device::gemm_tn_rec(ctx, enc, &c.xn, &dq, &dwq);
+            device::gemm_tn_rec(ctx, enc, &c.xn, &dk, &dwk);
+            device::gemm_tn_rec(ctx, enc, &c.xn, &dv, &dwv);
+            let dxn_q = ctx.alloc(seq, d); let dxn_k = ctx.alloc(seq, d); let dxn_v = ctx.alloc(seq, d);
+            device::gemm_nt_rec(ctx, enc, &dq, &l.wq, &dxn_q);
+            device::gemm_nt_rec(ctx, enc, &dk, &l.wk, &dxn_k);
+            device::gemm_nt_rec(ctx, enc, &dv, &l.wv, &dxn_v);
+            let dxn_a = ctx.alloc(seq, d); let dxn = ctx.alloc(seq, d);
+            device::add_rec(ctx, enc, &dxn_q, &dxn_k, &dxn_a);
+            device::add_rec(ctx, enc, &dxn_a, &dxn_v, &dxn);
+            let dn1 = ctx.alloc(1, d);
+            device::rms_w_bwd_rec(ctx, enc, &dxn, &c.x_in, &inv_scratch, &dn1, self.eps);
+            let dxn_in = ctx.alloc(seq, d);
+            device::rms_in_bwd_rec(ctx, enc, &dxn, &c.x_in, &l.norm1, &dxn_in, self.eps);
+            let dx_next = ctx.alloc(seq, d);
+            device::add_rec(ctx, enc, &dx1, &dxn_in, &dx_next);
+            dx = dx_next;
+            layer_grads.push(LayerGradDev { dwq, dwk, dwv, dwo, dw1, dw2, dn1, dn2 });
+        }
+        layer_grads.reverse();   // we walked layers in reverse
+        GradsDev { layers: layer_grads, d_norm_f, d_embed_head, dx }
+    }
+}
+
+struct LayerCacheDev {
+    x_in: Tensor, xn: Tensor, q: Tensor, k: Tensor, v: Tensor,
+    probs: Tensor, attn: Tensor, x_mid: Tensor, xn2: Tensor, h: Tensor, ha: Tensor,
+}
+
+struct LayerGradDev {
+    dwq: Tensor, dwk: Tensor, dwv: Tensor, dwo: Tensor,
+    dw1: Tensor, dw2: Tensor, dn1: Tensor, dn2: Tensor,
+}
+
+/// Device-resident gradients from one backward.
+pub struct GradsDev {
+    layers: Vec<LayerGradDev>,
+    d_norm_f: Tensor,
+    d_embed_head: Tensor,
+    dx: Tensor,
 }
 
 // ---- backward helpers (CPU, row-wise; small relative to GEMMs) ----
@@ -782,6 +1017,82 @@ mod tests {
         // diverges. Breaking the unigram floor (needs grad clipping + higher
         // LR) is proven separately by transformer_beats_unigram_floor.
         assert!(l.is_finite() && l < l0 * 0.5, "transformer training failed: {l0} -> {l}");
+    }
+
+    /// Device backward grads must match the CPU backward grads (same model,
+    /// same input) — localizes any wrong transpose/scale in backward_dev.
+    #[test]
+    fn device_backward_grad_parity() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16, n_predict: 1 };
+        let model = Model::init(cfg, 5);
+        let data = b"abracadabra!!";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        let (_, cpu) = model.backward(&ctx, &toks, &tgts);
+
+        let dev = ModelDev::new(&ctx, &model);
+        let d = cfg.d_model; let v = cfg.vocab; let seq = toks.len();
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let (caches, xf, x_final, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &toks);
+        ctx.queue.submit(Some(enc.finish()));
+        let logits = ctx.download(&logits_t);
+        let mut dlogits = vec![0.0f32; seq * v];
+        for i in 0..seq {
+            let row = &logits[i * v..(i + 1) * v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|z| (z - mx).exp()).collect();
+            let s: f32 = exps.iter().sum();
+            for j in 0..v { dlogits[i * v + j] = exps[j] / s / seq as f32; }
+            dlogits[i * v + tgts[i] as usize] -= 1.0 / seq as f32;
+        }
+        let dlt = ctx.upload(&dlogits, seq, v);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let g = dev.backward_dev(&ctx, &mut enc, &caches, &xf, &x_final, &dlt, &toks);
+        ctx.queue.submit(Some(enc.finish()));
+
+        let rel = |a: &[f32], b: &[f32]| {
+            let mut me = 0.0f32;
+            for (x, y) in a.iter().zip(b) { me = me.max((x - y).abs() / x.abs().max(y.abs()).max(1e-3)); }
+            me
+        };
+        let e_wq = rel(&ctx.download(&g.layers[0].dwq), &cpu.dwq[0]);
+        let e_wk = rel(&ctx.download(&g.layers[0].dwk), &cpu.dwk[0]);
+        let e_wv = rel(&ctx.download(&g.layers[0].dwv), &cpu.dwv[0]);
+        let e_wo = rel(&ctx.download(&g.layers[0].dwo), &cpu.dwo[0]);
+        let e_w1 = rel(&ctx.download(&g.layers[1].dw1), &cpu.dw1[1]);
+        let e_w2 = rel(&ctx.download(&g.layers[1].dw2), &cpu.dw2[1]);
+        let e_nf = rel(&ctx.download(&g.d_norm_f), &cpu.d_norm_f);
+        let _ = d;
+        eprintln!("grad rel-err wq={e_wq:.2e} wk={e_wk:.2e} wv={e_wv:.2e} wo={e_wo:.2e} \
+                   w1={e_w1:.2e} w2={e_w2:.2e} norm_f={e_nf:.2e}");
+        for (n, e) in [("wq",e_wq),("wk",e_wk),("wv",e_wv),("wo",e_wo),("w1",e_w1),("w2",e_w2),("nf",e_nf)] {
+            assert!(e < 5e-2, "device grad {n} rel-err {e} too high");
+        }
+    }
+
+    /// End-to-end proof the device training loop works: device train_step_clip
+    /// drives loss BELOW the unigram floor (same bar as the CPU floor-break).
+    /// Impossible unless forward_train_dev + backward_dev + on-device SGD are
+    /// all correct.
+    #[test]
+    fn device_train_breaks_floor() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
+        let model = Model::init(cfg, 7);
+        let data = b"fn add(a,b){a+b}";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        let mut cnt = [0u32; 256];
+        for &t in &tgts { cnt[t as usize] += 1; }
+        let n = tgts.len() as f32;
+        let floor: f32 = tgts.iter().map(|&t| -((cnt[t as usize] as f32 / n).ln())).sum::<f32>() / n;
+
+        let mut dev = ModelDev::new(&ctx, &model);
+        let mut l = 0.0;
+        for _ in 0..1500 { l = dev.train_step_clip(&ctx, &toks, &tgts, 0.3, 1.0); }
+        eprintln!("device train loss -> {l:.3} (unigram floor {floor:.3})");
+        assert!(l.is_finite() && l < floor, "device training did not beat floor: {l:.3} >= {floor:.3}");
     }
 
     /// Device-resident generation must produce the same bytes as the per-op
