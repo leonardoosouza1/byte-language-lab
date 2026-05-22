@@ -16,7 +16,7 @@ use wgpu::util::DeviceExt;
 
 const TILE: u32 = 16;
 
-const WGSL: &str = r#"
+pub(crate) const WGSL: &str = r#"
 struct Dims { m: u32, n: u32, k: u32, _pad: u32 };
 @group(0) @binding(0) var<storage, read>        a: array<f32>;
 @group(0) @binding(1) var<storage, read>        b: array<f32>;

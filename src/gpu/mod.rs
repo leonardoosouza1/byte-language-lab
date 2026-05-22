@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 /// Tiled GEMM — foundational kernel for the byte-transformer student.
 pub mod gemm;
 
+/// Device-resident tensors + op chaining (one submit, readback only the result).
+pub mod device;
+
 /// Transformer row/elementwise ops: softmax, RMSNorm, SiLU/GELU.
 pub mod nn_ops;
 
