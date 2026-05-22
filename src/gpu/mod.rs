@@ -12,7 +12,8 @@
 //!   Default wgpu = 16384, RDNA2 suporta 65536.
 //! - `required_features` vazio — não precisamos de extensões.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Tiled GEMM — foundational kernel for the byte-transformer student.
 pub mod gemm;
@@ -37,6 +38,10 @@ pub struct GpuContext {
     pub queue: Arc<wgpu::Queue>,
     /// Info do adapter (nome/backend) — útil para logs.
     pub adapter_info: wgpu::AdapterInfo,
+    /// Cache de compute pipelines por chave estática. Compilar WGSL é caro
+    /// (~1ms); recompilar a cada chamada de kernel domina o custo de ops
+    /// pequenas. Compilamos uma vez e reusamos.
+    pipelines: Mutex<HashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
 }
 
 impl GpuContext {
@@ -102,7 +107,28 @@ impl GpuContext {
             device: Arc::new(device),
             queue: Arc::new(queue),
             adapter_info,
+            pipelines: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Compute pipeline cacheado por `key` (chave única por WGSL+entry).
+    /// Compila na primeira chamada, reusa nas demais. `layout: None` (auto).
+    pub fn pipeline(&self, key: &'static str, wgsl: &str) -> Arc<wgpu::ComputePipeline> {
+        if let Some(p) = self.pipelines.lock().unwrap().get(key) {
+            return p.clone();
+        }
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(key),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(key), layout: None, module: &module,
+            entry_point: Some("main"), compilation_options: Default::default(),
+            cache: None,
+        });
+        let arc = Arc::new(pipeline);
+        self.pipelines.lock().unwrap().insert(key, arc.clone());
+        arc
     }
 
     /// Nome amigável do dispositivo (ex.: "AMD Radeon RX 6700 XT (RADV NAVI22)").

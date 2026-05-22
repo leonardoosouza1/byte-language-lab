@@ -94,15 +94,7 @@ pub fn gemm(ctx: &GpuContext, a: &[f32], b: &[f32], m: usize, k: usize, n: usize
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
-    let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("gemm.wgsl"),
-        source: wgpu::ShaderSource::Wgsl(WGSL.into()),
-    });
-    let pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("gemm.pipeline"), layout: None, module: &module,
-        entry_point: Some("main"), compilation_options: Default::default(),
-        cache: None,
-    });
+    let pipeline = ctx.pipeline("gemm", WGSL);
     let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("gemm.bind"),
         layout: &pipeline.get_bind_group_layout(0),

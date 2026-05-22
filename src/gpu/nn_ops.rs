@@ -143,11 +143,7 @@ fn run_row(ctx: &GpuContext, inp: &[f32], wgt: &[f32], rows: usize, cols: usize,
     let dims = [rows as u32, cols as u32, eps.to_bits(), op];
     let db = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None, contents: bytemuck::cast_slice(&dims), usage: wgpu::BufferUsages::UNIFORM });
-    let m = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("row"), source: wgpu::ShaderSource::Wgsl(ROW_WGSL.into()) });
-    let p = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None, layout: None, module: &m, entry_point: Some("main"),
-        compilation_options: Default::default(), cache: None });
+    let p = ctx.pipeline("nn_row", ROW_WGSL);
     let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None,
         layout: &p.get_bind_group_layout(0), entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: ib.as_entire_binding() },
@@ -208,11 +204,7 @@ fn run_elem(ctx: &GpuContext, inp: &[f32], op: u32) -> Vec<f32> {
     let dims = [n as u32, op];
     let db = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None, contents: bytemuck::cast_slice(&dims), usage: wgpu::BufferUsages::UNIFORM });
-    let m = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("elem"), source: wgpu::ShaderSource::Wgsl(ELEM_WGSL.into()) });
-    let p = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None, layout: None, module: &m, entry_point: Some("main"),
-        compilation_options: Default::default(), cache: None });
+    let p = ctx.pipeline("nn_elem", ELEM_WGSL);
     let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None,
         layout: &p.get_bind_group_layout(0), entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: ib.as_entire_binding() },
