@@ -293,6 +293,256 @@ pub fn add_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
 }
 
+// ======================= backward-pass device kernels =======================
+// Each mirrors a CPU helper in transformer.rs and is parity-checked against it.
+
+/// dh = dha * silu'(z),  silu'(z) = s + z·s·(1-s),  s = sigmoid(z),  z = h.
+const WGSL_SILU_BWD: &str = r#"
+struct D { n: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       dha: array<f32>;
+@group(0) @binding(1) var<storage, read>       hh:  array<f32>;
+@group(0) @binding(2) var<storage, read_write> o:   array<f32>;
+@group(0) @binding(3) var<uniform>             d:   D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= d.n) { return; }
+    let z = hh[i]; let s = 1.0 / (1.0 + exp(-z));
+    o[i] = dha[i] * (s + z * s * (1.0 - s));
+}
+"#;
+
+pub fn silu_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                    dha: &Tensor, h: &Tensor, out: &Tensor) {
+    let n = h.rows * h.cols;
+    elem2(ctx, enc, "silu_bwd", WGSL_SILU_BWD, dha, h, out, &[n as u32, 0]);
+}
+
+/// out = a * scalar.
+const WGSL_SCALE: &str = r#"
+struct D { n: u32, s: f32 };
+@group(0) @binding(0) var<storage, read>       a: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+@group(0) @binding(2) var<uniform>             d: D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= d.n) { return; }
+    o[i] = a[i] * d.s;
+}
+"#;
+
+pub fn scale_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                 a: &Tensor, out: &Tensor, s: f32) {
+    let n = a.rows * a.cols;
+    let dims = [n as u32, s.to_bits()];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("scale.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("scale", WGSL_SCALE);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
+/// Causal softmax backward: ds[r,j<=r] = p[r,j]*(g[r,j] - sum_k p[r,k]g[r,k]).
+const WGSL_CSM_BWD: &str = r#"
+struct D { rows: u32, cols: u32, _e: u32, _o: u32 };
+@group(0) @binding(0) var<storage, read>       g: array<f32>;   // dprobs
+@group(0) @binding(1) var<storage, read>       p: array<f32>;   // probs
+@group(0) @binding(2) var<storage, read_write> o: array<f32>;
+@group(0) @binding(3) var<uniform>             d: D;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r = wid.x; let tid = lid.x;
+    if (r >= d.rows) { return; }
+    let base = r * d.cols; let lim = r + 1u;
+    var ld: f32 = 0.0; var i = tid;
+    loop { if (i >= lim) { break; } ld = ld + p[base+i]*g[base+i]; i = i + 256u; }
+    red[tid] = ld; workgroupBarrier();
+    var s: u32 = 128u;
+    loop { if (s == 0u) { break; } if (tid < s) { red[tid] = red[tid] + red[tid+s]; } workgroupBarrier(); s = s/2u; }
+    let dot = red[0]; workgroupBarrier();
+    i = tid;
+    loop { if (i >= d.cols) { break; }
+        if (i < lim) { o[base+i] = p[base+i]*(g[base+i]-dot); } else { o[base+i] = 0.0; }
+        i = i + 256u; }
+}
+"#;
+
+pub fn csm_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                   dprobs: &Tensor, probs: &Tensor, out: &Tensor) {
+    row2(ctx, enc, "csm_bwd", WGSL_CSM_BWD, dprobs, probs, out,
+         &[dprobs.rows as u32, dprobs.cols as u32, 0, 0], dprobs.rows);
+}
+
+/// RMSNorm input grad: dx_j = inv·w_j·dy_j - coef·x_j,
+/// inv=1/sqrt(mean(x²)+eps),  coef = inv³/cols · sum_j dy_j·w_j·x_j.
+const WGSL_RMS_IN_BWD: &str = r#"
+struct D { rows: u32, cols: u32, eps: f32, _o: u32 };
+@group(0) @binding(0) var<storage, read>       dy: array<f32>;
+@group(0) @binding(1) var<storage, read>       x:  array<f32>;
+@group(0) @binding(2) var<storage, read>       w:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> o:  array<f32>;
+@group(0) @binding(4) var<uniform>             d:  D;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r = wid.x; let tid = lid.x;
+    if (r >= d.rows) { return; }
+    let base = r * d.cols;
+    // mean square
+    var ss: f32 = 0.0; var i = tid;
+    loop { if (i >= d.cols) { break; } let v = x[base+i]; ss = ss + v*v; i = i + 256u; }
+    red[tid] = ss; workgroupBarrier();
+    var s: u32 = 128u;
+    loop { if (s==0u){break;} if (tid<s){red[tid]=red[tid]+red[tid+s];} workgroupBarrier(); s=s/2u; }
+    let inv = 1.0 / sqrt(red[0]/f32(d.cols) + d.eps); workgroupBarrier();
+    // dot = sum dy*w*x
+    var dt: f32 = 0.0; i = tid;
+    loop { if (i >= d.cols) { break; } dt = dt + dy[base+i]*w[i]*x[base+i]; i = i + 256u; }
+    red[tid] = dt; workgroupBarrier();
+    s = 128u;
+    loop { if (s==0u){break;} if (tid<s){red[tid]=red[tid]+red[tid+s];} workgroupBarrier(); s=s/2u; }
+    let coef = inv*inv*inv/f32(d.cols)*red[0]; workgroupBarrier();
+    i = tid;
+    loop { if (i >= d.cols) { break; }
+        o[base+i] = inv*w[i]*dy[base+i] - coef*x[base+i]; i = i + 256u; }
+}
+"#;
+
+pub fn rms_in_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                      dy: &Tensor, x: &Tensor, w: &Tensor, out: &Tensor, eps: f32) {
+    let dims = [dy.rows as u32, dy.cols as u32, eps.to_bits(), 0];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rmsin.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("rms_in_bwd", WGSL_RMS_IN_BWD);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: dy.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: x.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: w.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(dy.rows as u32, 1, 1);
+}
+
+/// inv[r] = 1/sqrt(mean(x[r]²)+eps) — per-row, feeds the weight grad.
+const WGSL_RMS_INV: &str = r#"
+struct D { rows: u32, cols: u32, eps: f32, _o: u32 };
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;   // [rows]
+@group(0) @binding(2) var<uniform>             d: D;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r = wid.x; let tid = lid.x;
+    if (r >= d.rows) { return; }
+    let base = r * d.cols;
+    var ss: f32 = 0.0; var i = tid;
+    loop { if (i >= d.cols) { break; } let v = x[base+i]; ss = ss + v*v; i = i + 256u; }
+    red[tid] = ss; workgroupBarrier();
+    var s: u32 = 128u;
+    loop { if (s==0u){break;} if (tid<s){red[tid]=red[tid]+red[tid+s];} workgroupBarrier(); s=s/2u; }
+    if (tid == 0u) { o[r] = 1.0 / sqrt(red[0]/f32(d.cols) + d.eps); }
+}
+"#;
+
+/// RMSNorm weight grad: dw[c] = sum_r dy[r,c]·x[r,c]·inv[r].
+const WGSL_RMS_W_BWD: &str = r#"
+struct D { rows: u32, cols: u32, _e: u32, _o: u32 };
+@group(0) @binding(0) var<storage, read>       dy:  array<f32>;
+@group(0) @binding(1) var<storage, read>       x:   array<f32>;
+@group(0) @binding(2) var<storage, read>       inv: array<f32>;
+@group(0) @binding(3) var<storage, read_write> o:   array<f32>;
+@group(0) @binding(4) var<uniform>             d:   D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x; if (c >= d.cols) { return; }
+    var acc: f32 = 0.0;
+    for (var r: u32 = 0u; r < d.rows; r = r + 1u) {
+        acc = acc + dy[r*d.cols+c]*x[r*d.cols+c]*inv[r];
+    }
+    o[c] = acc;
+}
+"#;
+
+pub fn rms_w_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                     dy: &Tensor, x: &Tensor, inv_scratch: &Tensor, out: &Tensor, eps: f32) {
+    let (rows, cols) = (dy.rows, dy.cols);
+    // 1) inv[r]
+    let dims = [rows as u32, cols as u32, eps.to_bits(), 0];
+    let db = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rmsinv.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let p1 = ctx.pipeline("rms_inv", WGSL_RMS_INV);
+    let bg1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &p1.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: x.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: inv_scratch.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: db.as_entire_binding() }]});
+    { let mut pass = enc.begin_compute_pass(&Default::default());
+      pass.set_pipeline(&p1); pass.set_bind_group(0, &bg1, &[]);
+      pass.dispatch_workgroups(rows as u32, 1, 1); }
+    // 2) dw[c]
+    let db2 = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rmsw.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let p2 = ctx.pipeline("rms_w_bwd", WGSL_RMS_W_BWD);
+    let bg2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &p2.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: dy.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: x.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: inv_scratch.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: db2.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&p2); pass.set_bind_group(0, &bg2, &[]);
+    pass.dispatch_workgroups((cols as u32).div_ceil(256), 1, 1);
+}
+
+// shared helper: elementwise op with two read inputs + one output.
+fn elem2(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, key: &'static str, wgsl: &str,
+         a: &Tensor, b: &Tensor, out: &Tensor, dims: &[u32]) {
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None, contents: bytemuck::cast_slice(dims), usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline(key, wgsl);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let n = a.rows * a.cols;
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
+// shared helper: row op with two read inputs + one output, one workgroup/row.
+fn row2(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, key: &'static str, wgsl: &str,
+        a: &Tensor, b: &Tensor, out: &Tensor, dims: &[u32], rows: usize) {
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None, contents: bytemuck::cast_slice(dims), usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline(key, wgsl);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(rows as u32, 1, 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +550,82 @@ mod tests {
     fn lcg(s: &mut u64) -> f32 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*s >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    /// Every backward kernel (silu', causal-softmax grad, rmsnorm input &
+    /// weight grads, scale) must match the CPU formula it ports.
+    #[test]
+    fn backward_kernels_parity() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let mut s = 3u64;
+        let (rows, cols) = (16usize, 24usize);
+        let eps = 1e-6f32;
+        let mk = |s: &mut u64, n: usize| (0..n).map(|_| lcg(s)).collect::<Vec<f32>>();
+        let mxerr = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x,y)|(x-y).abs()).fold(0.0f32,f32::max);
+
+        // --- silu_bwd ---
+        let dha = mk(&mut s, rows*cols); let hh = mk(&mut s, rows*cols);
+        let mut ref_silu = vec![0.0f32; rows*cols];
+        for i in 0..rows*cols { let z = hh[i]; let sg = 1.0/(1.0+(-z).exp());
+            ref_silu[i] = dha[i]*(sg + z*sg*(1.0-sg)); }
+        let (tda, thh, to) = (ctx.upload(&dha,rows,cols), ctx.upload(&hh,rows,cols), ctx.alloc(rows,cols));
+        let mut e = ctx.device.create_command_encoder(&Default::default());
+        silu_bwd_rec(&ctx,&mut e,&tda,&thh,&to); ctx.queue.submit(Some(e.finish()));
+        let g_silu = ctx.download(&to);
+
+        // --- scale ---
+        let aa = mk(&mut s, rows*cols);
+        let ref_sc: Vec<f32> = aa.iter().map(|x| x*0.125).collect();
+        let (taa, tsc) = (ctx.upload(&aa,rows,cols), ctx.alloc(rows,cols));
+        let mut e = ctx.device.create_command_encoder(&Default::default());
+        scale_rec(&ctx,&mut e,&taa,&tsc,0.125); ctx.queue.submit(Some(e.finish()));
+        let g_sc = ctx.download(&tsc);
+
+        // --- causal softmax bwd (rows==cols square) ---
+        let n = 20usize;
+        let probs = mk(&mut s, n*n); let dprobs = mk(&mut s, n*n);
+        let mut ref_csm = vec![0.0f32; n*n];
+        for r in 0..n { let lim = r+1; let mut dot = 0.0;
+            for j in 0..lim { dot += probs[r*n+j]*dprobs[r*n+j]; }
+            for j in 0..lim { ref_csm[r*n+j] = probs[r*n+j]*(dprobs[r*n+j]-dot); } }
+        let (tp, tg, tcsm) = (ctx.upload(&probs,n,n), ctx.upload(&dprobs,n,n), ctx.alloc(n,n));
+        let mut e = ctx.device.create_command_encoder(&Default::default());
+        csm_bwd_rec(&ctx,&mut e,&tg,&tp,&tcsm); ctx.queue.submit(Some(e.finish()));
+        let g_csm = ctx.download(&tcsm);
+
+        // --- rmsnorm input grad ---
+        let dy = mk(&mut s, rows*cols); let x = mk(&mut s, rows*cols); let w = mk(&mut s, cols);
+        let mut ref_in = vec![0.0f32; rows*cols];
+        for r in 0..rows {
+            let ms: f32 = (0..cols).map(|j| x[r*cols+j]*x[r*cols+j]).sum::<f32>()/cols as f32;
+            let inv = 1.0/(ms+eps).sqrt();
+            let mut dot = 0.0; for j in 0..cols { dot += dy[r*cols+j]*w[j]*x[r*cols+j]; }
+            let coef = inv*inv*inv/cols as f32*dot;
+            for j in 0..cols { ref_in[r*cols+j] = inv*w[j]*dy[r*cols+j] - coef*x[r*cols+j]; }
+        }
+        let (tdy,tx,tw,tin) = (ctx.upload(&dy,rows,cols), ctx.upload(&x,rows,cols),
+                               ctx.upload(&w,1,cols), ctx.alloc(rows,cols));
+        let mut e = ctx.device.create_command_encoder(&Default::default());
+        rms_in_bwd_rec(&ctx,&mut e,&tdy,&tx,&tw,&tin,eps); ctx.queue.submit(Some(e.finish()));
+        let g_in = ctx.download(&tin);
+
+        // --- rmsnorm weight grad ---
+        let mut ref_w = vec![0.0f32; cols];
+        for r in 0..rows {
+            let ms: f32 = (0..cols).map(|j| x[r*cols+j]*x[r*cols+j]).sum::<f32>()/cols as f32;
+            let inv = 1.0/(ms+eps).sqrt();
+            for j in 0..cols { ref_w[j] += dy[r*cols+j]*x[r*cols+j]*inv; }
+        }
+        let (tinv, twg) = (ctx.alloc(rows,1), ctx.alloc(1,cols));
+        let mut e = ctx.device.create_command_encoder(&Default::default());
+        rms_w_bwd_rec(&ctx,&mut e,&tdy,&tx,&tinv,&twg,eps); ctx.queue.submit(Some(e.finish()));
+        let g_w = ctx.download(&twg);
+
+        let errs = [mxerr(&g_silu,&ref_silu), mxerr(&g_sc,&ref_sc), mxerr(&g_csm,&ref_csm),
+                    mxerr(&g_in,&ref_in), mxerr(&g_w,&ref_w)];
+        eprintln!("backward kernel max_err: silu={:.2e} scale={:.2e} csm={:.2e} rms_in={:.2e} rms_w={:.2e}",
+                  errs[0],errs[1],errs[2],errs[3],errs[4]);
+        for (i,&er) in errs.iter().enumerate() { assert!(er < 1e-3, "kernel {i} err {er}"); }
     }
 
     /// NT (A·Bᵀ) and TN (Aᵀ·B) device kernels must match a CPU reference —
