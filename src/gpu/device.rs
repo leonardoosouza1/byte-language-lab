@@ -347,6 +347,47 @@ pub fn scale_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, t: &Tensor, s
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
 }
 
+/// Sum of squares of a tensor → `accum[idx]`. One workgroup, 256 threads,
+/// strided reduction. Lets the grad-clip norm be computed ON-DEVICE: each grad
+/// tensor reduces to one slot of a packed accum buffer, so the whole step needs
+/// a single small readback instead of one per grad tensor (the old bottleneck).
+const WGSL_SUMSQ: &str = r#"
+struct D { n: u32, idx: u32 };
+@group(0) @binding(0) var<storage, read>       inp:   array<f32>;
+@group(0) @binding(1) var<storage, read_write> accum: array<f32>;
+@group(0) @binding(2) var<uniform>             d:     D;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    var ss: f32 = 0.0; var i = tid;
+    loop { if (i >= d.n) { break; } let v = inp[i]; ss = ss + v*v; i = i + 256u; }
+    red[tid] = ss; workgroupBarrier();
+    var s: u32 = 128u;
+    loop { if (s==0u){break;} if (tid<s){red[tid]=red[tid]+red[tid+s];} workgroupBarrier(); s=s/2u; }
+    if (tid == 0u) { accum[d.idx] = red[0]; }
+}
+"#;
+
+/// Record `accum[idx] = sum(inp[i]²)` into `enc`. `accum` must have > idx slots.
+pub fn sumsq_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                 inp: &Tensor, accum: &Tensor, idx: u32) {
+    let n = inp.rows * inp.cols;
+    let dims = [n as u32, idx];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sumsq.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("sumsq", WGSL_SUMSQ);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: inp.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: accum.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+}
+
 /// Causal softmax backward: ds[r,j<=r] = p[r,j]*(g[r,j] - sum_k p[r,k]g[r,k]).
 const WGSL_CSM_BWD: &str = r#"
 struct D { rows: u32, cols: u32, _e: u32, _o: u32 };

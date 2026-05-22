@@ -738,22 +738,28 @@ impl ModelDev {
         loss /= seq as f32;
         let dlogits_t = ctx.upload(&dlogits, seq, v);
 
-        // --- backward (record all grads in one encoder) ---
+        // --- backward + on-device clip-norm reduction (one encoder) ---
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         let g = self.backward_dev(ctx, &mut enc, &caches, &xf, &x_final, &dlogits_t, tokens);
+        // sum-of-squares of every weight grad into a packed accum buffer so the
+        // norm needs ONE small readback, not one per tensor (the old bottleneck).
+        let n_slots = self.layers.len() * 8 + 1;
+        let accum = ctx.alloc(1, n_slots);
+        let mut slot = 0u32;
+        for l in &g.layers {
+            for t in [&l.dwq, &l.dwk, &l.dwv, &l.dwo, &l.dw1, &l.dw2, &l.dn1, &l.dn2] {
+                device::sumsq_rec(ctx, &mut enc, t, &accum, slot); slot += 1;
+            }
+        }
+        device::sumsq_rec(ctx, &mut enc, &g.d_norm_f, &accum, slot);
         ctx.queue.submit(Some(enc.finish()));
 
-        // --- global-norm clip factor (download grads' norm pieces) ---
-        // matmul-weight + norm grads dominate; include dx for embed/pos.
+        // --- global-norm clip factor: 3 readbacks total ---
+        // accum (weight+norm grads, reduced on GPU) + dx + d_embed_head (the
+        // latter two are needed regardless for the host embed/pos scatter).
         let dx = ctx.download(&g.dx);
         let d_embed_head = ctx.download(&g.d_embed_head);
-        let mut sumsq = 0.0f64;
-        let mut acc = |t: &Tensor| { for x in ctx.download(t) { sumsq += (x as f64) * (x as f64); } };
-        for l in &g.layers {
-            acc(&l.dwq); acc(&l.dwk); acc(&l.dwv); acc(&l.dwo);
-            acc(&l.dw1); acc(&l.dw2); acc(&l.dn1); acc(&l.dn2);
-        }
-        acc(&g.d_norm_f);
+        let mut sumsq: f64 = ctx.download(&accum).iter().map(|&x| x as f64).sum();
         // embed+pos grads via host scatter of dx (+ tied head)
         let mut d_embed = d_embed_head.clone();
         let mut d_pos = vec![0.0f32; self.pos_host.len()];
@@ -1069,6 +1075,60 @@ mod tests {
         for (n, e) in [("wq",e_wq),("wk",e_wk),("wv",e_wv),("wo",e_wo),("w1",e_w1),("w2",e_w2),("nf",e_nf)] {
             assert!(e < 5e-2, "device grad {n} rel-err {e} too high");
         }
+    }
+
+    /// On-device grad-clip norm parity: the GPU sumsq reduction (packed accum)
+    /// must equal the host sum-of-squares of the same weight grads. Proves the
+    /// readback-cutting path (19 downloads -> 3) doesn't change the clip factor.
+    #[test]
+    fn device_clip_norm_matches() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16, n_predict: 1 };
+        let model = Model::init(cfg, 11);
+        let data = b"abracadabra!!";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        let dev = ModelDev::new(&ctx, &model);
+        let v = cfg.vocab; let seq = toks.len();
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let (caches, xf, x_final, logits_t) = dev.forward_train_dev(&ctx, &mut enc, &toks);
+        ctx.queue.submit(Some(enc.finish()));
+        let logits = ctx.download(&logits_t);
+        let mut dlogits = vec![0.0f32; seq * v];
+        for i in 0..seq {
+            let row = &logits[i * v..(i + 1) * v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|z| (z - mx).exp()).collect();
+            let s: f32 = exps.iter().sum();
+            for j in 0..v { dlogits[i * v + j] = exps[j] / s / seq as f32; }
+            dlogits[i * v + tgts[i] as usize] -= 1.0 / seq as f32;
+        }
+        let dlt = ctx.upload(&dlogits, seq, v);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let g = dev.backward_dev(&ctx, &mut enc, &caches, &xf, &x_final, &dlt, &toks);
+        // device: reduce each weight grad into accum, one readback
+        let n_slots = dev.layers.len() * 8 + 1;
+        let accum = ctx.alloc(1, n_slots);
+        let mut slot = 0u32;
+        for l in &g.layers {
+            for t in [&l.dwq, &l.dwk, &l.dwv, &l.dwo, &l.dw1, &l.dw2, &l.dn1, &l.dn2] {
+                device::sumsq_rec(&ctx, &mut enc, t, &accum, slot); slot += 1;
+            }
+        }
+        device::sumsq_rec(&ctx, &mut enc, &g.d_norm_f, &accum, slot);
+        ctx.queue.submit(Some(enc.finish()));
+        let dev_ss: f64 = ctx.download(&accum).iter().map(|&x| x as f64).sum();
+        // host: download each tensor, sum of squares in f64
+        let mut host_ss = 0.0f64;
+        let mut acc = |t: &Tensor| { for x in ctx.download(t) { host_ss += x as f64 * x as f64; } };
+        for l in &g.layers {
+            acc(&l.dwq); acc(&l.dwk); acc(&l.dwv); acc(&l.dwo);
+            acc(&l.dw1); acc(&l.dw2); acc(&l.dn1); acc(&l.dn2);
+        }
+        acc(&g.d_norm_f);
+        let rel = (dev_ss - host_ss).abs() / host_ss.max(1e-9);
+        eprintln!("clip sumsq device={dev_ss:.6} host={host_ss:.6} rel={rel:.2e}");
+        assert!(rel < 1e-3, "on-device clip norm diverges: dev={dev_ss} host={host_ss}");
     }
 
     /// End-to-end proof the device training loop works: device train_step_clip
