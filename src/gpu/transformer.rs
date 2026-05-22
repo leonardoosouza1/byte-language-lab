@@ -21,11 +21,16 @@ pub struct Config {
     pub n_layers: usize,
     pub d_ff: usize,
     pub max_seq: usize,
+    /// Multi-Token Prediction depth. 1 = predict only the next byte. k>1 adds
+    /// (k-1) auxiliary heads that predict bytes t+2..t+k from the same trunk
+    /// (DeepSeek-V3 style) — denser training signal + enables speculative
+    /// multi-byte drafting that a single verify pass accepts/rejects.
+    pub n_predict: usize,
 }
 
 impl Config {
     pub fn tiny() -> Self {
-        Config { vocab: 256, d_model: 64, n_layers: 2, d_ff: 128, max_seq: 32 }
+        Config { vocab: 256, d_model: 64, n_layers: 2, d_ff: 128, max_seq: 32, n_predict: 1 }
     }
 }
 
@@ -49,6 +54,10 @@ pub struct Model {
     pub pos: Vec<f32>,      // [max_seq, d]
     pub layers: Vec<Layer>,
     pub norm_f: Vec<f32>,   // [d]
+    /// MTP auxiliary heads, one per extra prediction depth: each [d,d] maps the
+    /// final hidden state to a "look k ahead" hidden state, then the tied
+    /// lm_head (embed^T) reads it. Length = n_predict - 1.
+    pub mtp: Vec<Vec<f32>>,
     pub eps: f32,
 }
 
@@ -62,6 +71,7 @@ pub struct Grads {
     pub dwv: Vec<Vec<f32>>, pub dwo: Vec<Vec<f32>>,
     pub dw1: Vec<Vec<f32>>, pub dw2: Vec<Vec<f32>>,
     pub dn1: Vec<Vec<f32>>, pub dn2: Vec<Vec<f32>>,
+    pub d_mtp: Vec<Vec<f32>>,
 }
 
 impl Grads {
@@ -71,7 +81,7 @@ impl Grads {
         let mut acc = |v: &[f32]| for &x in v { s += (x as f64) * (x as f64); };
         acc(&self.d_embed); acc(&self.d_pos); acc(&self.d_norm_f);
         for m in [&self.dwq, &self.dwk, &self.dwv, &self.dwo,
-                  &self.dw1, &self.dw2, &self.dn1, &self.dn2] {
+                  &self.dw1, &self.dw2, &self.dn1, &self.dn2, &self.d_mtp] {
             for v in m { acc(v); }
         }
         s.sqrt() as f32
@@ -82,7 +92,7 @@ impl Grads {
         let sc = |v: &mut Vec<f32>| for x in v.iter_mut() { *x *= f; };
         sc(&mut self.d_embed); sc(&mut self.d_pos); sc(&mut self.d_norm_f);
         for m in [&mut self.dwq, &mut self.dwk, &mut self.dwv, &mut self.dwo,
-                  &mut self.dw1, &mut self.dw2, &mut self.dn1, &mut self.dn2] {
+                  &mut self.dw1, &mut self.dw2, &mut self.dn1, &mut self.dn2, &mut self.d_mtp] {
             for v in m.iter_mut() { sc(v); }
         }
     }
@@ -109,12 +119,19 @@ impl Model {
                 w1: rnd(&mut s, d * cfg.d_ff), w2: rnd(&mut s, cfg.d_ff * d),
             });
         }
+        // MTP heads init near identity (so they start as ~next-byte heads).
+        let mtp: Vec<Vec<f32>> = (0..cfg.n_predict.saturating_sub(1)).map(|_| {
+            let mut w = rnd(&mut s, d * d);
+            for i in 0..d { w[i * d + i] += 1.0; }
+            w
+        }).collect();
         Model {
             cfg,
             embed: rnd(&mut s, cfg.vocab * d),
             pos: rnd(&mut s, cfg.max_seq * d),
             layers,
             norm_f: (0..d).map(|_| 1.0 + lcg(&mut s)).collect(),
+            mtp,
             eps: 1e-6,
         }
     }
@@ -242,7 +259,6 @@ impl Model {
         (x, xf, caches, logits)
     }
 
-    /// Full backward + SGD. Returns mean cross-entropy loss before the step.
     /// Compute loss + ALL gradients (no weight update). Split out from
     /// train_step so the gradient-check test can finite-difference the
     /// analytic grads — the rigorous proof the attention backward is correct.
@@ -271,8 +287,42 @@ impl Model {
         // lm_head (tied): logits = xf @ embed^T → d_embed += dlogits^T @ xf, dxf = dlogits @ embed
         let dlt = transpose(&dlogits, seq, vocab);          // [vocab, seq]
         let d_embed_head = gemm::gemm(ctx, &dlt, &xf, vocab, seq, d);   // [vocab, d]
-        let dxf = gemm::gemm(ctx, &dlogits, &self.embed, seq, vocab, d); // [seq, d]
+        let mut dxf = gemm::gemm(ctx, &dlogits, &self.embed, seq, vocab, d); // [seq, d]
         let mut d_embed = d_embed_head;                     // accumulate tied grad
+
+        // ---- MTP auxiliary heads ----  head k predicts the byte (k+2) ahead.
+        // logits_k = (xf @ mtp[k]) @ embed^T. Grad flows to d_embed (tied),
+        // d_mtp[k], and back into dxf so the trunk learns multi-step features.
+        let mtp_lambda = 0.3f32;     // aux weight: don't let look-ahead dominate next-byte
+        let mut d_mtp: Vec<Vec<f32>> = Vec::with_capacity(self.mtp.len());
+        for (k, wk) in self.mtp.iter().enumerate() {
+            let ahead = k + 2;                  // predict tokens[i + ahead]
+            let hk = gemm::gemm(ctx, &xf, wk, seq, d, d);            // [seq,d]
+            let et = transpose(&self.embed, vocab, d);              // [d,vocab]
+            let logits_k = gemm::gemm(ctx, &hk, &et, seq, d, vocab); // [seq,vocab]
+            let mut dlk = vec![0.0f32; seq * vocab];
+            let valid = seq.saturating_sub(ahead);                  // positions with a target
+            let nz = valid.max(1) as f32;
+            for i in 0..valid {
+                let tgt = tokens[i + ahead] as usize;               // byte `ahead` positions later
+                let row = &logits_k[i * vocab..(i + 1) * vocab];
+                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = row.iter().map(|v| (v - mx).exp()).collect();
+                let s: f32 = exps.iter().sum();
+                for j in 0..vocab { dlk[i * vocab + j] = mtp_lambda * exps[j] / s / nz; }
+                dlk[i * vocab + tgt] -= mtp_lambda / nz;
+            }
+            // d_embed += dlk^T @ hk ; dhk = dlk @ embed ; d_mtp = xf^T @ dhk ; dxf += dhk @ wk^T
+            let dlkt = transpose(&dlk, seq, vocab);
+            let de = gemm::gemm(ctx, &dlkt, &hk, vocab, seq, d);
+            for i in 0..d_embed.len() { d_embed[i] += de[i]; }
+            let dhk = gemm::gemm(ctx, &dlk, &self.embed, seq, vocab, d);   // [seq,d]
+            let xft = transpose(&xf, seq, d);
+            d_mtp.push(gemm::gemm(ctx, &xft, &dhk, d, seq, d));            // [d,d]
+            let wkt = transpose(wk, d, d);
+            let dxf_k = gemm::gemm(ctx, &dhk, &wkt, seq, d, d);
+            for i in 0..dxf.len() { dxf[i] += dxf_k[i]; }
+        }
 
         // norm_f backward (x_final is the real pre-norm input → direct)
         let mut dx = rmsnorm_input_grad(&dxf, &x_final, &self.norm_f, seq, d, self.eps);
@@ -360,7 +410,7 @@ impl Model {
         }
         let _ = seq;
         (loss, Grads { d_embed, d_pos, d_norm_f: dnorm_f,
-            dwq, dwk, dwv, dwo, dw1, dw2, dn1, dn2 })
+            dwq, dwk, dwv, dwo, dw1, dw2, dn1, dn2, d_mtp })
     }
 
     /// Apply gradients with SGD.
@@ -368,6 +418,9 @@ impl Model {
         for i in 0..self.embed.len() { self.embed[i] -= lr * g.d_embed[i]; }
         for i in 0..self.pos.len() { self.pos[i] -= lr * g.d_pos[i]; }
         for i in 0..self.norm_f.len() { self.norm_f[i] -= lr * g.d_norm_f[i]; }
+        for k in 0..self.mtp.len() {
+            for i in 0..self.mtp[k].len() { self.mtp[k][i] -= lr * g.d_mtp[k][i]; }
+        }
         for li in 0..self.layers.len() {
             let l = &mut self.layers[li];
             for i in 0..l.wq.len() { l.wq[i] -= lr * g.dwq[li][i]; }
@@ -409,6 +462,18 @@ impl Model {
             loss += -(row[targets[i] as usize] - mx - sum.ln());
         }
         loss / tokens.len() as f32
+    }
+
+    /// Logits [seq, vocab] from MTP head `k` — its prediction of the byte
+    /// (k+2) positions ahead of each input position. Used to draft multiple
+    /// bytes in one forward (verify pass then accepts/rejects).
+    pub fn mtp_logits(&self, ctx: &GpuContext, tokens: &[u8], k: usize) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        let seq = tokens.len();
+        let (_, xf, _, _) = self.forward_train(ctx, tokens);
+        let hk = gemm::gemm(ctx, &xf, &self.mtp[k], seq, d, d);
+        let et = transpose(&self.embed, self.cfg.vocab, d);
+        gemm::gemm(ctx, &hk, &et, seq, d, self.cfg.vocab)
     }
 }
 
@@ -523,7 +588,7 @@ mod tests {
     #[test]
     fn transformer_overfit() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -554,7 +619,7 @@ mod tests {
     #[test]
     fn attention_gradient_check() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 32, n_layers: 1, d_ff: 64, max_seq: 16 };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 1, d_ff: 64, max_seq: 16, n_predict: 1 };
         let mut model = Model::init(cfg, 11);
         let data = b"abracadabra!";            // heavy repeats → next-byte needs attention
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -611,7 +676,7 @@ mod tests {
     #[test]
     fn transformer_beats_unigram_floor() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -631,5 +696,37 @@ mod tests {
         eprintln!("loss {l0:.3} -> {l:.3}  (unigram floor {floor:.3})");
         assert!(l.is_finite(), "diverged: {l}");
         assert!(l < floor, "did not beat unigram floor: {l:.3} >= {floor:.3}");
+    }
+
+    /// Multi-Token Prediction: with n_predict=2 the auxiliary head must learn
+    /// to predict the byte TWO positions ahead. After training, its argmax
+    /// should match tokens[i+2] at most positions — proving the MTP head and
+    /// its backward (d_mtp, the aux contribution to dxf/d_embed) are correct.
+    /// This is the look-ahead that lets the model DRAFT several bytes at once.
+    #[test]
+    fn mtp_head_learns_two_ahead() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 2 };
+        let mut model = Model::init(cfg, 7);
+        let data = b"fn add(a,b){a+b}";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        let l0 = model.loss_only(&ctx, &toks, &tgts);
+        let mut l = l0;
+        for _ in 0..1500 { l = model.train_step_clip(&ctx, &toks, &tgts, 0.3, 1.0); }
+        // main next-byte head still works (aux didn't wreck it)
+        assert!(l.is_finite() && l < l0 * 0.5, "MTP hurt next-byte head: {l0} -> {l}");
+        // aux head 0 predicts the byte 2 ahead
+        let lg = model.mtp_logits(&ctx, &toks, 0);
+        let v = cfg.vocab;
+        let (mut correct, mut total) = (0, 0);
+        for i in 0..toks.len().saturating_sub(2) {
+            let amax = (0..v).max_by(|&a, &b|
+                lg[i * v + a].partial_cmp(&lg[i * v + b]).unwrap()).unwrap();
+            if amax == toks[i + 2] as usize { correct += 1; }
+            total += 1;
+        }
+        eprintln!("MTP 2-ahead argmax accuracy {correct}/{total}");
+        assert!(total >= 8 && correct * 2 >= total, "MTP 2-ahead acc {correct}/{total}");
     }
 }
