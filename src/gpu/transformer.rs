@@ -475,6 +475,71 @@ impl Model {
         let et = transpose(&self.embed, self.cfg.vocab, d);
         gemm::gemm(ctx, &hk, &et, seq, d, self.cfg.vocab)
     }
+
+    /// Main logits + every MTP-head logits from ONE forward (shared trunk).
+    pub fn forward_all(&self, ctx: &GpuContext, tokens: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let d = self.cfg.d_model;
+        let seq = tokens.len();
+        let v = self.cfg.vocab;
+        let (_, xf, _, logits) = self.forward_train(ctx, tokens);
+        let et = transpose(&self.embed, v, d);
+        let aux = self.mtp.iter().map(|wk| {
+            let hk = gemm::gemm(ctx, &xf, wk, seq, d, d);
+            gemm::gemm(ctx, &hk, &et, seq, d, v)
+        }).collect();
+        (logits, aux)
+    }
+
+    fn argmax_row(row: &[f32]) -> u8 {
+        (0..row.len()).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u8
+    }
+
+    /// Greedy generation of `n` bytes after `prompt`.
+    pub fn generate(&self, ctx: &GpuContext, prompt: &[u8], n: usize) -> Vec<u8> {
+        let v = self.cfg.vocab;
+        let mw = self.cfg.max_seq;
+        let mut seq = prompt.to_vec();
+        for _ in 0..n {
+            let w = &seq[seq.len().saturating_sub(mw)..];
+            let logits = self.forward_gpu(ctx, w);
+            let last = (w.len() - 1) * v;
+            seq.push(Self::argmax_row(&logits[last..last + v]));
+        }
+        seq[prompt.len()..].to_vec()
+    }
+
+    /// Speculative generation using the MTP head as a DRAFTER. Each step the
+    /// main head emits b1 and the t+2 head DRAFTS the following byte; the next
+    /// step's main head VERIFIES it. The emitted bytes are exactly what greedy
+    /// would emit (so output is identical), but we record how often the draft
+    /// was right — the hit rate a KV-cached engine would turn into a speedup.
+    /// A wrong draft is simply overwritten by the verified byte, never
+    /// propagated — that's how MTP "fixes the wrong byte".
+    /// Returns (bytes, draft_hits, drafts).
+    pub fn generate_speculative(&self, ctx: &GpuContext, prompt: &[u8], n: usize)
+        -> (Vec<u8>, usize, usize) {
+        assert!(!self.mtp.is_empty(), "speculative needs n_predict>=2");
+        let v = self.cfg.vocab;
+        let mw = self.cfg.max_seq;
+        let mut seq = prompt.to_vec();
+        let start = seq.len();
+        let (mut hits, mut drafts) = (0, 0);
+        let mut pending: Option<u8> = None;     // last step's draft of the CURRENT byte
+        while seq.len() - start < n {
+            let w = &seq[seq.len().saturating_sub(mw)..];
+            let (logits, aux) = self.forward_all(ctx, w);
+            let last = (w.len() - 1) * v;
+            let b1 = Self::argmax_row(&logits[last..last + v]);   // verified next byte
+            if let Some(d) = pending.take() {                     // we drafted this byte last step
+                drafts += 1;
+                if d == b1 { hits += 1; }
+            }
+            seq.push(b1);
+            // draft the byte AFTER b1 from the t+2 head at the same position
+            pending = Some(Self::argmax_row(&aux[0][last..last + v]));
+        }
+        (seq[start..start + n].to_vec(), hits, drafts)
+    }
 }
 
 // ---- backward helpers (CPU, row-wise; small relative to GEMMs) ----
@@ -728,5 +793,29 @@ mod tests {
         }
         eprintln!("MTP 2-ahead argmax accuracy {correct}/{total}");
         assert!(total >= 8 && correct * 2 >= total, "MTP 2-ahead acc {correct}/{total}");
+    }
+
+    /// End-to-end generation: a model that memorized a sequence regenerates it
+    /// from a prompt, AND speculative (MTP-drafted + verified) decoding yields
+    /// the IDENTICAL output as greedy — proving the verify step corrects any
+    /// wrong draft instead of propagating it.
+    #[test]
+    fn generate_matches_and_speculative_agrees() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 2 };
+        let mut model = Model::init(cfg, 7);
+        let data = b"fn add(a,b){a+b}";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        for _ in 0..1500 { model.train_step_clip(&ctx, &toks, &tgts, 0.3, 1.0); }
+
+        let prompt = b"fn ad";
+        let want = &data[prompt.len()..prompt.len() + 8];     // "d(a,b){a"
+        let g = model.generate(&ctx, prompt, 8);
+        let (s, hits, drafts) = model.generate_speculative(&ctx, prompt, 8);
+        eprintln!("greedy={:?} spec={:?} draft_hits={hits}/{drafts}",
+                  String::from_utf8_lossy(&g), String::from_utf8_lossy(&s));
+        assert_eq!(g, s, "speculative output must equal greedy");
+        assert_eq!(&g[..], want, "memorized model must regenerate the sequence");
     }
 }
