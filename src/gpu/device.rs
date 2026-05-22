@@ -100,6 +100,138 @@ pub fn gemm_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     pass.dispatch_workgroups((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1);
 }
 
+/// `out[m,n] = A[m,k] · B[n,k]^T` — A times B-transposed, used for scores
+/// (q·kᵀ) and tied lm_head (xf·embedᵀ) without a separate transpose op.
+const WGSL_NT: &str = r#"
+struct Dims { m: u32, n: u32, k: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read>        a: array<f32>;
+@group(0) @binding(1) var<storage, read>        b: array<f32>;
+@group(0) @binding(2) var<storage, read_write>  c: array<f32>;
+@group(0) @binding(3) var<uniform>              d: Dims;
+var<workgroup> tileA: array<f32, 256>;
+var<workgroup> tileB: array<f32, 256>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id)  lid: vec3<u32>,
+        @builtin(workgroup_id)         wid: vec3<u32>) {
+    let row = gid.y; let col = gid.x;
+    let lr = lid.y;  let lc = lid.x;
+    var acc: f32 = 0.0;
+    let n_tiles = (d.k + 15u) / 16u;
+    for (var t: u32 = 0u; t < n_tiles; t = t + 1u) {
+        let a_col = t * 16u + lc;
+        if (row < d.m && a_col < d.k) { tileA[lr*16u+lc] = a[row*d.k + a_col]; }
+        else { tileA[lr*16u+lc] = 0.0; }
+        let b_col = wid.x * 16u + lc;   // n-index
+        let b_k   = t * 16u + lr;
+        if (b_col < d.n && b_k < d.k) { tileB[lr*16u+lc] = b[b_col*d.k + b_k]; }
+        else { tileB[lr*16u+lc] = 0.0; }
+        workgroupBarrier();
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+            acc = acc + tileA[lr*16u+i] * tileB[i*16u+lc];
+        }
+        workgroupBarrier();
+    }
+    if (row < d.m && col < d.n) { c[row*d.n + col] = acc; }
+}
+"#;
+
+/// Record `out = a · bᵀ` (b is [n,k]) into `enc`.
+pub fn gemm_nt_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                   a: &Tensor, b: &Tensor, out: &Tensor) {
+    assert_eq!(a.cols, b.cols, "shared dim k mismatch");
+    assert_eq!(out.rows, a.rows);
+    assert_eq!(out.cols, b.rows);
+    let (m, k, n) = (a.rows, a.cols, b.rows);
+    let dims = [m as u32, n as u32, k as u32, 0u32];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nt.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("gemm_nt", WGSL_NT);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("nt.bind"), layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1);
+}
+
+/// Record a row op (op 0=softmax, 1=rmsnorm, 2=causal softmax) into `enc`.
+/// `wgt` is the RMSNorm weight [cols]; pass any tensor for softmax (unused).
+pub fn row_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+               inp: &Tensor, wgt: &Tensor, out: &Tensor, eps: f32, op: u32) {
+    let dims = [inp.rows as u32, inp.cols as u32, eps.to_bits(), op];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("row.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("nn_row", crate::gpu::nn_ops::ROW_WGSL);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("row.bind"), layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: inp.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgt.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(inp.rows as u32, 1, 1);
+}
+
+/// Record an elementwise op (op 0=SiLU, 1=GELU) into `enc`. out may equal inp.
+pub fn elem_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                inp: &Tensor, out: &Tensor, op: u32) {
+    let n = inp.rows * inp.cols;
+    let dims = [n as u32, op];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("elem.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("nn_elem", crate::gpu::nn_ops::ELEM_WGSL);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("elem.bind"), layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: inp.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
+/// Record `out[i] = a[i] + b[i]` (residual add) into `enc`.
+const WGSL_ADD: &str = r#"
+struct Dims { n: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       a: array<f32>;
+@group(0) @binding(1) var<storage, read>       b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> o: array<f32>;
+@group(0) @binding(3) var<uniform>             d: Dims;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= d.n) { return; }
+    o[i] = a[i] + b[i];
+}
+"#;
+
+/// Record element-wise `out = a + b` into `enc`.
+pub fn add_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+               a: &Tensor, b: &Tensor, out: &Tensor) {
+    let n = a.rows * a.cols;
+    let dims = [n as u32, 0u32];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("add.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("add", WGSL_ADD);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("add.bind"), layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

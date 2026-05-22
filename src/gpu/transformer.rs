@@ -12,6 +12,7 @@
 //! the kernel set is proven to build a transformer.
 
 use crate::gpu::{gemm, nn_ops, GpuContext};
+use crate::gpu::device::{self, Tensor};
 
 /// Tiny config — deliberately small for a fast parity test.
 #[derive(Clone, Copy)]
@@ -542,6 +543,102 @@ impl Model {
     }
 }
 
+// ---- device-resident forward: weights uploaded once, whole forward in one
+// ---- command encoder, only the logits read back. The fast inference path. ----
+
+struct LayerDev {
+    wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor,
+    norm1: Tensor, norm2: Tensor, w1: Tensor, w2: Tensor,
+}
+
+/// GPU-resident copy of a Model for fast forward. wq is PRE-SCALED by
+/// 1/sqrt(d) at upload so the attention scale needs no extra kernel.
+pub struct ModelDev {
+    pub cfg: Config,
+    embed: Tensor, pos: Tensor,
+    embed_host: Vec<f32>, pos_host: Vec<f32>,   // for the x0 embedding gather
+    layers: Vec<LayerDev>,
+    norm_f: Tensor,
+    eps: f32,
+}
+
+impl ModelDev {
+    pub fn new(ctx: &GpuContext, m: &Model) -> Self {
+        let d = m.cfg.d_model;
+        let ff = m.cfg.d_ff;
+        let scale = 1.0 / (d as f32).sqrt();
+        let layers = m.layers.iter().map(|l| {
+            let wq_scaled: Vec<f32> = l.wq.iter().map(|&x| x * scale).collect();
+            LayerDev {
+                wq: ctx.upload(&wq_scaled, d, d),
+                wk: ctx.upload(&l.wk, d, d),
+                wv: ctx.upload(&l.wv, d, d),
+                wo: ctx.upload(&l.wo, d, d),
+                norm1: ctx.upload(&l.norm1, 1, d),
+                norm2: ctx.upload(&l.norm2, 1, d),
+                w1: ctx.upload(&l.w1, d, ff),
+                w2: ctx.upload(&l.w2, ff, d),
+            }
+        }).collect();
+        ModelDev {
+            cfg: m.cfg,
+            embed: ctx.upload(&m.embed, m.cfg.vocab, d),
+            pos: ctx.upload(&m.pos, m.cfg.max_seq, d),
+            embed_host: m.embed.clone(), pos_host: m.pos.clone(),
+            layers, norm_f: ctx.upload(&m.norm_f, 1, d), eps: m.eps,
+        }
+    }
+
+    /// Device-resident forward → logits [seq, vocab]. One submit, one readback.
+    pub fn forward(&self, ctx: &GpuContext, tokens: &[u8]) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        let ff = self.cfg.d_ff;
+        let v = self.cfg.vocab;
+        let seq = tokens.len();
+        // x0 = embed[token] + pos  (host gather, single upload)
+        let mut x0 = vec![0.0f32; seq * d];
+        for (i, &t) in tokens.iter().enumerate() {
+            for j in 0..d {
+                x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[i * d + j];
+            }
+        }
+        let mut x = ctx.upload(&x0, seq, d);
+        // scratch
+        let xn = ctx.alloc(seq, d);
+        let q = ctx.alloc(seq, d); let k = ctx.alloc(seq, d); let vv = ctx.alloc(seq, d);
+        let scores = ctx.alloc(seq, seq); let probs = ctx.alloc(seq, seq);
+        let attn = ctx.alloc(seq, d); let ao = ctx.alloc(seq, d);
+        let xmid = ctx.alloc(seq, d); let xn2 = ctx.alloc(seq, d);
+        let h = ctx.alloc(seq, ff); let ha = ctx.alloc(seq, ff); let ffn = ctx.alloc(seq, d);
+        let xout = ctx.alloc(seq, d);
+        let logits = ctx.alloc(seq, v);
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for l in &self.layers {
+            device::row_rec(ctx, &mut enc, &x, &l.norm1, &xn, self.eps, 1);     // rmsnorm
+            device::gemm_rec(ctx, &mut enc, &xn, &l.wq, &q);                    // q (pre-scaled)
+            device::gemm_rec(ctx, &mut enc, &xn, &l.wk, &k);
+            device::gemm_rec(ctx, &mut enc, &xn, &l.wv, &vv);
+            device::gemm_nt_rec(ctx, &mut enc, &q, &k, &scores);               // q·kᵀ
+            device::row_rec(ctx, &mut enc, &scores, &self.pos, &probs, 0.0, 2); // causal softmax (wgt unused)
+            device::gemm_rec(ctx, &mut enc, &probs, &vv, &attn);
+            device::gemm_rec(ctx, &mut enc, &attn, &l.wo, &ao);
+            device::add_rec(ctx, &mut enc, &x, &ao, &xmid);                    // residual
+            device::row_rec(ctx, &mut enc, &xmid, &l.norm2, &xn2, self.eps, 1);
+            device::gemm_rec(ctx, &mut enc, &xn2, &l.w1, &h);
+            device::elem_rec(ctx, &mut enc, &h, &ha, 0);                       // SiLU
+            device::gemm_rec(ctx, &mut enc, &ha, &l.w2, &ffn);
+            device::add_rec(ctx, &mut enc, &xmid, &ffn, &xout);
+            // x <- xout for next layer (copy buffer; cheap, stays on device)
+            enc.copy_buffer_to_buffer(&xout.buf, 0, &x.buf, 0, (seq * d * 4) as u64);
+        }
+        device::row_rec(ctx, &mut enc, &x, &self.norm_f, &xn, self.eps, 1);     // final norm into xn
+        device::gemm_nt_rec(ctx, &mut enc, &xn, &self.embed, &logits);         // xf·embedᵀ
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.download(&logits)
+    }
+}
+
 // ---- backward helpers (CPU, row-wise; small relative to GEMMs) ----
 
 /// RMSNorm input gradient given the NORMALIZED output's cached value isn't
@@ -667,6 +764,33 @@ mod tests {
         // diverges. Breaking the unigram floor (needs grad clipping + higher
         // LR) is proven separately by transformer_beats_unigram_floor.
         assert!(l.is_finite() && l < l0 * 0.5, "transformer training failed: {l0} -> {l}");
+    }
+
+    /// Device-resident forward must match the per-op CPU forward (parity) and
+    /// be faster (one submit + one readback vs a readback per op).
+    #[test]
+    fn device_forward_parity_and_speed() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config::tiny();
+        let model = Model::init(cfg, 2024);
+        let data = b"fn main() { let x = 42; }";
+        let tokens = &data[..data.len().min(cfg.max_seq)];
+        let dev = ModelDev::new(&ctx, &model);
+
+        let cpu = model.forward_cpu(tokens);
+        let gpu = dev.forward(&ctx, tokens);
+        let max_err = gpu.iter().zip(&cpu).map(|(g, c)| (g - c).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-2, "device forward max_err {max_err}");
+
+        let iters = 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { let _ = dev.forward(&ctx, tokens); }
+        let dev_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { let _ = model.forward_gpu(&ctx, tokens); }
+        let perop_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!("device-forward {dev_ms:.3} ms vs per-op {perop_ms:.3} ms ({:.1}x) \
+                   max_err {max_err:.2e}", perop_ms / dev_ms);
     }
 
     /// RIGOROUS finite-difference proof of the attention VALUE/OUTPUT backward

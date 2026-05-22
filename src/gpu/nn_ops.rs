@@ -9,7 +9,7 @@
 use crate::gpu::GpuContext;
 use wgpu::util::DeviceExt;
 
-const ROW_WGSL: &str = r#"
+pub(crate) const ROW_WGSL: &str = r#"
 struct Dims { rows: u32, cols: u32, eps: f32, op: u32 };
 @group(0) @binding(0) var<storage, read>       inp: array<f32>;
 @group(0) @binding(1) var<storage, read>       wgt: array<f32>;   // RMSNorm weight (cols), unused for softmax
@@ -109,7 +109,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
-const ELEM_WGSL: &str = r#"
+pub(crate) const ELEM_WGSL: &str = r#"
 struct Dims { n: u32, op: u32 };
 @group(0) @binding(0) var<storage, read>       inp: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
