@@ -59,6 +59,11 @@ fn main() {
     let clip: f32 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let opt = args.get(8).cloned().unwrap_or_else(|| "adam".into());
     let batch: usize = args.get(9).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let qk_lr_mult: f32 = args.get(10).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let qk_norm: bool = args.get(11).map(|s| s == "1" || s == "true").unwrap_or(false);
+    let alibi_slope: f32 = args.get(12).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let save_path = args.get(13).cloned().filter(|s| !s.is_empty());
+    let load_path = args.get(14).cloned().filter(|s| !s.is_empty());
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     println!("corpus {path}: {} bytes", bytes.len());
@@ -80,23 +85,30 @@ fn main() {
     let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
     println!("GPU: {}", ctx.device_name());
 
-    let cfg = Config { vocab: 256, d_model, n_layers, d_ff: d_model * 4, max_seq, n_predict: 1 };
+    let cfg = Config { vocab: 256, d_model, n_layers, d_ff: d_model * 4, max_seq, n_predict: 1, qk_norm, alibi_slope };
     let n_params = 256 * d_model + max_seq * d_model
         + n_layers * (4 * d_model * d_model + 2 * d_model * (d_model * 4)) + d_model;
     println!("config: d_model={d_model} n_layers={n_layers} d_ff={} max_seq={max_seq} (~{:.2}M params)",
              d_model * 4, n_params as f64 / 1e6);
 
-    let model = Model::init(cfg, 1234);
+    let model = match &load_path {
+        Some(p) => { println!("resuming from checkpoint {p}"); Model::load(p).expect("load checkpoint") }
+        None => Model::init(cfg, 1234),
+    };
     let mut dev = ModelDev::new(&ctx, &model);
+    dev.set_qk_lr_mult(qk_lr_mult);
+    if let Some(p) = &save_path { println!("checkpointing to {p} (periodic + final)"); }
     let mut rng = Lcg(0x1234_5678_9abc_def0);
 
-    println!("optimizer={opt} lr={lr} clip={clip} batch={batch}");
+    println!("optimizer={opt} lr={lr} clip={clip} batch={batch} qk_lr_mult={qk_lr_mult} qk_norm={qk_norm}");
     let t0 = Instant::now();
     let mut step = 0u64;
     let mut tokens_seen = 0u64;
     let mut loss_ema = 0.0f32;
     let mut last_report = Instant::now();
     let report_every = std::time::Duration::from_secs(5);
+    let mut last_ckpt = Instant::now();
+    let ckpt_every = std::time::Duration::from_secs(120);
 
     let warmup = 300u64;   // linear lr warmup — without it Adam blows up early (bc2≈1e-3)
     let mut bt = vec![0u8; batch * max_seq];   // batched tokens/targets scratch
@@ -131,6 +143,17 @@ fn main() {
                       | held-out {bpb:.3} bits/byte (floor {floor:.3})");
             last_report = Instant::now();
         }
+        if save_path.is_some() && last_ckpt.elapsed() >= ckpt_every {
+            if let Some(p) = &save_path {
+                if let Err(e) = dev.to_model(&ctx).save(p) { eprintln!("checkpoint save failed: {e}"); }
+                else { println!("  [checkpoint @ step {step}]"); }
+            }
+            last_ckpt = Instant::now();
+        }
+    }
+    if let Some(p) = &save_path {
+        dev.to_model(&ctx).save(p).expect("final checkpoint save");
+        println!("final checkpoint saved to {p}");
     }
 
     let secs = t0.elapsed().as_secs_f64();

@@ -298,6 +298,14 @@ path = "bin/train_byte_lm.rs"
 name = "train_transformer"
 path = "bin/train_transformer.rs"
 
+[[bin]]
+name = "diag_attn_grad"
+path = "bin/diag_attn_grad.rs"
+
+[[bin]]
+name = "diag_qknorm_bootstrap"
+path = "bin/diag_qknorm_bootstrap.rs"
+
 [dependencies]
 # Mantém dependências mínimas — todo código é nosso, validável byte a byte.
 # Apenas RNG (reprodutível, sem cripto).

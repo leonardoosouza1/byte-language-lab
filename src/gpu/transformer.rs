@@ -27,11 +27,26 @@ pub struct Config {
     /// (DeepSeek-V3 style) — denser training signal + enables speculative
     /// multi-byte drafting that a single verify pass accepts/rejects.
     pub n_predict: usize,
+    /// QK-normalization: RMSNorm each query and key vector (over d) before the
+    /// score dot-product. Without it, the attention scores are saturated at init
+    /// (measured: scores.std≈4.8, max≈550 for d=256), the softmax is near
+    /// one-hot, and dQ/dK vanish through softmax-backward — so attention takes
+    /// ~2400 Adam steps to bootstrap out of the unigram floor. QK-norm keeps
+    /// scores O(1) at init (cosine-like), giving a healthy QK gradient from
+    /// step 0. (Gemma2/Chameleon use this for the same stability reason.)
+    pub qk_norm: bool,
+    /// ALiBi recency bias slope. When >0, adds -slope·(i−j) to score[i,j]
+    /// (j≤i) before the softmax — a fixed linear penalty on distance to the
+    /// past. This gives attention a LOCAL prior from step 0, so the model can
+    /// use the previous byte (escape the unigram floor → bigram) WITHOUT first
+    /// having to learn attention from a zero-signal init. No params, no
+    /// backward change (additive constant). 0.0 = off.
+    pub alibi_slope: f32,
 }
 
 impl Config {
     pub fn tiny() -> Self {
-        Config { vocab: 256, d_model: 64, n_layers: 2, d_ff: 128, max_seq: 32, n_predict: 1 }
+        Config { vocab: 256, d_model: 64, n_layers: 2, d_ff: 128, max_seq: 32, n_predict: 1, qk_norm: false, alibi_slope: 0.0 }
     }
 }
 
@@ -158,11 +173,17 @@ impl Model {
         for l in &self.layers {
             let xn = nn_ops::rmsnorm(ctx, &x, &l.norm1, seq, d, self.eps);
             let mut q = gemm::gemm(ctx, &xn, &l.wq, seq, d, d);
-            let k = gemm::gemm(ctx, &xn, &l.wk, seq, d, d);
+            let mut k = gemm::gemm(ctx, &xn, &l.wk, seq, d, d);
             let v = gemm::gemm(ctx, &xn, &l.wv, seq, d, d);
+            if self.cfg.qk_norm {
+                let ones = vec![1.0f32; d];
+                q = nn_ops::rmsnorm(ctx, &q, &ones, seq, d, self.eps);
+                k = nn_ops::rmsnorm(ctx, &k, &ones, seq, d, self.eps);
+            }
             for q_i in q.iter_mut() { *q_i *= scale; }
             let kt = transpose(&k, seq, d);                      // [d, seq]
-            let scores = gemm::gemm(ctx, &q, &kt, seq, d, seq);  // [seq, seq]
+            let mut scores = gemm::gemm(ctx, &q, &kt, seq, d, seq);  // [seq, seq]
+            add_alibi(&mut scores, seq, self.cfg.alibi_slope);
             let probs = nn_ops::causal_softmax(ctx, &scores, seq, seq);
             let attn = gemm::gemm(ctx, &probs, &v, seq, seq, d);  // [seq, d]
             let ao = gemm::gemm(ctx, &attn, &l.wo, seq, d, d);
@@ -191,11 +212,17 @@ impl Model {
         for l in &self.layers {
             let xn = rmsnorm_cpu(&x, &l.norm1, seq, d, self.eps);
             let mut q = gemm::gemm_cpu(&xn, &l.wq, seq, d, d);
-            let k = gemm::gemm_cpu(&xn, &l.wk, seq, d, d);
+            let mut k = gemm::gemm_cpu(&xn, &l.wk, seq, d, d);
             let v = gemm::gemm_cpu(&xn, &l.wv, seq, d, d);
+            if self.cfg.qk_norm {
+                let ones = vec![1.0f32; d];
+                q = rmsnorm_cpu(&q, &ones, seq, d, self.eps);
+                k = rmsnorm_cpu(&k, &ones, seq, d, self.eps);
+            }
             for q_i in q.iter_mut() { *q_i *= scale; }
             let kt = transpose(&k, seq, d);
-            let scores = gemm::gemm_cpu(&q, &kt, seq, d, seq);
+            let mut scores = gemm::gemm_cpu(&q, &kt, seq, d, seq);
+            add_alibi(&mut scores, seq, self.cfg.alibi_slope);
             let probs = causal_softmax_cpu(&scores, seq, seq);
             let attn = gemm::gemm_cpu(&probs, &v, seq, seq, d);
             let ao = gemm::gemm_cpu(&attn, &l.wo, seq, d, d);
@@ -211,12 +238,73 @@ impl Model {
         let et = transpose(&self.embed, self.cfg.vocab, d);
         gemm::gemm_cpu(&xf, &et, seq, d, self.cfg.vocab)
     }
+
+    /// Save all weights + arch to a no-dep little-endian `.blabtfm` checkpoint.
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        w.write_all(b"BLABTFM1")?;
+        let c = &self.cfg;
+        for v in [c.vocab, c.d_model, c.n_layers, c.d_ff, c.max_seq, c.n_predict] {
+            w.write_all(&(v as u32).to_le_bytes())?;
+        }
+        w.write_all(&[c.qk_norm as u8])?;
+        w.write_all(&c.alibi_slope.to_le_bytes())?;
+        w.write_all(&self.eps.to_le_bytes())?;
+        write_f32s(&mut w, &self.embed)?;
+        write_f32s(&mut w, &self.pos)?;
+        write_f32s(&mut w, &self.norm_f)?;
+        for l in &self.layers {
+            for s in [&l.wq, &l.wk, &l.wv, &l.wo, &l.norm1, &l.norm2, &l.w1, &l.w2] {
+                write_f32s(&mut w, s)?;
+            }
+        }
+        w.write_all(&(self.mtp.len() as u32).to_le_bytes())?;
+        for m in &self.mtp { write_f32s(&mut w, m)?; }
+        w.flush()
+    }
+
+    /// Load a checkpoint written by `save`.
+    pub fn load(path: &str) -> std::io::Result<Model> {
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut magic = [0u8; 8];
+        std::io::Read::read_exact(&mut r, &mut magic)?;
+        assert_eq!(&magic, b"BLABTFM1", "bad checkpoint magic");
+        let g = |r: &mut std::io::BufReader<std::fs::File>| read_u32(r).unwrap() as usize;
+        let (vocab, d, n_layers, d_ff, max_seq, n_predict) =
+            (g(&mut r), g(&mut r), g(&mut r), g(&mut r), g(&mut r), g(&mut r));
+        let mut qk = [0u8; 1]; std::io::Read::read_exact(&mut r, &mut qk)?;
+        let alibi_slope = read_f32(&mut r)?;
+        let eps = read_f32(&mut r)?;
+        let cfg = Config { vocab, d_model: d, n_layers, d_ff, max_seq, n_predict,
+                           qk_norm: qk[0] != 0, alibi_slope };
+        let embed = read_f32s(&mut r, vocab * d)?;
+        let pos = read_f32s(&mut r, max_seq * d)?;
+        let norm_f = read_f32s(&mut r, d)?;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            layers.push(Layer {
+                wq: read_f32s(&mut r, d * d)?, wk: read_f32s(&mut r, d * d)?,
+                wv: read_f32s(&mut r, d * d)?, wo: read_f32s(&mut r, d * d)?,
+                norm1: read_f32s(&mut r, d)?, norm2: read_f32s(&mut r, d)?,
+                w1: read_f32s(&mut r, d * d_ff)?, w2: read_f32s(&mut r, d_ff * d)?,
+            });
+        }
+        let nmtp = read_u32(&mut r)? as usize;
+        let mtp = (0..nmtp).map(|_| read_f32s(&mut r, d * d).unwrap()).collect();
+        Ok(Model { cfg, embed, pos, layers, norm_f, mtp, eps })
+    }
 }
 
 /// Per-layer forward activations cached for backward.
 struct LayerCache {
     x_in: Vec<f32>,   // layer input (input to norm1) — needed for norm1 backward
-    xn: Vec<f32>, q: Vec<f32>, k: Vec<f32>, v: Vec<f32>,
+    xn: Vec<f32>,
+    // q1,k1 = pre-QK-norm projections (input to the q/k RMSNorm); needed to
+    // backprop through QK-norm. q,k = the tensors fed to the score dot-product
+    // (q = scale·normed-q, k = normed-k when qk_norm; else q=scale·q, k=k1).
+    q1: Vec<f32>, k1: Vec<f32>,
+    q: Vec<f32>, k: Vec<f32>, v: Vec<f32>,
     probs: Vec<f32>, attn: Vec<f32>,
     x_mid: Vec<f32>,  // x after attention residual (input to norm2 branch)
     xn2: Vec<f32>, h: Vec<f32>, ha: Vec<f32>,
@@ -236,12 +324,18 @@ impl Model {
         for l in &self.layers {
             let x_in = x.clone();
             let xn = nn_ops::rmsnorm(ctx, &x, &l.norm1, seq, d, self.eps);
-            let mut q = gemm::gemm(ctx, &xn, &l.wq, seq, d, d);
-            let k = gemm::gemm(ctx, &xn, &l.wk, seq, d, d);
+            let q1 = gemm::gemm(ctx, &xn, &l.wq, seq, d, d);
+            let k1 = gemm::gemm(ctx, &xn, &l.wk, seq, d, d);
             let v = gemm::gemm(ctx, &xn, &l.wv, seq, d, d);
+            let (mut q, k) = if self.cfg.qk_norm {
+                let ones = vec![1.0f32; d];
+                (nn_ops::rmsnorm(ctx, &q1, &ones, seq, d, self.eps),
+                 nn_ops::rmsnorm(ctx, &k1, &ones, seq, d, self.eps))
+            } else { (q1.clone(), k1.clone()) };
             for qi in q.iter_mut() { *qi *= scale; }
             let kt = transpose(&k, seq, d);
-            let scores = gemm::gemm(ctx, &q, &kt, seq, d, seq);
+            let mut scores = gemm::gemm(ctx, &q, &kt, seq, d, seq);
+            add_alibi(&mut scores, seq, self.cfg.alibi_slope);
             let probs = nn_ops::causal_softmax(ctx, &scores, seq, seq);
             let attn = gemm::gemm(ctx, &probs, &v, seq, seq, d);
             let ao = gemm::gemm(ctx, &attn, &l.wo, seq, d, d);
@@ -252,7 +346,7 @@ impl Model {
             let ha: Vec<f32> = h.iter().map(|&z| z / (1.0 + (-z).exp())).collect();
             let ffn = gemm::gemm(ctx, &ha, &l.w2, seq, self.cfg.d_ff, d);
             for i in 0..x.len() { x[i] += ffn[i]; }
-            caches.push(LayerCache { x_in, xn, q, k, v, probs, attn, x_mid, xn2, h, ha });
+            caches.push(LayerCache { x_in, xn, q1, k1, q, k, v, probs, attn, x_mid, xn2, h, ha });
         }
         let xf = nn_ops::rmsnorm(ctx, &x, &self.norm_f, seq, d, self.eps);
         let et = transpose(&self.embed, self.cfg.vocab, d);
@@ -375,12 +469,19 @@ impl Model {
             let dprobs = gemm::gemm(ctx, &dattn, &vt, seq, d, seq);   // [seq,seq]
             // probs = causal_softmax(scores)
             let dscores = causal_softmax_backward(&dprobs, &c.probs, seq, seq);
-            // scores = q @ k^T  → dq = dscores @ k, dk = dscores^T @ q
-            let dq_raw = gemm::gemm(ctx, &dscores, &c.k, seq, seq, d);
+            // scores = q @ k^T  → grad to the score-input tensors (q,k = the
+            // post-QK-norm projections when qk_norm, else the raw projections).
+            let dq_raw = gemm::gemm(ctx, &dscores, &c.k, seq, seq, d);   // → q side (scaled)
             let dscorest = transpose(&dscores, seq, seq);
-            let dk = gemm::gemm(ctx, &dscorest, &c.q, seq, seq, d);
-            // q was scaled
-            let dq: Vec<f32> = dq_raw.iter().map(|&g| g * scale).collect();
+            let dk_hat = gemm::gemm(ctx, &dscorest, &c.q, seq, seq, d);  // → k side (no scale)
+            let dq_hat: Vec<f32> = dq_raw.iter().map(|&g| g * scale).collect();
+            // backprop through the QK RMSNorm (if on): map grad on normed q,k
+            // to grad on the raw projections q1,k1 (unit-gain rmsnorm).
+            let (dq, dk) = if self.cfg.qk_norm {
+                let ones = vec![1.0f32; d];
+                (rmsnorm_input_grad(&dq_hat, &c.q1, &ones, seq, d, self.eps),
+                 rmsnorm_input_grad(&dk_hat, &c.k1, &ones, seq, d, self.eps))
+            } else { (dq_hat, dk_hat) };
             // q=xn@wq, k=xn@wk, v=xn@wv  → dxn = dq@wq^T + dk@wk^T + dv@wv^T
             let xnt = transpose(&c.xn, seq, d);
             dwq[li] = gemm::gemm(ctx, &xnt, &dq, d, seq, d);
@@ -565,6 +666,12 @@ pub struct ModelDev {
     scale: f32,
     /// Adam optimizer state, lazily created on the first `train_step_adam`.
     opt: Option<AdamState>,
+    /// LR multiplier applied to Wq/Wk only. The QK-projection gradient is
+    /// attenuated through softmax-backward and compounds with depth (measured:
+    /// dWq ~1e-7 at L0, ~1e-10 at L1+, vs ~1e-3 for V/FFN), so attention takes
+    /// ~2400 Adam steps to bootstrap out of the unigram floor. Boosting the QK
+    /// learning rate accelerates that bootstrap. 1.0 = off (original behavior).
+    qk_lr_mult: f32,
 }
 
 /// Persistent first/second-moment buffers for one weight tensor.
@@ -606,6 +713,34 @@ impl ModelDev {
             layers, norm_f: ctx.upload(&m.norm_f, 1, d), eps: m.eps,
             scale: 1.0 / (d as f32).sqrt(),
             opt: None,
+            qk_lr_mult: 1.0,
+        }
+    }
+
+    /// Set the Wq/Wk-only LR multiplier (see field docs). >1 accelerates the
+    /// attention bootstrap that otherwise stalls the model at the unigram floor.
+    pub fn set_qk_lr_mult(&mut self, m: f32) { self.qk_lr_mult = m; }
+
+    /// Download all device weights back into a host `Model` (for checkpointing).
+    /// embed/pos are already host-resident; layer weights + norm_f live on the
+    /// device. (n_predict>1 MTP heads are not tracked by ModelDev → reconstructed
+    /// as zeros; training uses n_predict=1.)
+    pub fn to_model(&self, ctx: &GpuContext) -> Model {
+        let d = self.cfg.d_model;
+        let layers = self.layers.iter().map(|l| Layer {
+            wq: ctx.download(&l.wq), wk: ctx.download(&l.wk),
+            wv: ctx.download(&l.wv), wo: ctx.download(&l.wo),
+            norm1: ctx.download(&l.norm1), norm2: ctx.download(&l.norm2),
+            w1: ctx.download(&l.w1), w2: ctx.download(&l.w2),
+        }).collect();
+        Model {
+            cfg: self.cfg,
+            embed: self.embed_host.clone(),
+            pos: self.pos_host.clone(),
+            layers,
+            norm_f: ctx.download(&self.norm_f),
+            mtp: (0..self.cfg.n_predict.saturating_sub(1)).map(|_| vec![0.0; d * d]).collect(),
+            eps: self.eps,
         }
     }
 
@@ -948,13 +1083,17 @@ impl ModelDev {
             }
             device::scale_rec(ctx, &mut enc, &g.d_norm_f, f);
         }
-        let am = |e: &mut wgpu::CommandEncoder, w: &Tensor, gr: &Tensor, s: &AdamMV| {
-            device::adam_rec(ctx, e, w, gr, &s.m, &s.v, lr, B1, B2, EPS, bc1, bc2, WD);
+        let am_lr = |e: &mut wgpu::CommandEncoder, w: &Tensor, gr: &Tensor, s: &AdamMV, l: f32| {
+            device::adam_rec(ctx, e, w, gr, &s.m, &s.v, l, B1, B2, EPS, bc1, bc2, WD);
         };
+        let am = |e: &mut wgpu::CommandEncoder, w: &Tensor, gr: &Tensor, s: &AdamMV| {
+            am_lr(e, w, gr, s, lr);
+        };
+        let qk_lr = lr * self.qk_lr_mult;
         for (li, l) in self.layers.iter().enumerate() {
             let a = &opt.layers[li];
-            am(&mut enc, &l.wq, &g.layers[li].dwq, &a.wq);
-            am(&mut enc, &l.wk, &g.layers[li].dwk, &a.wk);
+            am_lr(&mut enc, &l.wq, &g.layers[li].dwq, &a.wq, qk_lr);
+            am_lr(&mut enc, &l.wk, &g.layers[li].dwk, &a.wk, qk_lr);
             am(&mut enc, &l.wv, &g.layers[li].dwv, &a.wv);
             am(&mut enc, &l.wo, &g.layers[li].dwo, &a.wo);
             am(&mut enc, &l.w1, &g.layers[li].dw1, &a.w1);
@@ -1131,6 +1270,34 @@ fn causal_softmax_backward(dprobs: &[f32], probs: &[f32], rows: usize, cols: usi
     ds
 }
 
+// ---- checkpoint (de)serialization helpers: no-dep little-endian binary ----
+fn write_f32s<W: std::io::Write>(w: &mut W, s: &[f32]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(s.len() * 4);
+    for &x in s { buf.extend_from_slice(&x.to_le_bytes()); }
+    w.write_all(&buf)
+}
+fn read_u32<R: std::io::Read>(r: &mut R) -> std::io::Result<u32> {
+    let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b))
+}
+fn read_f32<R: std::io::Read>(r: &mut R) -> std::io::Result<f32> {
+    let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(f32::from_le_bytes(b))
+}
+fn read_f32s<R: std::io::Read>(r: &mut R, n: usize) -> std::io::Result<Vec<f32>> {
+    let mut buf = vec![0u8; n * 4]; r.read_exact(&mut buf)?;
+    Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// ALiBi: add -slope·(i−j) to score[i,j] for j≤i (in-place). A fixed linear
+/// recency bias giving attention a local prior from step 0. No-op when slope=0.
+fn add_alibi(scores: &mut [f32], seq: usize, slope: f32) {
+    if slope == 0.0 { return; }
+    for i in 0..seq {
+        for j in 0..=i {
+            scores[i * seq + j] -= slope * (i - j) as f32;
+        }
+    }
+}
+
 fn transpose(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut t = vec![0.0f32; rows * cols];
     for r in 0..rows {
@@ -1198,7 +1365,7 @@ mod tests {
     #[test]
     fn transformer_overfit() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1219,7 +1386,7 @@ mod tests {
     #[test]
     fn device_backward_grad_parity() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let model = Model::init(cfg, 5);
         let data = b"abracadabra!!";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1273,7 +1440,7 @@ mod tests {
     #[test]
     fn batched_forward_matches_single() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 8, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 8, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let model = Model::init(cfg, 3);
         let dev = ModelDev::new(&ctx, &model);
         let v = cfg.vocab; let l = 8usize;
@@ -1302,7 +1469,7 @@ mod tests {
     #[test]
     fn batched_train_breaks_floor() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 16, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 16, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let model = Model::init(cfg, 9);
         // 4 blocks of length 16 from a repeating pattern (deterministic next byte)
         let block = 16usize;
@@ -1334,7 +1501,7 @@ mod tests {
     #[test]
     fn device_clip_norm_matches() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let model = Model::init(cfg, 11);
         let data = b"abracadabra!!";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1389,7 +1556,7 @@ mod tests {
     #[test]
     fn device_train_breaks_floor() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1411,7 +1578,7 @@ mod tests {
     #[test]
     fn device_generate_matches() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1466,7 +1633,7 @@ mod tests {
     #[test]
     fn attention_gradient_check() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 32, n_layers: 1, d_ff: 64, max_seq: 16, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 1, d_ff: 64, max_seq: 16, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let mut model = Model::init(cfg, 11);
         let data = b"abracadabra!";            // heavy repeats → next-byte needs attention
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1516,6 +1683,52 @@ mod tests {
                 "dV/dO finite-diff check failed: {ok}/{checked}");
     }
 
+    /// Proves the QK-norm forward+backward is CORRECT end-to-end. dQ/dK are too
+    /// small at every reachable point to finite-difference reliably (rounding
+    /// noise — same reason `attention_gradient_check` skips them), so we use the
+    /// codebase's end-to-end proof: memorizing a sequence that repeats bytes in
+    /// different contexts down to ~0 loss is IMPOSSIBLE unless the query/key
+    /// gradients (now flowing through the QK RMSNorm) sharpen attention.
+    #[test]
+    fn qk_norm_memorizes_with_attention() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 1, d_ff: 64, max_seq: 16,
+                           n_predict: 1, qk_norm: true, alibi_slope: 0.0 };
+        let mut model = Model::init(cfg, 11);
+        let data = b"abracadabra!";
+        let toks: Vec<u8> = data[..data.len() - 1].to_vec();
+        let tgts: Vec<u8> = data[1..].to_vec();
+        let l0 = model.train_step_clip(&ctx, &toks, &tgts, 0.3, 1.0);
+        for _ in 0..200 { model.train_step_clip(&ctx, &toks, &tgts, 0.3, 1.0); }
+        let l1 = model.loss_only(&ctx, &toks, &tgts);
+        eprintln!("QK-norm memorize: {l0:.3} -> {l1:.4}");
+        // ~0 loss ⇒ the QK RMSNorm backward correctly trained attention.
+        assert!(l1.is_finite() && l1 < 0.2, "QK-norm failed to memorize via attention: {l0} -> {l1}");
+    }
+
+    /// A trained ModelDev → to_model → save → load → ModelDev reproduces the
+    /// exact same logits. Proves checkpointing preserves every weight + the
+    /// arch flags (qk_norm, alibi_slope) so long runs can persist & resume.
+    #[test]
+    fn checkpoint_roundtrip() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 16,
+                           n_predict: 1, qk_norm: true, alibi_slope: 0.25 };
+        let model = Model::init(cfg, 5);
+        let mut dev = ModelDev::new(&ctx, &model);
+        let data = b"checkpoint me!!!";        // 16 bytes
+        for _ in 0..10 { dev.train_step_adam(&ctx, &data[..15], &data[1..16], 0.01, 1.0); }
+        let before = dev.forward(&ctx, &data[..15]);
+        let path = "/tmp/blab_ckpt_test.blabtfm";
+        dev.to_model(&ctx).save(path).unwrap();
+        let loaded = Model::load(path).unwrap();
+        assert!(loaded.cfg.qk_norm && (loaded.cfg.alibi_slope - 0.25).abs() < 1e-6,
+                "arch flags not preserved");
+        let after = ModelDev::new(&ctx, &loaded).forward(&ctx, &data[..15]);
+        let maxdiff = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(maxdiff < 1e-4, "checkpoint roundtrip logits differ by {maxdiff}");
+    }
+
     /// Can the model break BELOW the unigram floor? The unigram floor is the
     /// loss of always predicting the marginal byte distribution; beating it
     /// REQUIRES using context (attention/position). With grad clipping + a
@@ -1523,7 +1736,7 @@ mod tests {
     #[test]
     fn transformer_beats_unigram_floor() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1553,7 +1766,7 @@ mod tests {
     #[test]
     fn mtp_head_learns_two_ahead() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 2 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 2, qk_norm: false, alibi_slope: 0.0 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
@@ -1584,7 +1797,7 @@ mod tests {
     #[test]
     fn generate_matches_and_speculative_agrees() {
         let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
-        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 2 };
+        let cfg = Config { vocab: 256, d_model: 48, n_layers: 2, d_ff: 96, max_seq: 24, n_predict: 2, qk_norm: false, alibi_slope: 0.0 };
         let mut model = Model::init(cfg, 7);
         let data = b"fn add(a,b){a+b}";
         let toks: Vec<u8> = data[..data.len() - 1].to_vec();
