@@ -347,6 +347,56 @@ pub fn scale_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, t: &Tensor, s
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
 }
 
+/// Selective-SSM forward scan: `h_t = z_t·h_{t-1} + (1−z_t)·u_t`, elementwise
+/// per channel. The diagonal recurrence is independent across channels, so we
+/// parallelize over the `cols` channels (one thread each) and loop sequentially
+/// over `rows` timesteps inside the thread — no associative scan needed (rows
+/// ≤ context length is short). `block`>0 resets the state at every block start
+/// (block-diagonal batched generation); `block`=0 = one sequence.
+const WGSL_SCAN: &str = r#"
+struct D { rows: u32, cols: u32, block: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       z: array<f32>;
+@group(0) @binding(1) var<storage, read>       u: array<f32>;
+@group(0) @binding(2) var<storage, read_write> h: array<f32>;
+@group(0) @binding(3) var<uniform>             d: D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let j = gid.x; if (j >= d.cols) { return; }
+    var prev: f32 = 0.0;
+    var t: u32 = 0u;
+    loop {
+        if (t >= d.rows) { break; }
+        if (d.block > 0u && (t % d.block) == 0u) { prev = 0.0; }
+        let idx = t * d.cols + j;
+        let zt = z[idx];
+        let ht = zt * prev + (1.0 - zt) * u[idx];
+        h[idx] = ht;
+        prev = ht;
+        t = t + 1u;
+    }
+}
+"#;
+
+/// Record the SSM forward scan into `enc`: `h = scan(z, u)` (shapes [rows,cols]).
+pub fn scan_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                z: &Tensor, u: &Tensor, h: &Tensor, block: usize) {
+    let rows = z.rows as u32; let cols = z.cols as u32;
+    let dims = [rows, cols, block as u32, 0u32];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("scan.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("scan", WGSL_SCAN);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: z.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: u.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: h.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(cols.div_ceil(256), 1, 1);
+}
+
 /// Sum of squares of a tensor → `accum[idx]`. One workgroup, 256 threads,
 /// strided reduction. Lets the grad-clip norm be computed ON-DEVICE: each grad
 /// tensor reduces to one slot of a packed accum buffer, so the whole step needs
@@ -844,5 +894,44 @@ mod tests {
         eprintln!("device-chain {dev_ms:.3} ms/iter  vs per-op {perop_ms:.3} ms/iter  \
                    ({:.1}x)  max_err {max_err:.2e}", perop_ms / dev_ms);
         assert!(max_err < 1e-3, "device chain disagrees: {max_err}");
+    }
+
+    /// The SSM forward scan kernel must match the CPU sequential recurrence,
+    /// for a single sequence (block=0) and block-diagonal reset (block>0).
+    #[test]
+    fn scan_parity_cpu() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let (rows, cols) = (12usize, 7usize);
+        let mut s = 12345u64;
+        let mut rnd = |n: usize| (0..n).map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 40) as f32 / (1u64 << 24) as f32
+        }).collect::<Vec<f32>>();
+        let z = rnd(rows * cols);   // gate-like, in [0,1)
+        let u = rnd(rows * cols);
+        for &block in &[0usize, 4] {
+            // CPU reference
+            let mut h_cpu = vec![0.0f32; rows * cols];
+            for j in 0..cols {
+                let mut prev = 0.0f32;
+                for t in 0..rows {
+                    if block > 0 && t % block == 0 { prev = 0.0; }
+                    let idx = t * cols + j;
+                    let ht = z[idx] * prev + (1.0 - z[idx]) * u[idx];
+                    h_cpu[idx] = ht; prev = ht;
+                }
+            }
+            // GPU
+            let tz = ctx.upload(&z, rows, cols);
+            let tu = ctx.upload(&u, rows, cols);
+            let th = ctx.alloc(rows, cols);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            scan_rec(&ctx, &mut enc, &tz, &tu, &th, block);
+            ctx.queue.submit(Some(enc.finish()));
+            let h_gpu = ctx.download(&th);
+            let err = h_cpu.iter().zip(&h_gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("scan block={block} max_err {err:.2e}");
+            assert!(err < 1e-5, "scan mismatch block={block}: {err}");
+        }
     }
 }
