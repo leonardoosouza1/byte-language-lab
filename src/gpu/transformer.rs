@@ -746,15 +746,25 @@ impl ModelDev {
 
     /// Device-resident forward → logits [seq, vocab]. One submit, one readback.
     pub fn forward(&self, ctx: &GpuContext, tokens: &[u8]) -> Vec<f32> {
+        self.forward_block(ctx, tokens, 0)
+    }
+
+    /// Block-diagonal forward: `block`=0 → one causal sequence; `block`=L →
+    /// `tokens` is B sequences of length L concatenated, attention masked per
+    /// block (each block its own causal context). Enables batched generation.
+    pub fn forward_block(&self, ctx: &GpuContext, tokens: &[u8], block: usize) -> Vec<f32> {
         let d = self.cfg.d_model;
         let ff = self.cfg.d_ff;
         let v = self.cfg.vocab;
         let seq = tokens.len();
+        let pos_of = |i: usize| if block == 0 { i } else { i % block };
+        let blk_arg = f32::from_bits(block as u32);   // carried in softmax eps slot
         // x0 = embed[token] + pos  (host gather, single upload)
         let mut x0 = vec![0.0f32; seq * d];
         for (i, &t) in tokens.iter().enumerate() {
+            let p = pos_of(i);
             for j in 0..d {
-                x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[i * d + j];
+                x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[p * d + j];
             }
         }
         let mut x = ctx.upload(&x0, seq, d);
@@ -776,7 +786,7 @@ impl ModelDev {
             device::gemm_rec(ctx, &mut enc, &xn, &l.wk, &k);
             device::gemm_rec(ctx, &mut enc, &xn, &l.wv, &vv);
             device::gemm_nt_rec(ctx, &mut enc, &q, &k, &scores);               // q·kᵀ
-            device::row_rec(ctx, &mut enc, &scores, &self.pos, &probs, 0.0, 2); // causal softmax (wgt unused)
+            device::row_rec(ctx, &mut enc, &scores, &self.pos, &probs, blk_arg, 2); // causal softmax (block-diag)
             device::gemm_rec(ctx, &mut enc, &probs, &vv, &attn);
             device::gemm_rec(ctx, &mut enc, &attn, &l.wo, &ao);
             device::add_rec(ctx, &mut enc, &x, &ao, &xmid);                    // residual
@@ -810,6 +820,72 @@ impl ModelDev {
             seq.push(nb as u8);
         }
         seq[prompt.len()..].to_vec()
+    }
+
+    /// Temperature sampling (reveals learned structure that greedy hides by
+    /// always picking the mode). `temp` < 1 sharpens, > 1 flattens; `seed` is a
+    /// reproducible LCG seed. Pure-CPU sampling over the GPU forward logits.
+    pub fn generate_temp(&self, ctx: &GpuContext, prompt: &[u8], n: usize,
+                         temp: f32, seed: u64) -> Vec<u8> {
+        let v = self.cfg.vocab;
+        let mw = self.cfg.max_seq;
+        let t = temp.max(1e-3);
+        let mut seq = prompt.to_vec();
+        let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..n {
+            let w = &seq[seq.len().saturating_sub(mw)..];
+            let logits = self.forward(ctx, w);
+            let last = (w.len() - 1) * v;
+            let row = &logits[last..last + v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0.0f32; v];
+            let mut sum = 0.0f32;
+            for i in 0..v { let p = ((row[i] - mx) / t).exp(); probs[i] = p; sum += p; }
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((rng >> 40) as f32 / (1u64 << 24) as f32) * sum;
+            let mut acc = 0.0f32;
+            let mut nb = v - 1;
+            for i in 0..v { acc += probs[i]; if acc >= r { nb = i; break; } }
+            seq.push(nb as u8);
+        }
+        seq[prompt.len()..].to_vec()
+    }
+
+    /// Batched temperature sampling: generate `batch` independent streams from
+    /// the same prompt in parallel via one block-diagonal forward per step.
+    /// Single-stream latency is overhead-bound (~one forward), so B streams in
+    /// ~the same time → ~B× aggregate throughput. Each stream gets its own RNG
+    /// (different seeds) so they diverge. Returns `batch` continuations.
+    pub fn generate_batch(&self, ctx: &GpuContext, prompt: &[u8], batch: usize,
+                          n: usize, temp: f32, seed: u64) -> Vec<Vec<u8>> {
+        let v = self.cfg.vocab;
+        let mw = self.cfg.max_seq;
+        let t = temp.max(1e-3);
+        let mut seqs: Vec<Vec<u8>> = (0..batch).map(|_| prompt.to_vec()).collect();
+        let mut rng: Vec<u64> = (0..batch)
+            .map(|b| (seed ^ 0x9E37_79B9_7F4A_7C15).wrapping_add((b as u64).wrapping_mul(0x1000_0001B3)))
+            .collect();
+        for _ in 0..n {
+            // all streams share the same length each step → block size = window len
+            let l = seqs[0].len().min(mw);
+            let mut toks = Vec::with_capacity(batch * l);
+            for s in &seqs { toks.extend_from_slice(&s[s.len().saturating_sub(mw)..]); }
+            let logits = self.forward_block(ctx, &toks, l);   // (batch*l, v)
+            for b in 0..batch {
+                let row = &logits[(b * l + l - 1) * v..(b * l + l) * v];
+                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs = vec![0.0f32; v];
+                let mut sum = 0.0f32;
+                for i in 0..v { let p = ((row[i] - mx) / t).exp(); probs[i] = p; sum += p; }
+                rng[b] = rng[b].wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let r = ((rng[b] >> 40) as f32 / (1u64 << 24) as f32) * sum;
+                let mut acc = 0.0f32;
+                let mut nb = v - 1;
+                for i in 0..v { acc += probs[i]; if acc >= r { nb = i; break; } }
+                seqs[b].push(nb as u8);
+            }
+        }
+        seqs.into_iter().map(|s| s[prompt.len()..].to_vec()).collect()
     }
 
     /// Forward that keeps every activation as a device Tensor (for backward).
@@ -1462,6 +1538,31 @@ mod tests {
         let eb = rel(&lbatch[l * v..2 * l * v], &lb);
         eprintln!("batched-vs-single rel: block0={ea:.2e} block1={eb:.2e}");
         assert!(ea < 1e-4 && eb < 1e-4, "batched forward leaks across blocks: {ea}, {eb}");
+    }
+
+    /// The INFERENCE block-diagonal forward (`forward_block`, used by
+    /// `generate_batch`) must match standalone single-sequence forwards per
+    /// block — no cross-stream leakage during batched generation.
+    #[test]
+    fn forward_block_matches_single() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let cfg = Config { vocab: 256, d_model: 32, n_layers: 2, d_ff: 64, max_seq: 8, n_predict: 1, qk_norm: false, alibi_slope: 0.0 };
+        let model = Model::init(cfg, 3);
+        let dev = ModelDev::new(&ctx, &model);
+        let v = cfg.vocab; let l = 8usize;
+        let sa: Vec<u8> = b"abcdefgh".to_vec();
+        let sb: Vec<u8> = b"ZYXWVUTS".to_vec();
+        let la = dev.forward(&ctx, &sa);
+        let lb = dev.forward(&ctx, &sb);
+        let mut batch = sa.clone(); batch.extend_from_slice(&sb);
+        let lbatch = dev.forward_block(&ctx, &batch, l);   // block-diagonal, block = l
+        let rel = |a: &[f32], b: &[f32]| a.iter().zip(b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-3))
+            .fold(0.0f32, f32::max);
+        let ea = rel(&lbatch[0..l * v], &la);
+        let eb = rel(&lbatch[l * v..2 * l * v], &lb);
+        eprintln!("forward_block-vs-single rel: block0={ea:.2e} block1={eb:.2e}");
+        assert!(ea < 1e-4 && eb < 1e-4, "forward_block leaks across blocks: {ea}, {eb}");
     }
 
     /// Batched Adam training must still beat the unigram floor (block-diagonal

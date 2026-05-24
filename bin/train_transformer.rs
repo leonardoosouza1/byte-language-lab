@@ -166,9 +166,43 @@ fn main() {
     let gb_hours = 1.0e9 / (tokens_seen as f64 / secs) / 3600.0;
     println!("extrapolation: 1 pass over 1GB ≈ {gb_hours:.1} h at this throughput");
 
-    // sample generation from a code-ish prompt
+    // DIAGNÓSTICO: forward latency vs seq → dispatch-bound (flat) vs compute-bound (cresce)
+    println!("\n[forward latency vs seq] (50 iters)");
+    for &s in &[1usize, 8, 32, 64, 128] {
+        if train.len() < s + 1 { continue; }
+        let w = &train[0..s];
+        let _ = dev.forward(&ctx, w); // warmup
+        let t = Instant::now();
+        let iters = 50;
+        for _ in 0..iters { let _ = dev.forward(&ctx, w); }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("  seq={s:3}  {ms:.3} ms/forward", );
+    }
+
+    // sample generation from a code-ish prompt: greedy (mode) + sampled (structure)
     let prompt = b"fn ";
-    let out = dev.generate(&ctx, prompt, 64);
-    println!("\nsample (prompt {:?}):\n{}", String::from_utf8_lossy(prompt),
-             String::from_utf8_lossy(&out));
+    let g0 = Instant::now();
+    let greedy = dev.generate(&ctx, prompt, 256);
+    let gsecs = g0.elapsed().as_secs_f64();
+    println!("\n[gen speed] 256 bytes em {:.3}s = {:.0} bytes/s ({:.2} ms/byte, batch=1 autoregressive)",
+             gsecs, 256.0 / gsecs, gsecs * 1000.0 / 256.0);
+    println!("[greedy]  {:?} -> {}", String::from_utf8_lossy(prompt),
+             String::from_utf8_lossy(&greedy));
+
+    // batched generation throughput (overhead-bound single stream → B× aggregate)
+    println!("\n[gen batched] vs single ({:.0} bytes/s single):", 256.0 / gsecs);
+    for &bsz in &[4usize, 8, 16, 32] {
+        let b0 = Instant::now();
+        let outs = dev.generate_batch(&ctx, prompt, bsz, 128, 1.0, 0xBEEF);
+        let s = b0.elapsed().as_secs_f64();
+        let total = (bsz * 128) as f64;
+        println!("  batch={bsz:2}: {:.0} bytes/s agregado ({:.0}/stream) — {bsz}×128 bytes em {s:.3}s",
+                 total / s, total / s / bsz as f64);
+        let _ = outs;
+    }
+    for &t in &[0.7f32, 1.0] {
+        let s = dev.generate_temp(&ctx, prompt, 96, t, 0xC0FFEE ^ (t.to_bits() as u64));
+        println!("[temp {t}] {:?} -> {}", String::from_utf8_lossy(prompt),
+                 String::from_utf8_lossy(&s));
+    }
 }
