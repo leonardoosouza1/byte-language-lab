@@ -64,6 +64,7 @@ fn main() {
     let alibi_slope: f32 = args.get(12).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let save_path = args.get(13).cloned().filter(|s| !s.is_empty());
     let load_path = args.get(14).cloned().filter(|s| !s.is_empty());
+    let bit_embed: bool = args.get(15).map(|s| s == "1" || s == "true").unwrap_or(false);
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     println!("corpus {path}: {} bytes", bytes.len());
@@ -97,6 +98,7 @@ fn main() {
     };
     let mut dev = ModelDev::new(&ctx, &model);
     dev.set_qk_lr_mult(qk_lr_mult);
+    if bit_embed { dev.enable_bit_embed(0xB17_5EED); println!("bit-structured embedding: ON"); }
     if let Some(p) = &save_path { println!("checkpointing to {p} (periodic + final)"); }
     let mut rng = Lcg(0x1234_5678_9abc_def0);
 

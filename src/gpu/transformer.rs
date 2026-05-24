@@ -672,6 +672,13 @@ pub struct ModelDev {
     /// ~2400 Adam steps to bootstrap out of the unigram floor. Boosting the QK
     /// learning rate accelerates that bootstrap. 1.0 = off (original behavior).
     qk_lr_mult: f32,
+    /// Bit-structured embedding bias: when on, x0 += Σ_b (±1·bit_b(token))·bit_w[b].
+    /// Bytes sharing bits share this component (validated bit5=case etc.) → an
+    /// inductive prior over the 256-byte vocab. Zero+off by default = identical
+    /// to baseline; `enable_bit_embed` turns it on. Host-resident (gathered into
+    /// x0 like pos), shape [8, d].
+    bit_w: Vec<f32>,
+    bit_on: bool,
 }
 
 /// Persistent first/second-moment buffers for one weight tensor.
@@ -688,6 +695,7 @@ struct AdamState {
     norm_f: AdamMV,
     m_embed: Vec<f32>, v_embed: Vec<f32>,
     m_pos: Vec<f32>, v_pos: Vec<f32>,
+    m_bit: Vec<f32>, v_bit: Vec<f32>,
     t: u64,
 }
 
@@ -714,12 +722,37 @@ impl ModelDev {
             scale: 1.0 / (d as f32).sqrt(),
             opt: None,
             qk_lr_mult: 1.0,
+            bit_w: vec![0.0; 8 * d],
+            bit_on: false,
         }
     }
 
     /// Set the Wq/Wk-only LR multiplier (see field docs). >1 accelerates the
     /// attention bootstrap that otherwise stalls the model at the unigram floor.
     pub fn set_qk_lr_mult(&mut self, m: f32) { self.qk_lr_mult = m; }
+
+    /// Enable the bit-structured embedding bias (innovation #1). Initializes
+    /// bit_w to small random; from then on x0 carries the bit prior and
+    /// train_step_adam learns bit_w. Off→on is the ONLY change vs baseline.
+    pub fn enable_bit_embed(&mut self, seed: u64) {
+        let mut s = seed | 1;
+        for x in self.bit_w.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x = ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.04; // ±0.02
+        }
+        self.bit_on = true;
+    }
+
+    /// Add the bit-structured bias for byte `t` into x0[base..base+d].
+    #[inline]
+    fn add_bit_bias(&self, t: u8, x0: &mut [f32], base: usize, d: usize) {
+        if !self.bit_on { return; }
+        for b in 0..8usize {
+            let s = if (t >> b) & 1 == 1 { 1.0f32 } else { -1.0f32 };
+            let wb = b * d;
+            for j in 0..d { x0[base + j] += s * self.bit_w[wb + j]; }
+        }
+    }
 
     /// Download all device weights back into a host `Model` (for checkpointing).
     /// embed/pos are already host-resident; layer weights + norm_f live on the
@@ -766,6 +799,7 @@ impl ModelDev {
             for j in 0..d {
                 x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[p * d + j];
             }
+            self.add_bit_bias(t, &mut x0, i * d, d);
         }
         let mut x = ctx.upload(&x0, seq, d);
         // scratch
@@ -907,6 +941,7 @@ impl ModelDev {
             for j in 0..d {
                 x0[i * d + j] = self.embed_host[(t as usize) * d + j] + self.pos_host[p * d + j];
             }
+            self.add_bit_bias(t, &mut x0, i * d, d);
         }
         let mut x = ctx.upload(&x0, seq, d);
         let mut caches = Vec::with_capacity(self.layers.len());
@@ -1053,6 +1088,7 @@ impl ModelDev {
             layers, norm_f: zmv(1, d),
             m_embed: vec![0.0; v * d], v_embed: vec![0.0; v * d],
             m_pos: vec![0.0; self.cfg.max_seq * d], v_pos: vec![0.0; self.cfg.max_seq * d],
+            m_bit: vec![0.0; 8 * d], v_bit: vec![0.0; 8 * d],
             t: 0,
         });
     }
@@ -1131,6 +1167,7 @@ impl ModelDev {
         let mut sumsq: f64 = ctx.download(&accum).iter().map(|&x| x as f64).sum();
         let mut d_embed = d_embed_head.clone();
         let mut d_pos = vec![0.0f32; self.pos_host.len()];
+        let mut d_bit = vec![0.0f32; if self.bit_on { 8 * d } else { 0 }];
         for (i, &t) in tokens.iter().enumerate() {
             let base = (t as usize) * d;
             let pbase = pos_of(i) * d;   // batched: positions repeat per block
@@ -1138,9 +1175,17 @@ impl ModelDev {
                 d_embed[base + j] += dx[i * d + j];
                 d_pos[pbase + j] += dx[i * d + j];
             }
+            if self.bit_on {
+                for b in 0..8usize {
+                    let s = if (t >> b) & 1 == 1 { 1.0f32 } else { -1.0f32 };
+                    let wb = b * d;
+                    for j in 0..d { d_bit[wb + j] += s * dx[i * d + j]; }
+                }
+            }
         }
         for &x in d_embed.iter() { sumsq += (x as f64) * (x as f64); }
         for &x in d_pos.iter() { sumsq += (x as f64) * (x as f64); }
+        for &x in d_bit.iter() { sumsq += (x as f64) * (x as f64); }
         let gn = sumsq.sqrt() as f32;
         let f = if gn.is_finite() && gn > max_norm && gn > 0.0 { max_norm / gn } else { 1.0 };
 
@@ -1195,6 +1240,15 @@ impl ModelDev {
             o.v_pos[i] = B2 * o.v_pos[i] + (1.0 - B2) * gi * gi;
             let mh = o.m_pos[i] / bc1; let vh = o.v_pos[i] / bc2;
             self.pos_host[i] -= lr * (mh / (vh.sqrt() + EPS) + WD * self.pos_host[i]);
+        }
+        if self.bit_on {
+            for i in 0..self.bit_w.len() {
+                let gi = d_bit[i] * f;
+                o.m_bit[i] = B1 * o.m_bit[i] + (1.0 - B1) * gi;
+                o.v_bit[i] = B2 * o.v_bit[i] + (1.0 - B2) * gi * gi;
+                let mh = o.m_bit[i] / bc1; let vh = o.v_bit[i] / bc2;
+                self.bit_w[i] -= lr * (mh / (vh.sqrt() + EPS) + WD * self.bit_w[i]);
+            }
         }
         self.embed = ctx.upload(&self.embed_host, v, d);
         self.pos = ctx.upload(&self.pos_host, self.cfg.max_seq, d);

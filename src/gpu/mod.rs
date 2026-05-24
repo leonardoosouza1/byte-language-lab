@@ -33,6 +33,9 @@ pub mod byte_lm;
 /// Windowed (context-aware) byte LM — trains on real code, generates bytes.
 pub mod byte_win_lm;
 
+/// Generative liquid / selective-SSM byte LM (CPU prototype, gradient-checked).
+pub mod ssm;
+
 /// Handle para device/queue da GPU. Construído uma vez por processo.
 pub struct GpuContext {
     /// Device wgpu (Vulkan no Linux+RDNA2).
