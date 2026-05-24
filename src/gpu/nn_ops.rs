@@ -133,6 +133,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = inp[i];
     if (d.op == 0u) {
         out[i] = x / (1.0 + exp(-x));            // SiLU
+    } else if (d.op == 2u) {
+        out[i] = 1.0 / (1.0 + exp(-x));          // sigmoid (SSM gate)
     } else {
         // GELU tanh approx
         let c = 0.7978845608 * (x + 0.044715 * x * x * x);

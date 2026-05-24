@@ -397,6 +397,100 @@ pub fn scan_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
     pass.dispatch_workgroups(cols.div_ceil(256), 1, 1);
 }
 
+/// Backward of the SSM scan (BPTT). Given `dh` (grad into each h_t from the
+/// y=h·Wo path), the cached `z,u,h`, produces `dz,du`. Per channel, loop t
+/// backward carrying the recurrent gradient; `block`>0 cuts the carry at block
+/// boundaries (matches the forward reset). One thread per channel.
+const WGSL_SCAN_BWD: &str = r#"
+struct D { rows: u32, cols: u32, block: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       dh: array<f32>;
+@group(0) @binding(1) var<storage, read>       z:  array<f32>;
+@group(0) @binding(2) var<storage, read>       u:  array<f32>;
+@group(0) @binding(3) var<storage, read>       h:  array<f32>;
+@group(0) @binding(4) var<storage, read_write> dz: array<f32>;
+@group(0) @binding(5) var<storage, read_write> du: array<f32>;
+@group(0) @binding(6) var<uniform>             d:  D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let j = gid.x; if (j >= d.cols) { return; }
+    var carry: f32 = 0.0;
+    var tt: u32 = d.rows;
+    loop {
+        if (tt == 0u) { break; }
+        tt = tt - 1u;
+        let t = tt;
+        let idx = t * d.cols + j;
+        let block_start = (d.block > 0u && (t % d.block) == 0u);
+        let g = dh[idx] + carry;
+        var prev: f32 = 0.0;
+        if (t > 0u && !block_start) { prev = h[idx - d.cols]; }
+        dz[idx] = g * (prev - u[idx]);
+        du[idx] = g * (1.0 - z[idx]);
+        if (block_start) { carry = 0.0; } else { carry = g * z[idx]; }
+    }
+}
+"#;
+
+/// Record the SSM scan backward into `enc`. dz,du shape [rows,cols].
+#[allow(clippy::too_many_arguments)]
+pub fn scan_bwd_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                    dh: &Tensor, z: &Tensor, u: &Tensor, h: &Tensor,
+                    dz: &Tensor, du: &Tensor, block: usize) {
+    let rows = z.rows as u32; let cols = z.cols as u32;
+    let dims = [rows, cols, block as u32, 0u32];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("scanbwd.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("scan_bwd", WGSL_SCAN_BWD);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: dh.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: z.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: u.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: h.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: dz.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: du.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(cols.div_ceil(256), 1, 1);
+}
+
+/// Record `o = dz ⊙ z ⊙ (1−z)` (sigmoid backward) into `enc`. Shapes match.
+const WGSL_DSIG: &str = r#"
+struct D { n: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       dz: array<f32>;
+@group(0) @binding(1) var<storage, read>       z:  array<f32>;
+@group(0) @binding(2) var<storage, read_write> o:  array<f32>;
+@group(0) @binding(3) var<uniform>             d:  D;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= d.n) { return; }
+    let zz = z[i];
+    o[i] = dz[i] * zz * (1.0 - zz);
+}
+"#;
+
+/// Record `o = dz ⊙ z ⊙ (1−z)` into `enc` (sigmoid-backward elementwise).
+pub fn dsig_rec(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder,
+                dz: &Tensor, z: &Tensor, o: &Tensor) {
+    let n = (dz.rows * dz.cols) as u32;
+    let dims = [n, 0u32];
+    let dim_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("dsig.dims"), contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let pipeline = ctx.pipeline("dsig", WGSL_DSIG);
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: dz.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: z.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: o.buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() }]});
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+}
+
 /// Sum of squares of a tensor → `accum[idx]`. One workgroup, 256 threads,
 /// strided reduction. Lets the grad-clip norm be computed ON-DEVICE: each grad
 /// tensor reduces to one slot of a packed accum buffer, so the whole step needs

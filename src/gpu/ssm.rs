@@ -22,6 +22,9 @@
 //! unigram-floor-break overfit test prove correctness + that it learns + that
 //! it generates.
 
+use super::device::{self, Tensor};
+use super::GpuContext;
+
 /// Sigmoid.
 #[inline]
 fn sig(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -209,6 +212,11 @@ impl SsmModel {
         (logits, caches, xf, xf_inv)
     }
 
+    /// Forward → logits [T, vocab] only (for parity checks vs the device path).
+    pub fn forward_logits(&self, tokens: &[u8]) -> Vec<f32> {
+        self.forward_cache(tokens).0
+    }
+
     /// Forward → mean next-byte cross-entropy loss (no caches; for eval/fd-check).
     pub fn loss(&self, tokens: &[u8], targets: &[u8]) -> f32 {
         let (logits, _, _, _) = self.forward_cache(tokens);
@@ -364,6 +372,320 @@ fn rmsnorm_bwd_full(dy: &[f32], x: &[f32], w: &[f32], inv: &[f32], t: usize, d: 
     rmsnorm_bwd(dy, x, w, inv, t, d)
 }
 
+/// AdamW moment buffers for one parameter array.
+pub struct AdamBuf { m: Vec<f32>, v: Vec<f32> }
+impl AdamBuf {
+    fn z(n: usize) -> Self { AdamBuf { m: vec![0.0; n], v: vec![0.0; n] } }
+    #[allow(clippy::too_many_arguments)]
+    fn step(&mut self, w: &mut [f32], g: &[f32], lr: f32, b1: f32, b2: f32,
+            eps: f32, bc1: f32, bc2: f32, wd: f32) {
+        for i in 0..w.len() {
+            let gi = g[i];
+            self.m[i] = b1 * self.m[i] + (1.0 - b1) * gi;
+            self.v[i] = b2 * self.v[i] + (1.0 - b2) * gi * gi;
+            let mh = self.m[i] / bc1; let vh = self.v[i] / bc2;
+            w[i] -= lr * (mh / (vh.sqrt() + eps) + wd * w[i]);
+        }
+    }
+}
+struct LayerOpt { norm1: AdamBuf, wz: AdamBuf, bz: AdamBuf, wu: AdamBuf, bu: AdamBuf, wo: AdamBuf }
+/// AdamW optimizer state for an `SsmModel` (mirrors its parameters).
+pub struct SsmOpt { embed: AdamBuf, norm_f: AdamBuf, layers: Vec<LayerOpt>, t: u64 }
+impl SsmOpt {
+    pub fn new(m: &SsmModel) -> Self {
+        let d = m.d;
+        SsmOpt {
+            embed: AdamBuf::z(m.embed.len()),
+            norm_f: AdamBuf::z(d),
+            layers: m.layers.iter().map(|l| LayerOpt {
+                norm1: AdamBuf::z(d), wz: AdamBuf::z(l.wz.len()), bz: AdamBuf::z(d),
+                wu: AdamBuf::z(l.wu.len()), bu: AdamBuf::z(d), wo: AdamBuf::z(l.wo.len()),
+            }).collect(),
+            t: 0,
+        }
+    }
+}
+
+impl SsmModel {
+    /// AdamW step (decoupled weight decay). Plain SGD stalls on real data for
+    /// ill-conditioned recurrent nets — same lesson as the transformer.
+    pub fn adamw(&mut self, g: &SsmGrads, opt: &mut SsmOpt, lr: f32) {
+        opt.t += 1;
+        let (b1, b2, eps, wd) = (0.9f32, 0.999f32, 1e-5f32, 0.01f32);
+        let bc1 = 1.0 - b1.powi(opt.t as i32);
+        let bc2 = 1.0 - b2.powi(opt.t as i32);
+        opt.embed.step(&mut self.embed, &g.d_embed, lr, b1, b2, eps, bc1, bc2, wd);
+        opt.norm_f.step(&mut self.norm_f, &g.d_norm_f, lr, b1, b2, eps, bc1, bc2, wd);
+        for (l, (dl, ol)) in self.layers.iter_mut()
+            .zip(g.layers.iter().zip(opt.layers.iter_mut())) {
+            ol.norm1.step(&mut l.norm1, &dl.norm1, lr, b1, b2, eps, bc1, bc2, wd);
+            ol.wz.step(&mut l.wz, &dl.wz, lr, b1, b2, eps, bc1, bc2, wd);
+            ol.bz.step(&mut l.bz, &dl.bz, lr, b1, b2, eps, bc1, bc2, wd);
+            ol.wu.step(&mut l.wu, &dl.wu, lr, b1, b2, eps, bc1, bc2, wd);
+            ol.bu.step(&mut l.bu, &dl.bu, lr, b1, b2, eps, bc1, bc2, wd);
+            ol.wo.step(&mut l.wo, &dl.wo, lr, b1, b2, eps, bc1, bc2, wd);
+        }
+    }
+
+    /// Temperature sampling generation (reveals structure greedy hides).
+    pub fn generate_temp(&self, prompt: &[u8], n: usize, temp: f32, seed: u64) -> Vec<u8> {
+        let v = self.vocab; let t = temp.max(1e-3);
+        let mut seq = prompt.to_vec();
+        let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..n {
+            let (logits, _, _, _) = self.forward_cache(&seq);
+            let last = (seq.len() - 1) * v;
+            let row = &logits[last..last + v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0.0f32; v]; let mut sum = 0.0f32;
+            for i in 0..v { let p = ((row[i] - mx) / t).exp(); probs[i] = p; sum += p; }
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((rng >> 40) as f32 / (1u64 << 24) as f32) * sum;
+            let mut acc = 0.0f32; let mut nb = v - 1;
+            for i in 0..v { acc += probs[i]; if acc >= r { nb = i; break; } }
+            seq.push(nb as u8);
+        }
+        seq[prompt.len()..].to_vec()
+    }
+}
+
+// ===================== GPU device-resident path =====================
+
+/// One device-resident SSM layer (bias-free; norms fixed at 1.0 — parameter-free
+/// RMSNorm, standard in SSMs — so the device forward matches the CPU forward of
+/// a freshly-init'd model exactly).
+pub struct DevLayer { norm1: Tensor, wz: Tensor, wu: Tensor, wo: Tensor }
+
+struct LayerCacheDev { x_in: Tensor, xn: Tensor, z: Tensor, u: Tensor, h: Tensor }
+struct DevOpt { embed: AdamBuf, wz: Vec<AdamBuf>, wu: Vec<AdamBuf>, wo: Vec<AdamBuf>, t: u64 }
+
+/// GPU liquid/SSM byte LM. Forward+backward composed from the device kernels
+/// (rmsnorm, gemm, sigmoid, scan, scan_bwd, dsig) — the only SSM-specific
+/// primitives are scan/scan_bwd; everything else reuses the transformer's ops.
+/// Holds the host weights `m` (source of truth) + device mirrors; AdamW runs on
+/// host (embed + wz/wu/wo), then changed tensors are re-uploaded.
+pub struct DevSsm {
+    pub m: SsmModel,
+    embed: Tensor,
+    layers: Vec<DevLayer>,
+    norm_f: Tensor,
+    opt: Option<DevOpt>,
+}
+
+impl DevSsm {
+    pub fn from_cpu(ctx: &GpuContext, m: &SsmModel) -> Self {
+        let d = m.d;
+        let layers = m.layers.iter().map(|l| DevLayer {
+            norm1: ctx.upload(&l.norm1, 1, d),
+            wz: ctx.upload(&l.wz, d, d),
+            wu: ctx.upload(&l.wu, d, d),
+            wo: ctx.upload(&l.wo, d, d),
+        }).collect();
+        DevSsm {
+            embed: ctx.upload(&m.embed, m.vocab, d),
+            layers, norm_f: ctx.upload(&m.norm_f, 1, d),
+            m: m.clone(), opt: None,
+        }
+    }
+
+    pub fn new(ctx: &GpuContext, vocab: usize, d: usize, n_layers: usize, seed: u64) -> Self {
+        Self::from_cpu(ctx, &SsmModel::init(vocab, d, n_layers, seed))
+    }
+
+    /// Re-upload the trained tensors (embed + wz/wu/wo) from host `m` after Adam.
+    fn reupload(&mut self, ctx: &GpuContext) {
+        let d = self.m.d;
+        self.embed = ctx.upload(&self.m.embed, self.m.vocab, d);
+        for (l, t) in self.m.layers.iter().zip(self.layers.iter_mut()) {
+            t.wz = ctx.upload(&l.wz, d, d);
+            t.wu = ctx.upload(&l.wu, d, d);
+            t.wo = ctx.upload(&l.wo, d, d);
+        }
+    }
+
+    /// Inference forward → logits [T, vocab]. `block`=0 single sequence.
+    pub fn forward_dev(&self, ctx: &GpuContext, tokens: &[u8], block: usize) -> Vec<f32> {
+        let d = self.m.d; let v = self.m.vocab; let t = tokens.len();
+        let mut x0 = vec![0.0f32; t * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            let e = (tok as usize) * d;
+            x0[i * d..i * d + d].copy_from_slice(&self.m.embed[e..e + d]);
+        }
+        let mut x = ctx.upload(&x0, t, d);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for l in &self.layers {
+            let xn = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x, &l.norm1, &xn, self.m.eps, 1);
+            let zp = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wz, &zp);
+            let z = ctx.alloc(t, d); device::elem_rec(ctx, &mut enc, &zp, &z, 2);
+            let u = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wu, &u);
+            let h = ctx.alloc(t, d); device::scan_rec(ctx, &mut enc, &z, &u, &h, block);
+            let y = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &h, &l.wo, &y);
+            let xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
+            x = xo;
+        }
+        let xf = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x, &self.norm_f, &xf, self.m.eps, 1);
+        let logits = ctx.alloc(t, v); device::gemm_nt_rec(ctx, &mut enc, &xf, &self.embed, &logits);
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.download(&logits)
+    }
+
+    fn ensure_opt(&mut self) {
+        if self.opt.is_some() { return; }
+        let d = self.m.d;
+        self.opt = Some(DevOpt {
+            embed: AdamBuf::z(self.m.embed.len()),
+            wz: (0..self.layers.len()).map(|_| AdamBuf::z(d * d)).collect(),
+            wu: (0..self.layers.len()).map(|_| AdamBuf::z(d * d)).collect(),
+            wo: (0..self.layers.len()).map(|_| AdamBuf::z(d * d)).collect(),
+            t: 0,
+        });
+    }
+
+    /// Compute gradients on the GPU. Returns (loss, d_embed[v,d],
+    /// per-layer (dwz,dwu,dwo)[d,d]). Norms are fixed (not trained).
+    #[allow(clippy::type_complexity)]
+    fn compute_grads(&self, ctx: &GpuContext, tokens: &[u8], targets: &[u8], block: usize)
+        -> (f32, Vec<f32>, Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>) {
+        let d = self.m.d; let v = self.m.vocab; let t = tokens.len();
+        // ---- forward with caches ----
+        let mut x0 = vec![0.0f32; t * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            let e = (tok as usize) * d;
+            x0[i * d..i * d + d].copy_from_slice(&self.m.embed[e..e + d]);
+        }
+        let mut x = ctx.upload(&x0, t, d);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let mut caches: Vec<LayerCacheDev> = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            let xn = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x, &l.norm1, &xn, self.m.eps, 1);
+            let zp = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wz, &zp);
+            let z = ctx.alloc(t, d); device::elem_rec(ctx, &mut enc, &zp, &z, 2);
+            let u = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wu, &u);
+            let h = ctx.alloc(t, d); device::scan_rec(ctx, &mut enc, &z, &u, &h, block);
+            let y = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &h, &l.wo, &y);
+            let xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
+            caches.push(LayerCacheDev { x_in: x, xn, z, u, h });
+            x = xo;
+        }
+        let x_final = x;
+        let xf = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x_final, &self.norm_f, &xf, self.m.eps, 1);
+        let logits_t = ctx.alloc(t, v); device::gemm_nt_rec(ctx, &mut enc, &xf, &self.embed, &logits_t);
+        ctx.queue.submit(Some(enc.finish()));
+        let logits = ctx.download(&logits_t);
+
+        // ---- softmax CE grad (host) ----
+        let mut dlogits = vec![0.0f32; t * v];
+        let mut loss = 0.0f64;
+        for i in 0..t {
+            let row = &logits[i * v..i * v + v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for &zz in row { sum += (zz - mx).exp(); }
+            for j in 0..v { dlogits[i * v + j] = ((row[j] - mx).exp() / sum) / t as f32; }
+            dlogits[i * v + targets[i] as usize] -= 1.0 / t as f32;
+            loss += -(((row[targets[i] as usize] - mx) - sum.ln()) as f64);
+        }
+        loss /= t as f64;
+        let dlt = ctx.upload(&dlogits, t, v);
+
+        // ---- backward ----
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let d_embed_head = ctx.alloc(v, d); device::gemm_tn_rec(ctx, &mut enc, &dlt, &xf, &d_embed_head);
+        let dxf = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &dlt, &self.embed, &dxf);
+        let mut dx = ctx.alloc(t, d);
+        device::rms_in_bwd_rec(ctx, &mut enc, &dxf, &x_final, &self.norm_f, &dx, self.m.eps);
+        let mut dws: Vec<(Tensor, Tensor, Tensor)> = Vec::with_capacity(self.layers.len());
+        for li in (0..self.layers.len()).rev() {
+            let l = &self.layers[li];
+            let c = &caches[li];
+            let dwo = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.h, &dx, &dwo);   // hᵀ·dy
+            let dh_y = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &dx, &l.wo, &dh_y); // dy·woᵀ
+            let dz = ctx.alloc(t, d); let du = ctx.alloc(t, d);
+            device::scan_bwd_rec(ctx, &mut enc, &dh_y, &c.z, &c.u, &c.h, &dz, &du, block);
+            let dzpre = ctx.alloc(t, d); device::dsig_rec(ctx, &mut enc, &dz, &c.z, &dzpre);
+            let dwz = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.xn, &dzpre, &dwz);
+            let dwu = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.xn, &du, &dwu);
+            let dxn = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &dzpre, &l.wz, &dxn);
+            let dxn_u = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &du, &l.wu, &dxn_u);
+            let dxn_s = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &dxn, &dxn_u, &dxn_s);
+            let dxin_norm = ctx.alloc(t, d);
+            device::rms_in_bwd_rec(ctx, &mut enc, &dxn_s, &c.x_in, &l.norm1, &dxin_norm, self.m.eps);
+            let dx_new = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &dx, &dxin_norm, &dx_new);
+            dx = dx_new;
+            dws.push((dwz, dwu, dwo));
+        }
+        dws.reverse();
+        ctx.queue.submit(Some(enc.finish()));
+
+        // ---- download grads + scatter embed ----
+        let mut d_embed = ctx.download(&d_embed_head);
+        let dx_host = ctx.download(&dx);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let e = (tok as usize) * d;
+            for j in 0..d { d_embed[e + j] += dx_host[i * d + j]; }
+        }
+        let layer_grads = dws.into_iter()
+            .map(|(z, u, o)| (ctx.download(&z), ctx.download(&u), ctx.download(&o)))
+            .collect();
+        (loss as f32, d_embed, layer_grads)
+    }
+
+    /// One AdamW training step fully on GPU (forward+backward), host Adam update.
+    pub fn train_step(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
+                      lr: f32, block: usize) -> f32 {
+        self.ensure_opt();
+        let (loss, d_embed, lg) = self.compute_grads(ctx, tokens, targets, block);
+        let (b1, b2, eps, wd) = (0.9f32, 0.999f32, 1e-5f32, 0.01f32);
+        let (bc1, bc2) = {
+            let o = self.opt.as_mut().unwrap(); o.t += 1;
+            (1.0 - b1.powi(o.t as i32), 1.0 - b2.powi(o.t as i32))
+        };
+        let o = self.opt.as_mut().unwrap();
+        o.embed.step(&mut self.m.embed, &d_embed, lr, b1, b2, eps, bc1, bc2, wd);
+        for (li, (dwz, dwu, dwo)) in lg.iter().enumerate() {
+            o.wz[li].step(&mut self.m.layers[li].wz, dwz, lr, b1, b2, eps, bc1, bc2, wd);
+            o.wu[li].step(&mut self.m.layers[li].wu, dwu, lr, b1, b2, eps, bc1, bc2, wd);
+            o.wo[li].step(&mut self.m.layers[li].wo, dwo, lr, b1, b2, eps, bc1, bc2, wd);
+        }
+        self.reupload(ctx);
+        loss
+    }
+
+    /// Greedy generation (forward over the growing prefix).
+    pub fn generate(&self, ctx: &GpuContext, prompt: &[u8], n: usize) -> Vec<u8> {
+        let v = self.m.vocab;
+        let mut seq = prompt.to_vec();
+        for _ in 0..n {
+            let logits = self.forward_dev(ctx, &seq, 0);
+            let last = (seq.len() - 1) * v;
+            let nb = (0..v).max_by(|&a, &b|
+                logits[last + a].partial_cmp(&logits[last + b]).unwrap()).unwrap();
+            seq.push(nb as u8);
+        }
+        seq[prompt.len()..].to_vec()
+    }
+
+    /// Temperature sampling generation.
+    pub fn generate_temp(&self, ctx: &GpuContext, prompt: &[u8], n: usize, temp: f32, seed: u64) -> Vec<u8> {
+        let v = self.m.vocab; let tp = temp.max(1e-3);
+        let mut seq = prompt.to_vec();
+        let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..n {
+            let logits = self.forward_dev(ctx, &seq, 0);
+            let row = &logits[(seq.len() - 1) * v..seq.len() * v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0.0f32; v]; let mut sum = 0.0f32;
+            for i in 0..v { let p = ((row[i] - mx) / tp).exp(); probs[i] = p; sum += p; }
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((rng >> 40) as f32 / (1u64 << 24) as f32) * sum;
+            let mut acc = 0.0f32; let mut nb = v - 1;
+            for i in 0..v { acc += probs[i]; if acc >= r { nb = i; break; } }
+            seq.push(nb as u8);
+        }
+        seq[prompt.len()..].to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +736,72 @@ mod tests {
         // gradients (biases get ~1e-3 grads); the large-gradient probes (wu/wo)
         // land at 1e-4..4e-3, and ssm_breaks_unigram_floor is the end-to-end proof.
         assert!(max_rel < 6e-2, "SSM gradient check failed: max rel {max_rel}");
+    }
+
+    /// Device SSM forward must match the CPU forward (same weights). Gate for
+    /// the GPU path: validates rmsnorm+gemm+sigmoid+scan compose correctly.
+    #[test]
+    fn dev_forward_matches_cpu() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let (v, d) = (256usize, 32usize);
+        let m = SsmModel::init(v, d, 3, 7);   // init biases are 0 → bias-free = device
+        let dev = DevSsm::from_cpu(&ctx, &m);
+        let toks: Vec<u8> = b"fn main() { let x = 42; }".to_vec();
+        let cpu = m.forward_logits(&toks);
+        let gpu = dev.forward_dev(&ctx, &toks, 0);
+        let rel = cpu.iter().zip(&gpu)
+            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-3))
+            .fold(0.0f32, f32::max);
+        eprintln!("dev-vs-cpu forward rel {rel:.2e}");
+        assert!(rel < 1e-3, "device SSM forward disagrees: {rel}");
+    }
+
+    /// Device backward must match CPU backward grads (same weights) for the
+    /// trained params (embed + wz/wu/wo). The correctness gate for GPU training.
+    #[test]
+    fn dev_backward_matches_cpu() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let (v, d) = (64usize, 24usize);
+        let m = SsmModel::init(v, d, 2, 5);
+        let dev = DevSsm::from_cpu(&ctx, &m);
+        let toks: Vec<u8> = (0..20).map(|i| ((i * 7 + 3) % v) as u8).collect();
+        let tgts: Vec<u8> = (0..20).map(|i| ((i * 7 + 10) % v) as u8).collect();
+        let (_, cg) = m.backward(&toks, &tgts);
+        let (_, d_embed, lg) = dev.compute_grads(&ctx, &toks, &tgts, 0);
+        let rel = |a: &[f32], b: &[f32]| a.iter().zip(b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-3)).fold(0.0f32, f32::max);
+        let re = rel(&cg.d_embed, &d_embed);
+        let rz = rel(&cg.layers[0].wz, &lg[0].0);
+        let ru = rel(&cg.layers[0].wu, &lg[0].1);
+        let ro = rel(&cg.layers[0].wo, &lg[0].2);
+        eprintln!("dev-vs-cpu grads rel: embed={re:.2e} wz={rz:.2e} wu={ru:.2e} wo={ro:.2e}");
+        assert!(re < 5e-2 && rz < 5e-2 && ru < 5e-2 && ro < 5e-2,
+                "device backward disagrees: e={re} z={rz} u={ru} o={ro}");
+    }
+
+    /// The GPU liquid model must TRAIN and GENERATE: break the unigram floor on
+    /// a period-7 cycle and generate it back. End-to-end GPU proof.
+    #[test]
+    fn dev_breaks_unigram_floor() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let v = 32usize;
+        let pat: Vec<u8> = (0..200).map(|i| ((i % 7) * 3 % v) as u8).collect();
+        let toks = &pat[..pat.len() - 1];
+        let tgts = &pat[1..];
+        let mut cnt = [0u32; 256];
+        for &b in tgts { cnt[b as usize] += 1; }
+        let n = tgts.len() as f32;
+        let floor: f32 = tgts.iter().map(|&b| -((cnt[b as usize] as f32 / n).ln())).sum::<f32>() / n;
+        let mut dev = DevSsm::new(&ctx, v, 24, 2, 1);
+        let mut loss = 0.0;
+        for step in 0..400 {
+            loss = dev.train_step(&ctx, toks, tgts, 0.01, 0);
+            if step % 100 == 0 { eprintln!("gpu step {step}: loss {loss:.4} (floor {floor:.4})"); }
+        }
+        eprintln!("gpu final loss {loss:.4}, floor {floor:.4}");
+        assert!(loss < floor * 0.6, "GPU liquid core did not learn: {loss} vs floor {floor}");
+        let out = dev.generate(&ctx, &pat[..7], 14);
+        eprintln!("gpu generated: {:?}", out);
     }
 
     /// The generative liquid core must LEARN: overfit a deterministic period-7
