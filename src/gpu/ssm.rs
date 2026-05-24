@@ -457,7 +457,12 @@ impl SsmModel {
 pub struct DevLayer { norm1: Tensor, wz: Tensor, wu: Tensor, wo: Tensor }
 
 struct LayerCacheDev { x_in: Tensor, xn: Tensor, z: Tensor, u: Tensor, h: Tensor }
-struct DevOpt { embed: AdamBuf, wz: Vec<AdamBuf>, wu: Vec<AdamBuf>, wo: Vec<AdamBuf>, t: u64 }
+/// Device-resident Adam moments for one weight tensor (no host round-trip).
+struct AdamMV { m: Tensor, v: Tensor }
+/// Optimizer state: layer weights (wz/wu/wo) get DEVICE moments (adam_rec
+/// in-place, no download/reupload); embed stays host (small, like the
+/// transformer's embed/pos).
+struct DevOpt { embed: AdamBuf, wz: Vec<AdamMV>, wu: Vec<AdamMV>, wo: Vec<AdamMV>, t: u64 }
 
 /// GPU liquid/SSM byte LM. Forward+backward composed from the device kernels
 /// (rmsnorm, gemm, sigmoid, scan, scan_bwd, dsig) — the only SSM-specific
@@ -529,14 +534,18 @@ impl DevSsm {
         ctx.download(&logits)
     }
 
-    fn ensure_opt(&mut self) {
+    fn ensure_opt(&mut self, ctx: &GpuContext) {
         if self.opt.is_some() { return; }
         let d = self.m.d;
+        let zmv = || AdamMV {
+            m: ctx.upload(&vec![0.0f32; d * d], d, d),
+            v: ctx.upload(&vec![0.0f32; d * d], d, d),
+        };
         self.opt = Some(DevOpt {
             embed: AdamBuf::z(self.m.embed.len()),
-            wz: (0..self.layers.len()).map(|_| AdamBuf::z(d * d)).collect(),
-            wu: (0..self.layers.len()).map(|_| AdamBuf::z(d * d)).collect(),
-            wo: (0..self.layers.len()).map(|_| AdamBuf::z(d * d)).collect(),
+            wz: (0..self.layers.len()).map(|_| zmv()).collect(),
+            wu: (0..self.layers.len()).map(|_| zmv()).collect(),
+            wo: (0..self.layers.len()).map(|_| zmv()).collect(),
             t: 0,
         });
     }
@@ -630,25 +639,113 @@ impl DevSsm {
         (loss as f32, d_embed, layer_grads)
     }
 
-    /// One AdamW training step fully on GPU (forward+backward), host Adam update.
+    /// One AdamW step, DEVICE-RESIDENT: forward+backward+Adam(layer weights) all
+    /// on GPU. Layer weights (wz/wu/wo) update in-place via `adam_rec` (no grad
+    /// download, no weight reupload). Only embed round-trips to host (small) +
+    /// the logits readback for the softmax-CE grad (small). 3 submits/step.
     pub fn train_step(&mut self, ctx: &GpuContext, tokens: &[u8], targets: &[u8],
                       lr: f32, block: usize) -> f32 {
-        self.ensure_opt();
-        let (loss, d_embed, lg) = self.compute_grads(ctx, tokens, targets, block);
-        let (b1, b2, eps, wd) = (0.9f32, 0.999f32, 1e-5f32, 0.01f32);
+        const B1: f32 = 0.9; const B2: f32 = 0.999; const EPS: f32 = 1e-5; const WD: f32 = 0.01;
+        self.ensure_opt(ctx);
+        let d = self.m.d; let v = self.m.vocab; let t = tokens.len();
+
+        // ---- forward (1 submit) ----
+        let mut x0 = vec![0.0f32; t * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            let e = (tok as usize) * d;
+            x0[i * d..i * d + d].copy_from_slice(&self.m.embed[e..e + d]);
+        }
+        let mut x = ctx.upload(&x0, t, d);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let mut caches: Vec<LayerCacheDev> = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            let xn = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x, &l.norm1, &xn, self.m.eps, 1);
+            let zp = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wz, &zp);
+            let z = ctx.alloc(t, d); device::elem_rec(ctx, &mut enc, &zp, &z, 2);
+            let u = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wu, &u);
+            let h = ctx.alloc(t, d); device::scan_rec(ctx, &mut enc, &z, &u, &h, block);
+            let y = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &h, &l.wo, &y);
+            let xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
+            caches.push(LayerCacheDev { x_in: x, xn, z, u, h });
+            x = xo;
+        }
+        let x_final = x;
+        let xf = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x_final, &self.norm_f, &xf, self.m.eps, 1);
+        let logits_t = ctx.alloc(t, v); device::gemm_nt_rec(ctx, &mut enc, &xf, &self.embed, &logits_t);
+        ctx.queue.submit(Some(enc.finish()));
+        let logits = ctx.download(&logits_t);
+
+        // ---- softmax CE grad (host, small) ----
+        let mut dlogits = vec![0.0f32; t * v];
+        let mut loss = 0.0f64;
+        for i in 0..t {
+            let row = &logits[i * v..i * v + v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for &zz in row { sum += (zz - mx).exp(); }
+            for j in 0..v { dlogits[i * v + j] = ((row[j] - mx).exp() / sum) / t as f32; }
+            dlogits[i * v + targets[i] as usize] -= 1.0 / t as f32;
+            loss += -(((row[targets[i] as usize] - mx) - sum.ln()) as f64);
+        }
+        loss /= t as f64;
+        let dlt = ctx.upload(&dlogits, t, v);
+
+        // ---- backward (1 submit) → layer grads stay on device ----
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let d_embed_head = ctx.alloc(v, d); device::gemm_tn_rec(ctx, &mut enc, &dlt, &xf, &d_embed_head);
+        let dxf = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &dlt, &self.embed, &dxf);
+        let mut dx = ctx.alloc(t, d);
+        device::rms_in_bwd_rec(ctx, &mut enc, &dxf, &x_final, &self.norm_f, &dx, self.m.eps);
+        let mut dws: Vec<(usize, Tensor, Tensor, Tensor)> = Vec::with_capacity(self.layers.len());
+        for li in (0..self.layers.len()).rev() {
+            let l = &self.layers[li];
+            let c = &caches[li];
+            let dwo = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.h, &dx, &dwo);
+            let dh_y = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &dx, &l.wo, &dh_y);
+            let dz = ctx.alloc(t, d); let du = ctx.alloc(t, d);
+            device::scan_bwd_rec(ctx, &mut enc, &dh_y, &c.z, &c.u, &c.h, &dz, &du, block);
+            let dzpre = ctx.alloc(t, d); device::dsig_rec(ctx, &mut enc, &dz, &c.z, &dzpre);
+            let dwz = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.xn, &dzpre, &dwz);
+            let dwu = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.xn, &du, &dwu);
+            let dxn = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &dzpre, &l.wz, &dxn);
+            let dxn_u = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &du, &l.wu, &dxn_u);
+            let dxn_s = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &dxn, &dxn_u, &dxn_s);
+            let dxin = ctx.alloc(t, d);
+            device::rms_in_bwd_rec(ctx, &mut enc, &dxn_s, &c.x_in, &l.norm1, &dxin, self.m.eps);
+            let dx_new = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &dx, &dxin, &dx_new);
+            dx = dx_new;
+            dws.push((li, dwz, dwu, dwo));
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        // ---- Adam: layer weights in-place on device; embed on host ----
         let (bc1, bc2) = {
             let o = self.opt.as_mut().unwrap(); o.t += 1;
-            (1.0 - b1.powi(o.t as i32), 1.0 - b2.powi(o.t as i32))
+            (1.0 - B1.powi(o.t as i32), 1.0 - B2.powi(o.t as i32))
         };
-        let o = self.opt.as_mut().unwrap();
-        o.embed.step(&mut self.m.embed, &d_embed, lr, b1, b2, eps, bc1, bc2, wd);
-        for (li, (dwz, dwu, dwo)) in lg.iter().enumerate() {
-            o.wz[li].step(&mut self.m.layers[li].wz, dwz, lr, b1, b2, eps, bc1, bc2, wd);
-            o.wu[li].step(&mut self.m.layers[li].wu, dwu, lr, b1, b2, eps, bc1, bc2, wd);
-            o.wo[li].step(&mut self.m.layers[li].wo, dwo, lr, b1, b2, eps, bc1, bc2, wd);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let o = self.opt.as_ref().unwrap();
+            for (li, dwz, dwu, dwo) in &dws {
+                let l = &self.layers[*li];
+                device::adam_rec(ctx, &mut enc, &l.wz, dwz, &o.wz[*li].m, &o.wz[*li].v, lr, B1, B2, EPS, bc1, bc2, WD);
+                device::adam_rec(ctx, &mut enc, &l.wu, dwu, &o.wu[*li].m, &o.wu[*li].v, lr, B1, B2, EPS, bc1, bc2, WD);
+                device::adam_rec(ctx, &mut enc, &l.wo, dwo, &o.wo[*li].m, &o.wo[*li].v, lr, B1, B2, EPS, bc1, bc2, WD);
+            }
         }
-        self.reupload(ctx);
-        loss
+        ctx.queue.submit(Some(enc.finish()));
+
+        // embed: host Adam (download head grad + dx, scatter, step, reupload — small)
+        let mut d_embed = ctx.download(&d_embed_head);
+        let dx_host = ctx.download(&dx);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let e = (tok as usize) * d;
+            for j in 0..d { d_embed[e + j] += dx_host[i * d + j]; }
+        }
+        let o = self.opt.as_mut().unwrap();
+        o.embed.step(&mut self.m.embed, &d_embed, lr, B1, B2, EPS, bc1, bc2, WD);
+        self.embed = ctx.upload(&self.m.embed, v, d);
+        loss as f32
     }
 
     /// Greedy generation (forward over the growing prefix).

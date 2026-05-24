@@ -50,6 +50,7 @@ fn main() {
     let n_layers: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
     let seq: usize = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(64);
     let lr: f32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(3e-3);
+    let batch: usize = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     println!("corpus {path}: {} bytes", bytes.len());
@@ -66,7 +67,7 @@ fn main() {
     let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
     println!("GPU: {}", ctx.device_name());
     let n_params = 256 * d + n_layers * 3 * d * d + d;
-    println!("LIQUID/SSM (GPU): d={d} layers={n_layers} seq={seq} lr={lr} (~{:.2}M params)",
+    println!("LIQUID/SSM (GPU): d={d} layers={n_layers} seq={seq} batch={batch} lr={lr} (~{:.2}M params)",
              n_params as f64 / 1e6);
 
     let mut dev = DevSsm::new(&ctx, 256, d, n_layers, 1234);
@@ -77,12 +78,18 @@ fn main() {
     let mut loss_ema = 0.0f32;
     let mut last = Instant::now();
 
+    let mut bt = vec![0u8; batch * seq];   // block-diagonal batch scratch
+    let mut bg = vec![0u8; batch * seq];
     while t0.elapsed().as_secs() < budget {
-        let s = rng.next(train.len() - seq - 1);
         let wlr = lr * ((step + 1) as f32 / warmup as f32).min(1.0);
-        let l = dev.train_step(&ctx, &train[s..s + seq], &train[s + 1..s + seq + 1], wlr, 0);
+        for b in 0..batch {
+            let s = rng.next(train.len() - seq - 1);
+            bt[b * seq..(b + 1) * seq].copy_from_slice(&train[s..s + seq]);
+            bg[b * seq..(b + 1) * seq].copy_from_slice(&train[s + 1..s + seq + 1]);
+        }
+        let l = dev.train_step(&ctx, &bt, &bg, wlr, seq);   // block=seq → block-diagonal
         loss_ema = if step == 0 { l } else { 0.99 * loss_ema + 0.01 * l };
-        step += 1; toks_seen += seq as u64;
+        step += 1; toks_seen += (batch * seq) as u64;
         if last.elapsed().as_secs_f64() >= 5.0 {
             let secs = t0.elapsed().as_secs_f64();
             let bpb = heldout_bpb(&ctx, &dev, held, seq, &mut rng, 16);
