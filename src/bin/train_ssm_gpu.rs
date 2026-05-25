@@ -9,6 +9,8 @@
 
 use blab::gpu::ssm::DevSsm;
 use blab::gpu::GpuContext;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;
 
 struct Lcg(u64);
@@ -53,17 +55,24 @@ fn main() {
     let batch: usize = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
     let ff: usize = a.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);   // FFN hidden dim (0 = off)
 
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    println!("corpus {path}: {} bytes", bytes.len());
-    let held_len = (bytes.len() / 20).min(32768);
-    let split = bytes.len() - held_len;
-    let (train, held) = bytes.split_at(split);
+    // Windowed (mmap-style) loading: the corpus is NOT read whole into RAM.
+    // We keep the file open and seek+read each training window on demand — app
+    // RAM stays ~constant regardless of corpus size (scales to GB; the OS page
+    // cache keeps hot pages fast). Only the small held-out tail lives in RAM.
+    let total = std::fs::metadata(&path).unwrap_or_else(|e| panic!("stat {path}: {e}")).len() as usize;
+    let held_len = (total / 20).min(32768);
+    let train_len = total - held_len;
+    let mut file = File::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let mut held = vec![0u8; held_len];
+    file.seek(SeekFrom::Start(train_len as u64)).unwrap();
+    file.read_exact(&mut held).unwrap();
+    println!("corpus {path}: {total} bytes (windowed read, RAM ~constant)");
     let mut cnt = [0u64; 256];
-    for &b in held { cnt[b as usize] += 1; }
+    for &b in &held { cnt[b as usize] += 1; }
     let n = held.len() as f64;
     let floor: f64 = (0..256).filter(|&i| cnt[i] > 0)
         .map(|i| { let p = cnt[i] as f64 / n; -p * p.log2() }).sum();
-    println!("train {} | held {} bytes | unigram floor {floor:.3} bits/byte", train.len(), held.len());
+    println!("train {train_len} | held {held_len} bytes | unigram floor {floor:.3} bits/byte");
 
     let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
     println!("GPU: {}", ctx.device_name());
@@ -85,19 +94,22 @@ fn main() {
 
     let mut bt = vec![0u8; batch * seq];   // block-diagonal batch scratch
     let mut bg = vec![0u8; batch * seq];
+    let mut win = vec![0u8; seq + 1];      // reused per-window read buffer
     while t0.elapsed().as_secs() < budget {
         let wlr = lr * ((step + 1) as f32 / warmup as f32).min(1.0);
         for b in 0..batch {
-            let s = rng.next(train.len() - seq - 1);
-            bt[b * seq..(b + 1) * seq].copy_from_slice(&train[s..s + seq]);
-            bg[b * seq..(b + 1) * seq].copy_from_slice(&train[s + 1..s + seq + 1]);
+            let s = rng.next(train_len - seq - 1);
+            file.seek(SeekFrom::Start(s as u64)).unwrap();
+            file.read_exact(&mut win).unwrap();           // seek+read 1 window (page-cached)
+            bt[b * seq..(b + 1) * seq].copy_from_slice(&win[..seq]);
+            bg[b * seq..(b + 1) * seq].copy_from_slice(&win[1..seq + 1]);
         }
         let l = dev.train_step(&ctx, &bt, &bg, wlr, seq);   // block=seq → block-diagonal
         loss_ema = if step == 0 { l } else { 0.99 * loss_ema + 0.01 * l };
         step += 1; toks_seen += (batch * seq) as u64;
         if last.elapsed().as_secs_f64() >= 5.0 {
             let secs = t0.elapsed().as_secs_f64();
-            let bpb = heldout_bpb(&ctx, &dev, held, seq, &mut rng, 16);
+            let bpb = heldout_bpb(&ctx, &dev, &held, seq, &mut rng, 16);
             println!("[{secs:5.1}s] step {step:6} | {:6.0} tok/s | train {:.3} bits | held-out {bpb:.3} (floor {floor:.3})",
                      toks_seen as f64 / secs, loss_ema as f64 / LN2);
             last = Instant::now();
@@ -105,10 +117,10 @@ fn main() {
     }
 
     let secs = t0.elapsed().as_secs_f64();
-    let bpb = heldout_bpb(&ctx, &dev, held, seq, &mut rng, 64);
+    let bpb = heldout_bpb(&ctx, &dev, &held, seq, &mut rng, 64);
     println!("\n=== done: {step} steps in {secs:.1}s | {:.0} tok/s ===", toks_seen as f64 / secs);
     println!("held-out: {bpb:.3} bits/byte (floor {floor:.3})");
-    println!("epochs: {:.2}", toks_seen as f64 / train.len() as f64);
+    println!("epochs: {:.2}", toks_seen as f64 / train_len as f64);
 
     let prompt = b"fn ";
     let greedy = dev.generate(&ctx, prompt, 80);

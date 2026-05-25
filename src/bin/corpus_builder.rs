@@ -62,12 +62,13 @@ fn walk(dir: &Path, exts: &[String], max_bytes: u64,
             let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
             if meta.len() > max_bytes { continue; }
             let f = match File::open(&path) { Ok(f) => f, Err(_) => continue };
-            // file separator
-            let rel = if ps.len() > root_len { &ps[root_len..] } else { &ps };
-            let sep = format!("\n\n===FILE {rel}===\n");
-            let _ = out.write_all(sep.as_bytes());
-            for c in sep.bytes() { st.byte_counts[c as usize] += 1; }
-            st.bytes += sep.len() as u64;
+            let _ = root_len;
+            // 1-byte document separator (0x00): a clean boundary signal the model
+            // learns as one byte, instead of the verbose `===FILE path===` line
+            // (whose paths are noise the model wasted capacity memorizing).
+            let _ = out.write_all(&[0u8]);
+            st.byte_counts[0] += 1;
+            st.bytes += 1;
             st.files += 1;
             // stream lines, dedup by hash
             let reader = BufReader::new(f);
