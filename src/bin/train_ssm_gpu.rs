@@ -51,6 +51,7 @@ fn main() {
     let seq: usize = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(64);
     let lr: f32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(3e-3);
     let batch: usize = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
+    let ff: usize = a.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);   // FFN hidden dim (0 = off)
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     println!("corpus {path}: {} bytes", bytes.len());
@@ -66,11 +67,15 @@ fn main() {
 
     let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
     println!("GPU: {}", ctx.device_name());
-    let n_params = 256 * d + n_layers * 3 * d * d + d;
-    println!("LIQUID/SSM (GPU): d={d} layers={n_layers} seq={seq} batch={batch} lr={lr} (~{:.2}M params)",
+    let n_params = 256 * d + n_layers * (3 * d * d + if ff > 0 { 2 * d * ff } else { 0 }) + d;
+    println!("LIQUID/SSM (GPU): d={d} layers={n_layers} seq={seq} batch={batch} ff={ff} lr={lr} (~{:.2}M params)",
              n_params as f64 / 1e6);
 
-    let mut dev = DevSsm::new(&ctx, 256, d, n_layers, 1234);
+    let mut dev = if ff > 0 {
+        DevSsm::new_ffn(&ctx, 256, d, n_layers, ff, 1234)
+    } else {
+        DevSsm::new(&ctx, 256, d, n_layers, 1234)
+    };
     let mut rng = Lcg(0xDEAD_BEEF_99);
     let t0 = Instant::now();
     let warmup = 200u64;

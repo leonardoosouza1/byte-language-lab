@@ -454,15 +454,21 @@ impl SsmModel {
 /// One device-resident SSM layer (bias-free; norms fixed at 1.0 — parameter-free
 /// RMSNorm, standard in SSMs — so the device forward matches the CPU forward of
 /// a freshly-init'd model exactly).
-pub struct DevLayer { norm1: Tensor, wz: Tensor, wu: Tensor, wo: Tensor }
+/// Channel-MLP (FFN) for a layer: rmsnorm → w1 → SiLU → w2 → residual. Adds
+/// per-param expressivity the pure recurrence lacks (standard in Mamba blocks).
+/// norm2 fixed at 1.0 (parameter-free); trained: w1 [d,ff], w2 [ff,d].
+pub struct Ffn { w1: Tensor, w2: Tensor, norm2: Tensor }
+pub struct DevLayer { norm1: Tensor, wz: Tensor, wu: Tensor, wo: Tensor, ffn: Option<Ffn> }
 
-struct LayerCacheDev { x_in: Tensor, xn: Tensor, z: Tensor, u: Tensor, h: Tensor }
+struct FfnCache { x_mid: Tensor, xn2: Tensor, h1: Tensor, ha: Tensor }
+struct LayerCacheDev { x_in: Tensor, xn: Tensor, z: Tensor, u: Tensor, h: Tensor, ffn: Option<FfnCache> }
 /// Device-resident Adam moments for one weight tensor (no host round-trip).
 struct AdamMV { m: Tensor, v: Tensor }
-/// Optimizer state: layer weights (wz/wu/wo) get DEVICE moments (adam_rec
-/// in-place, no download/reupload); embed stays host (small, like the
-/// transformer's embed/pos).
-struct DevOpt { embed: AdamBuf, wz: Vec<AdamMV>, wu: Vec<AdamMV>, wo: Vec<AdamMV>, t: u64 }
+struct FfnOpt { w1: AdamMV, w2: AdamMV }
+/// Optimizer state: layer weights (wz/wu/wo + optional ffn) get DEVICE moments
+/// (adam_rec in-place); embed stays host (small, like the transformer's embed).
+struct DevOpt { embed: AdamBuf, wz: Vec<AdamMV>, wu: Vec<AdamMV>, wo: Vec<AdamMV>,
+                ffn: Vec<Option<FfnOpt>>, t: u64 }
 
 /// GPU liquid/SSM byte LM. Forward+backward composed from the device kernels
 /// (rmsnorm, gemm, sigmoid, scan, scan_bwd, dsig) — the only SSM-specific
@@ -471,6 +477,7 @@ struct DevOpt { embed: AdamBuf, wz: Vec<AdamMV>, wu: Vec<AdamMV>, wo: Vec<AdamMV
 /// host (embed + wz/wu/wo), then changed tensors are re-uploaded.
 pub struct DevSsm {
     pub m: SsmModel,
+    pub ff: usize,            // FFN hidden dim (0 = no FFN)
     embed: Tensor,
     layers: Vec<DevLayer>,
     norm_f: Tensor,
@@ -485,16 +492,38 @@ impl DevSsm {
             wz: ctx.upload(&l.wz, d, d),
             wu: ctx.upload(&l.wu, d, d),
             wo: ctx.upload(&l.wo, d, d),
+            ffn: None,
         }).collect();
         DevSsm {
             embed: ctx.upload(&m.embed, m.vocab, d),
             layers, norm_f: ctx.upload(&m.norm_f, 1, d),
-            m: m.clone(), opt: None,
+            m: m.clone(), ff: 0, opt: None,
         }
     }
 
     pub fn new(ctx: &GpuContext, vocab: usize, d: usize, n_layers: usize, seed: u64) -> Self {
         Self::from_cpu(ctx, &SsmModel::init(vocab, d, n_layers, seed))
+    }
+
+    /// Build WITH a channel-MLP (FFN) of hidden dim `ff` per layer (the key
+    /// per-FLOP capacity lever). w1/w2 random-init; norm2 fixed at 1.0.
+    pub fn new_ffn(ctx: &GpuContext, vocab: usize, d: usize, n_layers: usize, ff: usize, seed: u64) -> Self {
+        let mut s = Self::from_cpu(ctx, &SsmModel::init(vocab, d, n_layers, seed));
+        s.ff = ff;
+        // deterministic init for w1/w2
+        let mut rng = seed ^ 0xF00D_F00D;
+        let mut rnd = |n: usize, scale: f32| (0..n).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
+        }).collect::<Vec<f32>>();
+        for l in s.layers.iter_mut() {
+            l.ffn = Some(Ffn {
+                w1: ctx.upload(&rnd(d * ff, (1.0 / d as f32).sqrt()), d, ff),
+                w2: ctx.upload(&rnd(ff * d, (1.0 / ff as f32).sqrt()), ff, d),
+                norm2: ctx.upload(&vec![1.0f32; d], 1, d),
+            });
+        }
+        s
     }
 
     /// Re-upload the trained tensors (embed + wz/wu/wo) from host `m` after Adam.
@@ -525,7 +554,16 @@ impl DevSsm {
             let u = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &xn, &l.wu, &u);
             let h = ctx.alloc(t, d); device::scan_rec(ctx, &mut enc, &z, &u, &h, block);
             let y = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &h, &l.wo, &y);
-            let xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
+            let mut xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
+            if let Some(f) = &l.ffn {                       // channel-MLP
+                let ff = self.ff;
+                let xn2 = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &xo, &f.norm2, &xn2, self.m.eps, 1);
+                let h1 = ctx.alloc(t, ff); device::gemm_rec(ctx, &mut enc, &xn2, &f.w1, &h1);
+                let ha = ctx.alloc(t, ff); device::elem_rec(ctx, &mut enc, &h1, &ha, 0);   // SiLU
+                let fo = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &ha, &f.w2, &fo);
+                let xo2 = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &xo, &fo, &xo2);
+                xo = xo2;
+            }
             x = xo;
         }
         let xf = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x, &self.norm_f, &xf, self.m.eps, 1);
@@ -536,16 +574,18 @@ impl DevSsm {
 
     fn ensure_opt(&mut self, ctx: &GpuContext) {
         if self.opt.is_some() { return; }
-        let d = self.m.d;
-        let zmv = || AdamMV {
-            m: ctx.upload(&vec![0.0f32; d * d], d, d),
-            v: ctx.upload(&vec![0.0f32; d * d], d, d),
+        let d = self.m.d; let ff = self.ff;
+        let zmv = |r: usize, c: usize| AdamMV {
+            m: ctx.upload(&vec![0.0f32; r * c], r, c),
+            v: ctx.upload(&vec![0.0f32; r * c], r, c),
         };
         self.opt = Some(DevOpt {
             embed: AdamBuf::z(self.m.embed.len()),
-            wz: (0..self.layers.len()).map(|_| zmv()).collect(),
-            wu: (0..self.layers.len()).map(|_| zmv()).collect(),
-            wo: (0..self.layers.len()).map(|_| zmv()).collect(),
+            wz: (0..self.layers.len()).map(|_| zmv(d, d)).collect(),
+            wu: (0..self.layers.len()).map(|_| zmv(d, d)).collect(),
+            wo: (0..self.layers.len()).map(|_| zmv(d, d)).collect(),
+            ffn: self.layers.iter().map(|l| l.ffn.as_ref()
+                .map(|_| FfnOpt { w1: zmv(d, ff), w2: zmv(ff, d) })).collect(),
             t: 0,
         });
     }
@@ -556,7 +596,8 @@ impl DevSsm {
     fn compute_grads(&self, ctx: &GpuContext, tokens: &[u8], targets: &[u8], block: usize)
         -> (f32, Vec<f32>, Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>) {
         let d = self.m.d; let v = self.m.vocab; let t = tokens.len();
-        // ---- forward with caches ----
+        // ---- forward with caches ---- (compute_grads: FFN-less parity path; ff must be 0)
+        debug_assert_eq!(self.ff, 0, "compute_grads is FFN-less; use train_step for FFN");
         let mut x0 = vec![0.0f32; t * d];
         for (i, &tok) in tokens.iter().enumerate() {
             let e = (tok as usize) * d;
@@ -573,7 +614,7 @@ impl DevSsm {
             let h = ctx.alloc(t, d); device::scan_rec(ctx, &mut enc, &z, &u, &h, block);
             let y = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &h, &l.wo, &y);
             let xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
-            caches.push(LayerCacheDev { x_in: x, xn, z, u, h });
+            caches.push(LayerCacheDev { x_in: x, xn, z, u, h, ffn: None });
             x = xo;
         }
         let x_final = x;
@@ -650,6 +691,7 @@ impl DevSsm {
         let d = self.m.d; let v = self.m.vocab; let t = tokens.len();
 
         // ---- forward (1 submit) ----
+        let ff = self.ff;
         let mut x0 = vec![0.0f32; t * d];
         for (i, &tok) in tokens.iter().enumerate() {
             let e = (tok as usize) * d;
@@ -666,8 +708,18 @@ impl DevSsm {
             let h = ctx.alloc(t, d); device::scan_rec(ctx, &mut enc, &z, &u, &h, block);
             let y = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &h, &l.wo, &y);
             let xo = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &x, &y, &xo);
-            caches.push(LayerCacheDev { x_in: x, xn, z, u, h });
-            x = xo;
+            let (next_x, ffn_cache) = if let Some(f) = &l.ffn {
+                let xn2 = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &xo, &f.norm2, &xn2, self.m.eps, 1);
+                let h1 = ctx.alloc(t, ff); device::gemm_rec(ctx, &mut enc, &xn2, &f.w1, &h1);
+                let ha = ctx.alloc(t, ff); device::elem_rec(ctx, &mut enc, &h1, &ha, 0);   // SiLU
+                let fo = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &ha, &f.w2, &fo);
+                let xo2 = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &xo, &fo, &xo2);
+                (xo2, Some(FfnCache { x_mid: xo, xn2, h1, ha }))
+            } else {
+                (xo, None)
+            };
+            caches.push(LayerCacheDev { x_in: x, xn, z, u, h, ffn: ffn_cache });
+            x = next_x;
         }
         let x_final = x;
         let xf = ctx.alloc(t, d); device::row_rec(ctx, &mut enc, &x_final, &self.norm_f, &xf, self.m.eps, 1);
@@ -696,10 +748,25 @@ impl DevSsm {
         let dxf = ctx.alloc(t, d); device::gemm_rec(ctx, &mut enc, &dlt, &self.embed, &dxf);
         let mut dx = ctx.alloc(t, d);
         device::rms_in_bwd_rec(ctx, &mut enc, &dxf, &x_final, &self.norm_f, &dx, self.m.eps);
-        let mut dws: Vec<(usize, Tensor, Tensor, Tensor)> = Vec::with_capacity(self.layers.len());
+        #[allow(clippy::type_complexity)]
+        let mut dws: Vec<(usize, Tensor, Tensor, Tensor, Option<(Tensor, Tensor)>)> =
+            Vec::with_capacity(self.layers.len());
         for li in (0..self.layers.len()).rev() {
             let l = &self.layers[li];
             let c = &caches[li];
+            // FFN backward (last in forward → first in backward): dx → grad into x_mid
+            let dffn = if let (Some(f), Some(fc)) = (&l.ffn, &c.ffn) {
+                let dw2 = ctx.alloc(ff, d); device::gemm_tn_rec(ctx, &mut enc, &fc.ha, &dx, &dw2);    // haᵀ·dfo
+                let dha = ctx.alloc(t, ff); device::gemm_nt_rec(ctx, &mut enc, &dx, &f.w2, &dha);     // dfo·w2ᵀ
+                let dh1 = ctx.alloc(t, ff); device::silu_bwd_rec(ctx, &mut enc, &dha, &fc.h1, &dh1);
+                let dw1 = ctx.alloc(d, ff); device::gemm_tn_rec(ctx, &mut enc, &fc.xn2, &dh1, &dw1);  // xn2ᵀ·dh1
+                let dxn2 = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &dh1, &f.w1, &dxn2);   // dh1·w1ᵀ
+                let dxin2 = ctx.alloc(t, d);
+                device::rms_in_bwd_rec(ctx, &mut enc, &dxn2, &fc.x_mid, &f.norm2, &dxin2, self.m.eps);
+                let dx_mid = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &dx, &dxin2, &dx_mid);   // residual + norm
+                dx = dx_mid;
+                Some((dw1, dw2))
+            } else { None };
             let dwo = ctx.alloc(d, d); device::gemm_tn_rec(ctx, &mut enc, &c.h, &dx, &dwo);
             let dh_y = ctx.alloc(t, d); device::gemm_nt_rec(ctx, &mut enc, &dx, &l.wo, &dh_y);
             let dz = ctx.alloc(t, d); let du = ctx.alloc(t, d);
@@ -714,7 +781,7 @@ impl DevSsm {
             device::rms_in_bwd_rec(ctx, &mut enc, &dxn_s, &c.x_in, &l.norm1, &dxin, self.m.eps);
             let dx_new = ctx.alloc(t, d); device::add_rec(ctx, &mut enc, &dx, &dxin, &dx_new);
             dx = dx_new;
-            dws.push((li, dwz, dwu, dwo));
+            dws.push((li, dwz, dwu, dwo, dffn));
         }
         ctx.queue.submit(Some(enc.finish()));
 
@@ -726,11 +793,15 @@ impl DevSsm {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         {
             let o = self.opt.as_ref().unwrap();
-            for (li, dwz, dwu, dwo) in &dws {
+            for (li, dwz, dwu, dwo, dffn) in &dws {
                 let l = &self.layers[*li];
                 device::adam_rec(ctx, &mut enc, &l.wz, dwz, &o.wz[*li].m, &o.wz[*li].v, lr, B1, B2, EPS, bc1, bc2, WD);
                 device::adam_rec(ctx, &mut enc, &l.wu, dwu, &o.wu[*li].m, &o.wu[*li].v, lr, B1, B2, EPS, bc1, bc2, WD);
                 device::adam_rec(ctx, &mut enc, &l.wo, dwo, &o.wo[*li].m, &o.wo[*li].v, lr, B1, B2, EPS, bc1, bc2, WD);
+                if let (Some((dw1, dw2)), Some(f), Some(fo)) = (dffn, &l.ffn, &o.ffn[*li]) {
+                    device::adam_rec(ctx, &mut enc, &f.w1, dw1, &fo.w1.m, &fo.w1.v, lr, B1, B2, EPS, bc1, bc2, WD);
+                    device::adam_rec(ctx, &mut enc, &f.w2, dw2, &fo.w2.m, &fo.w2.v, lr, B1, B2, EPS, bc1, bc2, WD);
+                }
             }
         }
         ctx.queue.submit(Some(enc.finish()));
@@ -874,6 +945,31 @@ mod tests {
         eprintln!("dev-vs-cpu grads rel: embed={re:.2e} wz={rz:.2e} wu={ru:.2e} wo={ro:.2e}");
         assert!(re < 5e-2 && rz < 5e-2 && ru < 5e-2 && ro < 5e-2,
                 "device backward disagrees: e={re} z={rz} u={ru} o={ro}");
+    }
+
+    /// FFN-equipped GPU model must train (validates the FFN forward+backward+adam
+    /// integrate correctly — a broken FFN backward would block learning).
+    #[test]
+    fn dev_ffn_breaks_floor() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let v = 32usize;
+        let pat: Vec<u8> = (0..200).map(|i| ((i % 7) * 3 % v) as u8).collect();
+        let toks = &pat[..pat.len() - 1];
+        let tgts = &pat[1..];
+        let mut cnt = [0u32; 256];
+        for &b in tgts { cnt[b as usize] += 1; }
+        let n = tgts.len() as f32;
+        let floor: f32 = tgts.iter().map(|&b| -((cnt[b as usize] as f32 / n).ln())).sum::<f32>() / n;
+        let mut dev = DevSsm::new_ffn(&ctx, v, 24, 2, 48, 1);   // ff=48
+        let mut loss = 0.0;
+        for step in 0..500 {
+            loss = dev.train_step(&ctx, toks, tgts, 0.01, 0);
+            if step % 100 == 0 { eprintln!("ffn step {step}: loss {loss:.4} (floor {floor:.4})"); }
+        }
+        eprintln!("ffn final loss {loss:.4}, floor {floor:.4}");
+        assert!(loss < floor * 0.6, "FFN model did not learn: {loss} vs floor {floor}");
+        let out = dev.generate(&ctx, &pat[..7], 14);
+        eprintln!("ffn gen: {:?}", out);
     }
 
     /// The GPU liquid model must TRAIN and GENERATE: break the unigram floor on
