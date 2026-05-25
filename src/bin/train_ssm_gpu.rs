@@ -54,6 +54,8 @@ fn main() {
     let lr: f32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(3e-3);
     let batch: usize = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
     let ff: usize = a.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);   // FFN hidden dim (0 = off)
+    let save_path = a.get(9).cloned().filter(|s| !s.is_empty());          // checkpoint out
+    let load_path = a.get(10).cloned().filter(|s| !s.is_empty());         // warm-start from
 
     // Windowed (mmap-style) loading: the corpus is NOT read whole into RAM.
     // We keep the file open and seek+read each training window on demand — app
@@ -80,17 +82,22 @@ fn main() {
     println!("LIQUID/SSM (GPU): d={d} layers={n_layers} seq={seq} batch={batch} ff={ff} lr={lr} (~{:.2}M params)",
              n_params as f64 / 1e6);
 
-    let mut dev = if ff > 0 {
+    let mut dev = if let Some(p) = &load_path {
+        println!("warm-start: resuming from checkpoint {p} (d/layers/ff from file)");
+        DevSsm::load(&ctx, p).unwrap_or_else(|e| panic!("load {p}: {e}"))
+    } else if ff > 0 {
         DevSsm::new_ffn(&ctx, 256, d, n_layers, ff, 1234)
     } else {
         DevSsm::new(&ctx, 256, d, n_layers, 1234)
     };
+    if let Some(p) = &save_path { println!("checkpointing to {p} (every 120s + final)"); }
     let mut rng = Lcg(0xDEAD_BEEF_99);
     let t0 = Instant::now();
     let warmup = 200u64;
     let (mut step, mut toks_seen) = (0u64, 0u64);
     let mut loss_ema = 0.0f32;
     let mut last = Instant::now();
+    let mut last_save = Instant::now();
 
     let mut bt = vec![0u8; batch * seq];   // block-diagonal batch scratch
     let mut bg = vec![0u8; batch * seq];
@@ -114,8 +121,19 @@ fn main() {
                      toks_seen as f64 / secs, loss_ema as f64 / LN2);
             last = Instant::now();
         }
+        if let Some(p) = &save_path {
+            if last_save.elapsed().as_secs() >= 120 {
+                if let Err(e) = dev.save(&ctx, p) { eprintln!("checkpoint save failed: {e}"); }
+                else { println!("  [checkpoint saved @ step {step}]"); }
+                last_save = Instant::now();
+            }
+        }
     }
 
+    if let Some(p) = &save_path {
+        dev.save(&ctx, p).unwrap_or_else(|e| eprintln!("final save failed: {e}"));
+        println!("final checkpoint saved to {p}");
+    }
     let secs = t0.elapsed().as_secs_f64();
     let bpb = heldout_bpb(&ctx, &dev, &held, seq, &mut rng, 64);
     println!("\n=== done: {step} steps in {secs:.1}s | {:.0} tok/s ===", toks_seen as f64 / secs);

@@ -24,6 +24,8 @@
 
 use super::device::{self, Tensor};
 use super::GpuContext;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Sigmoid.
 #[inline]
@@ -454,6 +456,19 @@ impl SsmModel {
 /// One device-resident SSM layer (bias-free; norms fixed at 1.0 — parameter-free
 /// RMSNorm, standard in SSMs — so the device forward matches the CPU forward of
 /// a freshly-init'd model exactly).
+fn rd_u32(r: &mut impl Read) -> std::io::Result<u32> {
+    let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b))
+}
+fn rd_f32s(r: &mut impl Read, n: usize) -> std::io::Result<Vec<f32>> {
+    let mut buf = vec![0u8; n * 4]; r.read_exact(&mut buf)?;
+    Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+fn wr_f32s(w: &mut impl Write, data: &[f32]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(data.len() * 4);
+    for &x in data { buf.extend_from_slice(&x.to_le_bytes()); }
+    w.write_all(&buf)
+}
+
 /// Channel-MLP (FFN) for a layer: rmsnorm → w1 → SiLU → w2 → residual. Adds
 /// per-param expressivity the pure recurrence lacks (standard in Mamba blocks).
 /// norm2 fixed at 1.0 (parameter-free); trained: w1 [d,ff], w2 [ff,d].
@@ -819,6 +834,71 @@ impl DevSsm {
         loss as f32
     }
 
+    /// Save all weights to a binary checkpoint, so training RESUMES instead of
+    /// restarting: grow the dataset → load → keep training (warm-start). Only a
+    /// few MB (the model), downloaded from the device.
+    pub fn save(&self, ctx: &GpuContext, path: &str) -> std::io::Result<()> {
+        let (d, v, nl, ff) = (self.m.d, self.m.vocab, self.layers.len(), self.ff);
+        let mut w = BufWriter::new(File::create(path)?);
+        w.write_all(b"SSMC")?;
+        for x in [1u32, v as u32, d as u32, nl as u32, ff as u32] { w.write_all(&x.to_le_bytes())?; }
+        wr_f32s(&mut w, &self.m.embed)?;
+        wr_f32s(&mut w, &ctx.download(&self.norm_f))?;
+        for l in &self.layers {
+            wr_f32s(&mut w, &ctx.download(&l.norm1))?;
+            wr_f32s(&mut w, &ctx.download(&l.wz))?;
+            wr_f32s(&mut w, &ctx.download(&l.wu))?;
+            wr_f32s(&mut w, &ctx.download(&l.wo))?;
+            if let Some(f) = &l.ffn {
+                wr_f32s(&mut w, &ctx.download(&f.w1))?;
+                wr_f32s(&mut w, &ctx.download(&f.w2))?;
+                wr_f32s(&mut w, &ctx.download(&f.norm2))?;
+            }
+        }
+        w.flush()
+    }
+
+    /// Load a checkpoint → ready to continue training or generate. Optimizer
+    /// state is NOT saved (re-warms over a few hundred steps — weights are what
+    /// matter for warm-start).
+    pub fn load(ctx: &GpuContext, path: &str) -> std::io::Result<Self> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
+        assert_eq!(&magic, b"SSMC", "bad checkpoint magic");
+        let _ver = rd_u32(&mut r)?;
+        let v = rd_u32(&mut r)? as usize;
+        let d = rd_u32(&mut r)? as usize;
+        let nl = rd_u32(&mut r)? as usize;
+        let ff = rd_u32(&mut r)? as usize;
+        let embed = rd_f32s(&mut r, v * d)?;
+        let norm_f_h = rd_f32s(&mut r, d)?;
+        let mut layers = Vec::with_capacity(nl);
+        let mut m_layers = Vec::with_capacity(nl);
+        for _ in 0..nl {
+            let n1 = rd_f32s(&mut r, d)?;
+            let wz = rd_f32s(&mut r, d * d)?;
+            let wu = rd_f32s(&mut r, d * d)?;
+            let wo = rd_f32s(&mut r, d * d)?;
+            let ffn = if ff > 0 {
+                let w1 = rd_f32s(&mut r, d * ff)?;
+                let w2 = rd_f32s(&mut r, ff * d)?;
+                let n2 = rd_f32s(&mut r, d)?;
+                Some(Ffn { w1: ctx.upload(&w1, d, ff), w2: ctx.upload(&w2, ff, d), norm2: ctx.upload(&n2, 1, d) })
+            } else { None };
+            m_layers.push(SsmLayer { norm1: n1.clone(), wz: wz.clone(), bz: vec![0.0; d],
+                                     wu: wu.clone(), bu: vec![0.0; d], wo: wo.clone() });
+            layers.push(DevLayer {
+                norm1: ctx.upload(&n1, 1, d), wz: ctx.upload(&wz, d, d),
+                wu: ctx.upload(&wu, d, d), wo: ctx.upload(&wo, d, d), ffn,
+            });
+        }
+        let m = SsmModel { vocab: v, d, embed: embed.clone(), layers: m_layers, norm_f: norm_f_h.clone(), eps: 1e-5 };
+        Ok(DevSsm {
+            embed: ctx.upload(&embed, v, d), layers,
+            norm_f: ctx.upload(&norm_f_h, 1, d), m, ff, opt: None,
+        })
+    }
+
     /// Greedy generation (forward over the growing prefix).
     pub fn generate(&self, ctx: &GpuContext, prompt: &[u8], n: usize) -> Vec<u8> {
         let v = self.m.vocab;
@@ -970,6 +1050,27 @@ mod tests {
         assert!(loss < floor * 0.6, "FFN model did not learn: {loss} vs floor {floor}");
         let out = dev.generate(&ctx, &pat[..7], 14);
         eprintln!("ffn gen: {:?}", out);
+    }
+
+    /// Checkpoint roundtrip: train → save → load → identical forward. Validates
+    /// warm-start (resume training / grow dataset without retraining from zero).
+    #[test]
+    fn dev_save_load_roundtrip() {
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(_) => return };
+        let path = "/tmp/test_ckpt.ssmc";
+        let mut dev = DevSsm::new_ffn(&ctx, 256, 24, 2, 48, 7);
+        let toks: Vec<u8> = (0..40).map(|i| ((i * 5 + 1) % 256) as u8).collect();
+        for _ in 0..20 { dev.train_step(&ctx, &toks[..39], &toks[1..40], 0.01, 0); }
+        let prompt = b"abc";
+        let before = dev.forward_dev(&ctx, prompt, 0);
+        dev.save(&ctx, path).unwrap();
+        let dev2 = DevSsm::load(&ctx, path).unwrap();
+        let after = dev2.forward_dev(&ctx, prompt, 0);
+        let rel = before.iter().zip(&after)
+            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-3)).fold(0.0f32, f32::max);
+        eprintln!("save/load roundtrip rel {rel:.2e} (ff={})", dev2.ff);
+        assert!(rel < 1e-5, "checkpoint roundtrip mismatch: {rel}");
+        let _ = std::fs::remove_file(path);
     }
 
     /// The GPU liquid model must TRAIN and GENERATE: break the unigram floor on
